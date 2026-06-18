@@ -48,10 +48,10 @@ const PROVIDERS = [
     label: 'Octopia',
     auth: {
       tokenUrl: 'https://auth.octopia-io.net/auth/realms/maas/protocol/openid-connect/token',
-      apiBase:  (process.env.OCTOPIA_API_BASE || 'https://api.octopia-io.net/seller/v2').replace(/\/+$/, ''),
-      clientId:     process.env.OCTOPIA_CLIENT_ID,
+      apiBase: (process.env.OCTOPIA_API_BASE || 'https://api.octopia-io.net/seller/v2').replace(/\/+$/, ''),
+      clientId: process.env.OCTOPIA_CLIENT_ID,
       clientSecret: process.env.OCTOPIA_CLIENT_SECRET,
-      sellerId:     process.env.OCTOPIA_SELLER_ID,
+      sellerId: process.env.OCTOPIA_SELLER_ID,
     },
     // Mappe le code "salesChannel" Octopia -> code marketplace affiché dans la page.
     // (un seul compte Octopia peut couvrir plusieurs canaux)
@@ -61,23 +61,27 @@ const PROVIDERS = [
     },
   },
   // --- Marketplaces Mirakl (une ligne par opérateur, même adaptateur) ---
-  { type: 'mirakl', code: 'carrefour',     label: 'Carrefour',       url: process.env.CARREFOUR_URL,     key: process.env.CARREFOUR_KEY },
-  { type: 'mirakl', code: 'leroymerlin',   label: 'Leroy Merlin',    url: process.env.LEROYMERLIN_URL,   key: process.env.LEROYMERLIN_KEY },
-  { type: 'mirakl', code: 'boulanger',     label: 'Boulanger',       url: process.env.BOULANGER_URL,     key: process.env.BOULANGER_KEY },
-  { type: 'mirakl', code: 'leclerc',       label: 'E.Leclerc',       url: process.env.LECLERC_URL,       key: process.env.LECLERC_KEY },
-  { type: 'mirakl', code: 'but',           label: 'But',             url: process.env.BUT_URL,           key: process.env.BUT_KEY },
-  { type: 'mirakl', code: 'cultura',       label: 'Cultura',         url: process.env.CULTURA_URL,       key: process.env.CULTURA_KEY },
-  { type: 'mirakl', code: 'conforama',     label: 'Conforama',       url: process.env.CONFORAMA_URL,     key: process.env.CONFORAMA_KEY },
-  { type: 'mirakl', code: 'ubaldi',        label: 'Ubaldi',          url: process.env.UBALDI_URL,        key: process.env.UBALDI_KEY },
+  { type: 'mirakl', code: 'carrefour', label: 'Carrefour', url: process.env.CARREFOUR_URL, key: process.env.CARREFOUR_KEY },
+  { type: 'mirakl', code: 'leroymerlin', label: 'Leroy Merlin', url: process.env.LEROYMERLIN_URL, key: process.env.LEROYMERLIN_KEY },
+  { type: 'mirakl', code: 'boulanger', label: 'Boulanger', url: process.env.BOULANGER_URL, key: process.env.BOULANGER_KEY },
+  { type: 'mirakl', code: 'leclerc', label: 'E.Leclerc', url: process.env.LECLERC_URL, key: process.env.LECLERC_KEY },
+  { type: 'mirakl', code: 'but', label: 'But', url: process.env.BUT_URL, key: process.env.BUT_KEY },
+  { type: 'mirakl', code: 'cultura', label: 'Cultura', url: process.env.CULTURA_URL, key: process.env.CULTURA_KEY },
+  { type: 'mirakl', code: 'conforama', label: 'Conforama', url: process.env.CONFORAMA_URL, key: process.env.CONFORAMA_KEY },
+  { type: 'mirakl', code: 'ubaldi', label: 'Ubaldi', url: process.env.UBALDI_URL, key: process.env.UBALDI_KEY },
   { type: 'mirakl', code: 'rueducommerce', label: 'Rue du Commerce', url: process.env.RUEDUCOMMERCE_URL, key: process.env.RUEDUCOMMERCE_KEY },
-  { type: 'mirakl', code: 'castorama',     label: 'Castorama',       url: process.env.CASTORAMA_URL,     key: process.env.CASTORAMA_KEY },
-  { type: 'mirakl', code: 'auchan',        label: 'Auchan',          url: process.env.AUCHAN_URL,        key: process.env.AUCHAN_KEY },
+  { type: 'mirakl', code: 'castorama', label: 'Castorama', url: process.env.CASTORAMA_URL, key: process.env.CASTORAMA_KEY },
+  { type: 'mirakl', code: 'auchan', label: 'Auchan', url: process.env.AUCHAN_URL, key: process.env.AUCHAN_KEY },
   // --- Fnac / Darty (BOMP) — API Marketplace Fnac historique, en XML ---
   // Auth = partnerId + shopId + key. Clé API distincte par boutique, partnerId commun.
-  { type: 'bomp', code: 'fnac',  label: 'Fnac',  apiBase: 'https://vendeur.fnac.com/api.php',
-    partnerId: process.env.FNAC_PARTNER_ID,  shopId: process.env.FNAC_SHOP_ID,  key: process.env.FNAC_KEY },
-  { type: 'bomp', code: 'darty', label: 'Darty', apiBase: 'https://vendeur.fnac.com/api.php',
-    partnerId: process.env.DARTY_PARTNER_ID, shopId: process.env.DARTY_SHOP_ID, key: process.env.DARTY_KEY },
+  {
+    type: 'bomp', code: 'fnac', label: 'Fnac', apiBase: 'https://vendeur.fnac.com/api.php',
+    partnerId: process.env.FNAC_PARTNER_ID, shopId: process.env.FNAC_SHOP_ID, key: process.env.FNAC_KEY
+  },
+  {
+    type: 'bomp', code: 'darty', label: 'Darty', apiBase: 'https://vendeur.fnac.com/api.php',
+    partnerId: process.env.DARTY_PARTNER_ID, shopId: process.env.DARTY_SHOP_ID, key: process.env.DARTY_KEY
+  },
 ];
 
 /* =====================================================================
@@ -141,10 +145,10 @@ const octopia = (() => {
         ...opts.headers,
       },
     });
-if (!res.ok) {
-  const txt = await res.text();
-  throw new Error(`Octopia ${res.status} (${path}) — ${txt.slice(0, 1000)}`);
-}    return res.status === 204 ? {} : res.json();
+    if (!res.ok) {
+      const txt = await res.text();
+      throw new Error(`Octopia ${res.status} (${path}) — ${txt.slice(0, 1000)}`);
+    } return res.status === 204 ? {} : res.json();
   }
 
   function graduationToPriority(g) {
@@ -219,7 +223,7 @@ function miraklApiBase(rawUrl) {
 async function throwHttpError(prefix, res) {
   if (res.ok) return;
   let body = '';
-  try { body = await res.text(); } catch (_) {}
+  try { body = await res.text(); } catch (_) { }
   throw new Error(`${prefix} ${res.status}${body ? ' — ' + body.slice(0, 300) : ''}`);
 }
 const mirakl = {
@@ -263,46 +267,85 @@ const mirakl = {
       []
     );
   },
+  async fetchThread(provider, ctx) {
+    const base = miraklApiBase(provider.url);
 
+    const res = await fetch(
+      `${base}/api/inbox/threads/${encodeURIComponent(ctx.threadId)}?with_messages=true`,
+      {
+        headers: {
+          Authorization: provider.key,
+          Accept: 'application/json',
+        },
+      }
+    );
+
+    await throwHttpError('Mirakl', res);
+    const t = await res.json();
+
+    const thread = t.data || t.thread || t;
+
+    return makeClaim(provider.code, {
+      providerType: 'mirakl',
+      id: thread.id || thread.thread_id || thread.threadId || ctx.threadId,
+      customer: thread.from?.display_name || thread.from?.name || thread.customer?.name || 'Client',
+      subject: thread.topic?.value || thread.subject || thread.title || 'Réclamation',
+      orderId: thread.entities?.[0]?.id || thread.order_id || thread.orderId || '',
+      product: thread.entities?.[0]?.label || thread.product_title || thread.product || '',
+      status: thread.status === 'CLOSED' || thread.closed === true ? 'resolu' : 'nouveau',
+      updatedAt: new Date(thread.date_updated || thread.updated_at || thread.date_created || Date.now()).getTime(),
+      messages: (thread.messages || []).map(m => ({
+        from:
+          m.from?.type === 'CUSTOMER' ||
+            m.from_type === 'CUSTOMER' ||
+            m.author_type === 'CUSTOMER'
+            ? 'client'
+            : 'seller',
+        at: new Date(m.date_created || m.created_at || m.date_updated || Date.now()).getTime(),
+        text: m.body || m.text || m.message || '',
+      })),
+      ctx: { threadId: thread.id || thread.thread_id || thread.threadId || ctx.threadId },
+    });
+  },
   async fetchAllThreads(provider) {
-  const all = [];
+    const all = [];
 
-  const max = Number(process.env.MIRAKL_PAGE_SIZE || 10);
-  const maxPages = Number(process.env.MIRAKL_MAX_PAGES || 1);
-  const withMessages = String(process.env.MIRAKL_WITH_MESSAGES || 'false') === 'true';
+    const max = Number(process.env.MIRAKL_PAGE_SIZE || 10);
+    const maxPages = Number(process.env.MIRAKL_MAX_PAGES || 1);
+    const withMessages = String(process.env.MIRAKL_WITH_MESSAGES || 'false') === 'true';
 
-  let offset = 0;
-  let pageCount = 0;
+    let offset = 0;
+    let pageCount = 0;
 
-  while (pageCount < maxPages) {
-    const params = new URLSearchParams();
+    while (pageCount < maxPages) {
+      const params = new URLSearchParams();
 
-    params.set('max', String(max));
-    params.set('offset', String(offset));
+      params.set('max', String(max));
+      params.set('offset', String(offset));
 
-    if (withMessages) {
-      params.set('with_messages', 'true');
+      if (withMessages) {
+        params.set('with_messages', 'true');
+      }
+
+      const data = await this.api(provider, `/inbox/threads?${params.toString()}`);
+      const page = this.extractThreads(data);
+
+      console.log(`[mirakl/${provider.code}] page=${pageCount + 1}, offset=${offset}, reçus=${page.length}`);
+
+      all.push(...page);
+
+      if (page.length < max) break;
+
+      offset += max;
+      pageCount += 1;
+
+      const delay = Number(process.env.MIRAKL_DELAY_MS || 0);
+      if (delay > 0) await sleep(delay);
     }
 
-    const data = await this.api(provider, `/inbox/threads?${params.toString()}`);
-    const page = this.extractThreads(data);
-
-    console.log(`[mirakl/${provider.code}] page=${pageCount + 1}, offset=${offset}, reçus=${page.length}`);
-
-    all.push(...page);
-
-    if (page.length < max) break;
-
-    offset += max;
-    pageCount += 1;
-
-    const delay = Number(process.env.MIRAKL_DELAY_MS || 0);
-    if (delay > 0) await sleep(delay);
-  }
-
-  console.log(`[mirakl/${provider.code}] total threads chargés=${all.length}`);
-  return all;
-},
+    console.log(`[mirakl/${provider.code}] total threads chargés=${all.length}`);
+    return all;
+  },
 
   async fetchClaims(provider) {
     const threads = await this.fetchAllThreads(provider);
@@ -319,8 +362,8 @@ const mirakl = {
       messages: (t.messages || []).map(m => ({
         from:
           m.from?.type === 'CUSTOMER' ||
-          m.from_type === 'CUSTOMER' ||
-          m.author_type === 'CUSTOMER'
+            m.from_type === 'CUSTOMER' ||
+            m.author_type === 'CUSTOMER'
             ? 'client'
             : 'seller',
         at: new Date(m.date_created || m.created_at || Date.now()).getTime(),
@@ -388,7 +431,7 @@ const bomp = (() => {
     });
     if (!res.ok) {
       let txt = '';
-      try { txt = await res.text(); } catch (_) {}
+      try { txt = await res.text(); } catch (_) { }
       throw new Error(`BOMP ${operation} ${res.status}${txt ? ' — ' + txt.slice(0, 300) : ''}`);
     }
     return parser.parse(await res.text());
@@ -489,7 +532,7 @@ ${inner}
       const token = await getToken(provider);
       if (ctx.messageId) {
         const xml = authedRequest(provider, token, 'messages_update',
-`  <message action="reply" id="${xmlEscape(ctx.messageId)}" to="CLIENT">
+          `  <message action="reply" id="${xmlEscape(ctx.messageId)}" to="CLIENT">
     <description><![CDATA[${String(body).replace(/]]>/g, ']]]]><![CDATA[>')}]]></description>
     <subject>order_information</subject>
     <type>ORDER</type>
@@ -518,145 +561,149 @@ const ADAPTERS = { octopia, mirakl, bomp };
    =====================================================================*/
 
 // Déduction d'un statut normalisé à partir d'un texte d'événement
-function mapStatus(text){
-  const t=(text||'').toLowerCase();
-  if(/livr|delivered|remis/.test(t))                       return 'livre';
-  if(/point relais|relais|pickup|disposal|à retirer|consigne/.test(t)) return 'pret_retrait';
-  if(/incident|échec|echec|absent|retour|refus|exception|problème/.test(t)) return 'incident';
-  if(/préparation|preparation|étiquette|label|enregistr|created|annonce/.test(t)) return 'en_attente';
+function mapStatus(text) {
+  const t = (text || '').toLowerCase();
+  if (/livr|delivered|remis/.test(t)) return 'livre';
+  if (/point relais|relais|pickup|disposal|à retirer|consigne/.test(t)) return 'pret_retrait';
+  if (/incident|échec|echec|absent|retour|refus|exception|problème/.test(t)) return 'incident';
+  if (/préparation|preparation|étiquette|label|enregistr|created|annonce/.test(t)) return 'en_attente';
   return 'en_transit';
 }
 
 // Cache de token OAuth (UPS, FedEx)
-const oauthCache={};
-async function getOAuthToken(key, tokenUrl, body, headers){
-  const c=oauthCache[key];
-  if(c && Date.now()<c.exp) return c.value;
-  const r=await fetch(tokenUrl,{method:'POST',headers,body});
-  if(!r.ok) throw new Error(`${key} auth ${r.status}`);
-  const j=await r.json();
-  oauthCache[key]={value:j.access_token, exp:Date.now()+((j.expires_in||3600)-120)*1000};
+const oauthCache = {};
+async function getOAuthToken(key, tokenUrl, body, headers) {
+  const c = oauthCache[key];
+  if (c && Date.now() < c.exp) return c.value;
+  const r = await fetch(tokenUrl, { method: 'POST', headers, body });
+  if (!r.ok) throw new Error(`${key} auth ${r.status}`);
+  const j = await r.json();
+  oauthCache[key] = { value: j.access_token, exp: Date.now() + ((j.expires_in || 3600) - 120) * 1000 };
   return oauthCache[key].value;
 }
 
 const CARRIERS = {
   // ---- Colissimo / La Poste — API "Suivi v2" (clé Okapi) ----
   colissimo: {
-    async track(number){
-      if(!process.env.LAPOSTE_OKAPI_KEY) throw new Error('Colissimo: clé Okapi manquante (LAPOSTE_OKAPI_KEY)');
-      const r=await fetch(`https://api.laposte.fr/suivi/v2/idships/${encodeURIComponent(number)}`,
-        {headers:{'X-Okapi-Key':process.env.LAPOSTE_OKAPI_KEY,Accept:'application/json'}});
-      if(!r.ok) throw new Error(`Colissimo ${r.status}`);
-      const sh=(await r.json()).shipment||{};
-      const events=(sh.event||[]).map(e=>({at:e.date,label:e.label}));
-      return {status: events[0]?mapStatus(events[0].label):'en_transit', etaH:null, events};
+    async track(number) {
+      if (!process.env.LAPOSTE_OKAPI_KEY) throw new Error('Colissimo: clé Okapi manquante (LAPOSTE_OKAPI_KEY)');
+      const r = await fetch(`https://api.laposte.fr/suivi/v2/idships/${encodeURIComponent(number)}`,
+        { headers: { 'X-Okapi-Key': process.env.LAPOSTE_OKAPI_KEY, Accept: 'application/json' } });
+      if (!r.ok) throw new Error(`Colissimo ${r.status}`);
+      const sh = (await r.json()).shipment || {};
+      const events = (sh.event || []).map(e => ({ at: e.date, label: e.label }));
+      return { status: events[0] ? mapStatus(events[0].label) : 'en_transit', etaH: null, events };
     },
   },
 
   // ---- Chronopost — WS de suivi (compte + mot de passe) ----
   chronopost: {
-    async track(number){
-      if(!process.env.CHRONOPOST_ACCOUNT||!process.env.CHRONOPOST_PASSWORD) throw new Error('Chronopost: identifiants manquants (CHRONOPOST_ACCOUNT/PASSWORD)');
+    async track(number) {
+      if (!process.env.CHRONOPOST_ACCOUNT || !process.env.CHRONOPOST_PASSWORD) throw new Error('Chronopost: identifiants manquants (CHRONOPOST_ACCOUNT/PASSWORD)');
       // REST de suivi Chronopost (sinon WS SOAP TrackingServiceWS). TODO: ajuster selon votre contrat.
-      const u=`https://www.chronopost.fr/tracking-cxf/TrackingServiceWS/track?accountNumber=${process.env.CHRONOPOST_ACCOUNT}&password=${process.env.CHRONOPOST_PASSWORD}&skybillNumber=${encodeURIComponent(number)}&language=fr_FR`;
-      const r=await fetch(u,{headers:{Accept:'application/json'}});
-      if(!r.ok) throw new Error(`Chronopost ${r.status}`);
-      const j=await r.json();
-      const evs=(j.listEventInfoComp||j.events||[]).map(e=>({at:e.eventDate||e.date,label:e.eventLabel||e.label})); // TODO
-      return {status: evs[0]?mapStatus(evs[0].label):'en_transit', etaH:null, events:evs};
+      const u = `https://www.chronopost.fr/tracking-cxf/TrackingServiceWS/track?accountNumber=${process.env.CHRONOPOST_ACCOUNT}&password=${process.env.CHRONOPOST_PASSWORD}&skybillNumber=${encodeURIComponent(number)}&language=fr_FR`;
+      const r = await fetch(u, { headers: { Accept: 'application/json' } });
+      if (!r.ok) throw new Error(`Chronopost ${r.status}`);
+      const j = await r.json();
+      const evs = (j.listEventInfoComp || j.events || []).map(e => ({ at: e.eventDate || e.date, label: e.eventLabel || e.label })); // TODO
+      return { status: evs[0] ? mapStatus(evs[0].label) : 'en_transit', etaH: null, events: evs };
     },
   },
 
   // ---- DPD France — WS de suivi (identifiants) ----
   dpd: {
-    async track(number){
-      if(!process.env.DPD_USER||!process.env.DPD_KEY) throw new Error('DPD: identifiants manquants (DPD_USER/DPD_KEY)');
+    async track(number) {
+      if (!process.env.DPD_USER || !process.env.DPD_KEY) throw new Error('DPD: identifiants manquants (DPD_USER/DPD_KEY)');
       // TODO: endpoint DPD France (ex-API e-station). Ajuster URL/auth selon votre contrat.
-      const r=await fetch(`https://api.dpd.fr/tracking/v1/parcels/${encodeURIComponent(number)}`,
-        {headers:{Authorization:`Bearer ${process.env.DPD_KEY}`,Accept:'application/json'}});
-      if(!r.ok) throw new Error(`DPD ${r.status}`);
-      const j=await r.json();
-      const evs=(j.scanInfo||j.events||[]).map(e=>({at:e.date,label:e.status||e.label})); // TODO
-      return {status: evs[0]?mapStatus(evs[0].label):'en_transit', etaH:null, events:evs};
+      const r = await fetch(`https://api.dpd.fr/tracking/v1/parcels/${encodeURIComponent(number)}`,
+        { headers: { Authorization: `Bearer ${process.env.DPD_KEY}`, Accept: 'application/json' } });
+      if (!r.ok) throw new Error(`DPD ${r.status}`);
+      const j = await r.json();
+      const evs = (j.scanInfo || j.events || []).map(e => ({ at: e.date, label: e.status || e.label })); // TODO
+      return { status: evs[0] ? mapStatus(evs[0].label) : 'en_transit', etaH: null, events: evs };
     },
   },
 
   // ---- GLS — Track & Trace REST (identifiants) ----
   gls: {
-    async track(number){
-      if(!process.env.GLS_USER||!process.env.GLS_PASSWORD) throw new Error('GLS: identifiants manquants (GLS_USER/GLS_PASSWORD)');
-      const auth=Buffer.from(`${process.env.GLS_USER}:${process.env.GLS_PASSWORD}`).toString('base64');
-      const r=await fetch(`https://api.gls-group.eu/public/v1/tracking/references/${encodeURIComponent(number)}`,
-        {headers:{Authorization:`Basic ${auth}`,Accept:'application/json'}});
-      if(!r.ok) throw new Error(`GLS ${r.status}`);
-      const j=await r.json();
-      const p=(j.parcels&&j.parcels[0])||{};
-      const evs=(p.events||[]).map(e=>({at:e.timestamp,label:e.description})); // TODO
-      return {status: evs[0]?mapStatus(evs[0].label):'en_transit', etaH:null, events:evs};
+    async track(number) {
+      if (!process.env.GLS_USER || !process.env.GLS_PASSWORD) throw new Error('GLS: identifiants manquants (GLS_USER/GLS_PASSWORD)');
+      const auth = Buffer.from(`${process.env.GLS_USER}:${process.env.GLS_PASSWORD}`).toString('base64');
+      const r = await fetch(`https://api.gls-group.eu/public/v1/tracking/references/${encodeURIComponent(number)}`,
+        { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } });
+      if (!r.ok) throw new Error(`GLS ${r.status}`);
+      const j = await r.json();
+      const p = (j.parcels && j.parcels[0]) || {};
+      const evs = (p.events || []).map(e => ({ at: e.timestamp, label: e.description })); // TODO
+      return { status: evs[0] ? mapStatus(evs[0].label) : 'en_transit', etaH: null, events: evs };
     },
   },
 
   // ---- UPS — Tracking API (OAuth client_credentials) ----
   ups: {
-    async track(number){
-      if(!process.env.UPS_CLIENT_ID||!process.env.UPS_CLIENT_SECRET) throw new Error('UPS: identifiants manquants (UPS_CLIENT_ID/SECRET)');
-      const basic=Buffer.from(`${process.env.UPS_CLIENT_ID}:${process.env.UPS_CLIENT_SECRET}`).toString('base64');
-      const token=await getOAuthToken('ups','https://onlinetools.ups.com/security/v1/oauth/token',
-        'grant_type=client_credentials',{Authorization:`Basic ${basic}`,'Content-Type':'application/x-www-form-urlencoded'});
-      const r=await fetch(`https://onlinetools.ups.com/api/track/v1/details/${encodeURIComponent(number)}`,
-        {headers:{Authorization:`Bearer ${token}`,Accept:'application/json'}});
-      if(!r.ok) throw new Error(`UPS ${r.status}`);
-      const j=await r.json();
-      const pkg=j.trackResponse?.shipment?.[0]?.package?.[0]||{};
-      const evs=(pkg.activity||[]).map(a=>({at:`${a.date} ${a.time}`,label:a.status?.description})); // TODO
-      return {status: evs[0]?mapStatus(evs[0].label):'en_transit', etaH:null, events:evs};
+    async track(number) {
+      if (!process.env.UPS_CLIENT_ID || !process.env.UPS_CLIENT_SECRET) throw new Error('UPS: identifiants manquants (UPS_CLIENT_ID/SECRET)');
+      const basic = Buffer.from(`${process.env.UPS_CLIENT_ID}:${process.env.UPS_CLIENT_SECRET}`).toString('base64');
+      const token = await getOAuthToken('ups', 'https://onlinetools.ups.com/security/v1/oauth/token',
+        'grant_type=client_credentials', { Authorization: `Basic ${basic}`, 'Content-Type': 'application/x-www-form-urlencoded' });
+      const r = await fetch(`https://onlinetools.ups.com/api/track/v1/details/${encodeURIComponent(number)}`,
+        { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' } });
+      if (!r.ok) throw new Error(`UPS ${r.status}`);
+      const j = await r.json();
+      const pkg = j.trackResponse?.shipment?.[0]?.package?.[0] || {};
+      const evs = (pkg.activity || []).map(a => ({ at: `${a.date} ${a.time}`, label: a.status?.description })); // TODO
+      return { status: evs[0] ? mapStatus(evs[0].label) : 'en_transit', etaH: null, events: evs };
     },
   },
 
   // ---- DHL — Shipment Tracking Unified API (clé API) ----
   dhl: {
-    async track(number){
-      if(!process.env.DHL_API_KEY) throw new Error('DHL: clé manquante (DHL_API_KEY)');
-      const r=await fetch(`https://api-eu.dhl.com/track/shipments?trackingNumber=${encodeURIComponent(number)}`,
-        {headers:{'DHL-API-Key':process.env.DHL_API_KEY,Accept:'application/json'}});
-      if(!r.ok) throw new Error(`DHL ${r.status}`);
-      const s=(await r.json()).shipments?.[0]||{};
-      const evs=(s.events||[]).map(e=>({at:e.timestamp,label:e.description||e.status}));
-      return {status: s.status?.statusCode==='delivered'?'livre':(evs[0]?mapStatus(evs[0].label):'en_transit'),
-              etaH:null, events:evs};
+    async track(number) {
+      if (!process.env.DHL_API_KEY) throw new Error('DHL: clé manquante (DHL_API_KEY)');
+      const r = await fetch(`https://api-eu.dhl.com/track/shipments?trackingNumber=${encodeURIComponent(number)}`,
+        { headers: { 'DHL-API-Key': process.env.DHL_API_KEY, Accept: 'application/json' } });
+      if (!r.ok) throw new Error(`DHL ${r.status}`);
+      const s = (await r.json()).shipments?.[0] || {};
+      const evs = (s.events || []).map(e => ({ at: e.timestamp, label: e.description || e.status }));
+      return {
+        status: s.status?.statusCode === 'delivered' ? 'livre' : (evs[0] ? mapStatus(evs[0].label) : 'en_transit'),
+        etaH: null, events: evs
+      };
     },
   },
 
   // ---- FedEx (et TNT, réseau FedEx) — Track API (OAuth) ----
   fedex: {
-    async track(number){
-      if(!process.env.FEDEX_CLIENT_ID||!process.env.FEDEX_CLIENT_SECRET) throw new Error('FedEx: identifiants manquants (FEDEX_CLIENT_ID/SECRET)');
-      const token=await getOAuthToken('fedex','https://apis.fedex.com/oauth/token',
+    async track(number) {
+      if (!process.env.FEDEX_CLIENT_ID || !process.env.FEDEX_CLIENT_SECRET) throw new Error('FedEx: identifiants manquants (FEDEX_CLIENT_ID/SECRET)');
+      const token = await getOAuthToken('fedex', 'https://apis.fedex.com/oauth/token',
         `grant_type=client_credentials&client_id=${process.env.FEDEX_CLIENT_ID}&client_secret=${process.env.FEDEX_CLIENT_SECRET}`,
-        {'Content-Type':'application/x-www-form-urlencoded'});
-      const r=await fetch('https://apis.fedex.com/track/v1/trackingnumbers',{method:'POST',
-        headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},
-        body:JSON.stringify({trackingInfo:[{trackingNumberInfo:{trackingNumber:number}}],includeDetailedScans:true})});
-      if(!r.ok) throw new Error(`FedEx ${r.status}`);
-      const j=await r.json();
-      const tr=j.output?.completeTrackResults?.[0]?.trackResults?.[0]||{};
-      const evs=(tr.scanEvents||[]).map(e=>({at:e.date,label:e.eventDescription}));
-      return {status: evs[0]?mapStatus(evs[0].label):'en_transit', etaH:null, events:evs};
+        { 'Content-Type': 'application/x-www-form-urlencoded' });
+      const r = await fetch('https://apis.fedex.com/track/v1/trackingnumbers', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ trackingInfo: [{ trackingNumberInfo: { trackingNumber: number } }], includeDetailedScans: true })
+      });
+      if (!r.ok) throw new Error(`FedEx ${r.status}`);
+      const j = await r.json();
+      const tr = j.output?.completeTrackResults?.[0]?.trackResults?.[0] || {};
+      const evs = (tr.scanEvents || []).map(e => ({ at: e.date, label: e.eventDescription }));
+      return { status: evs[0] ? mapStatus(evs[0].label) : 'en_transit', etaH: null, events: evs };
     },
   },
-  tnt: { async track(n){ return CARRIERS.fedex.track(n); } },  // TNT suivi via le réseau FedEx
+  tnt: { async track(n) { return CARRIERS.fedex.track(n); } },  // TNT suivi via le réseau FedEx
 
   // ---- ChezVous (livraison à domicile) — API à brancher ----
   chezvous: {
-    async track(number){
-      if(!process.env.CHEZVOUS_KEY) throw new Error('ChezVous: clé manquante (CHEZVOUS_KEY)');
+    async track(number) {
+      if (!process.env.CHEZVOUS_KEY) throw new Error('ChezVous: clé manquante (CHEZVOUS_KEY)');
       // TODO: endpoint/auth ChezVous à confirmer auprès du transporteur.
-      const r=await fetch(`https://api.chezvous.fr/tracking/${encodeURIComponent(number)}`,
-        {headers:{Authorization:`Bearer ${process.env.CHEZVOUS_KEY}`,Accept:'application/json'}});
-      if(!r.ok) throw new Error(`ChezVous ${r.status}`);
-      const j=await r.json();
-      const evs=(j.events||[]).map(e=>({at:e.date,label:e.label||e.status})); // TODO
-      return {status: evs[0]?mapStatus(evs[0].label):'en_transit', etaH:null, events:evs};
+      const r = await fetch(`https://api.chezvous.fr/tracking/${encodeURIComponent(number)}`,
+        { headers: { Authorization: `Bearer ${process.env.CHEZVOUS_KEY}`, Accept: 'application/json' } });
+      if (!r.ok) throw new Error(`ChezVous ${r.status}`);
+      const j = await r.json();
+      const evs = (j.events || []).map(e => ({ at: e.date, label: e.label || e.status })); // TODO
+      return { status: evs[0] ? mapStatus(evs[0].label) : 'en_transit', etaH: null, events: evs };
     },
   },
 };
