@@ -1,0 +1,19 @@
+{
+  "name": "2kings-reclamations-proxy",
+  "version": "1.0.0",
+  "description": "Proxy backend qui agrège les réclamations, notes et suivis des marketplaces (Octopia, Mirakl, Fnac/Darty BOMP) pour le tableau de bord 2KINGS.",
+  "main": "proxy-exemple.js",
+  "scripts": {
+    "start": "node proxy-exemple.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "node-fetch": "^3.3.2",
+    "fast-xml-parser": "^4.4.1"
+  }
+}

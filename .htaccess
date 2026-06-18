@@ -1,0 +1,16 @@
+# Protection par mot de passe du tableau de bord 2KINGS (Apache / OVH mutualisé)
+# 1) Renseignez le chemin ABSOLU vers le fichier .htpasswd sur votre hébergement.
+#    Sur OVH mutualisé, c'est souvent : /home/<login>/www/.htpasswd
+#    (visible dans l'explorateur de fichiers OVH, en haut de la barre d'adresse).
+AuthType Basic
+AuthName "2KINGS - Centre de réclamations (accès réservé)"
+AuthUserFile /home/VOTRE_LOGIN/www/.htpasswd
+Require valid-user
+
+# Empêche d'afficher/télécharger les fichiers d'authentification
+<FilesMatch "^\.ht">
+  Require all denied
+</FilesMatch>
+
+# (Optionnel) page d'accueil par défaut
+DirectoryIndex index.html
