@@ -976,12 +976,41 @@ const CONFIG = {
   SLA_LATE: 0, SLA_SOON: 8,
 };
 
+function normalizeClaim(c){
+  return {
+    id: c.id || `${c.marketplace || "unknown"}-${Math.random().toString(36).slice(2)}`,
+    marketplace: c.marketplace || "unknown",
+    customer: c.customer || "Client",
+    subject: c.subject || "Réclamation",
+    orderId: c.orderId || "",
+    product: c.product || "",
+    ean: c.ean || "",
+    priority: c.priority || "moyenne",
+    status: c.status || "nouveau",
+    updatedAt: c.updatedAt || Date.now(),
+    dueAt: c.dueAt || Date.now() + 24 * 3600 * 1000,
+    messages: Array.isArray(c.messages) ? c.messages : [],
+    tracking: c.tracking || null,
+  };
+}
+
 const DataAPI = {
   async fetchClaims(){
     if(CONFIG.USE_DEMO_DATA) return structuredClone(DEMO);
     const r = await fetch(`${CONFIG.API_BASE}/threads`, {headers:{'Accept':'application/json'}});
     if(!r.ok) throw new Error("Erreur API "+r.status);
     return await r.json();
+  },
+  async fetchClaimDetail(id){
+    if(CONFIG.USE_DEMO_DATA){
+      await new Promise(r=>setTimeout(r,250));
+      return claims.find(c=>c.id===id) || null;
+    }
+    const r = await fetch(`${CONFIG.API_BASE}/threads/${encodeURIComponent(id)}`, {
+      headers:{'Accept':'application/json'}
+    });
+    if(!r.ok) throw new Error("Erreur détail "+r.status);
+    return normalizeClaim(await r.json());
   },
   async sendReply(id,message,status,files){
     if(CONFIG.USE_DEMO_DATA){ await new Promise(r=>setTimeout(r,400)); return {ok:true}; }
@@ -2021,8 +2050,8 @@ function renderTable(){
   }
 }
 
-function openDrawer(id){
-  const c=claims.find(x=>x.id===id); if(!c)return;
+async function openDrawer(id, skipRemoteDetail=false){
+  let c=claims.find(x=>x.id===id); if(!c)return;
   selectedId=id; renderTable();
   const mp=mpOf(c.marketplace),st=STATUS[c.status],pr=PRIO[c.priority],sla=slaInfo(c);
   $("#dSubject").innerHTML='<span class="subj-mp">'+mpMarkLink(c.marketplace,c.orderId)+'</span> '+esc(c.subject)+' <span class="subj-ord ordref" data-lbl="N° de commande">'+esc(c.orderId)+'</span> <span class="subj-date" title="Date de commande">📅 '+fmtDate(createdAt(c))+'</span>';
@@ -2041,6 +2070,25 @@ function openDrawer(id){
   $("#dStatus").value=c.status; $("#replyText").value="";
   pendingFiles=[]; renderAttachList();   // réinitialise les pièces jointes
   $("#overlay").classList.add("show"); $("#drawer").classList.add("show");
+
+  // Chargement du contenu complet uniquement au clic : la liste reste rapide,
+  // puis le détail Mirakl recharge les messages avec with_messages=true.
+  if(!skipRemoteDetail && (!c.messages || c.messages.length===0)){
+    const oldBody=$("#dBody").innerHTML;
+    $("#dBody").innerHTML=renderTracking(c)+`<div class="meta" style="padding:12px">Chargement du contenu du message…</div>`;
+    try{
+      const detail=await DataAPI.fetchClaimDetail(id);
+      if(detail){
+        const i=claims.findIndex(x=>x.id===id);
+        if(i>=0) claims[i]=detail;
+        if(selectedId===id) openDrawer(id,true);
+      }
+    }catch(e){
+      console.error(e);
+      $("#dBody").innerHTML=oldBody+`<div class="meta" style="padding:12px;color:#b91c1c">Impossible de charger le contenu complet : ${esc(e.message)}</div>`;
+      toast("Impossible de charger le contenu du message : "+e.message,true);
+    }
+  }
 }
 
 /* Bloc de suivi de livraison dans le détail */
@@ -2079,7 +2127,7 @@ function bindTracking(c){
       if(upd){ c.tracking.status=upd.status||c.tracking.status; if(upd.etaH!=null)c.tracking.etaH=upd.etaH;
         if(upd.events)c.tracking.events=upd.events; toast("Suivi mis à jour"); }
       else toast("Mode démo : suivi simulé (branchez le proxy pour le réel)");
-      openDrawer(c.id);
+      openDrawer(c.id,true);
     }catch(e){toast("Suivi : "+e.message,true);}
     finally{btn.disabled=false;btn.textContent="↻ Rafraîchir";}
   };
@@ -2097,7 +2145,7 @@ async function sendReply(){
     c.messages.push({from:"seller",author:currentUser,at:Date.now(),text,attachments}); c.status=status; c.updatedAt=Date.now();
     pendingFiles=[];
     playSendAnimation();
-    toast("Réponse envoyée à "+c.customer+(attachments.length?` (${attachments.length} P.J.)`:"")); renderKPIs(); renderEvo(); renderCharts(); renderTable(); openDrawer(c.id);
+    toast("Réponse envoyée à "+c.customer+(attachments.length?` (${attachments.length} P.J.)`:"")); renderKPIs(); renderEvo(); renderCharts(); renderTable(); openDrawer(c.id,true);
   }catch(e){toast("Erreur : "+e.message,true);}
   finally{$("#sendBtn").disabled=false;$("#sendBtn").textContent="Envoyer la réponse";}
 }

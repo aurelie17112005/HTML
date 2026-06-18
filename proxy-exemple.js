@@ -110,6 +110,15 @@ function makeClaim(marketplace, o) {
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
+function parseMarketplaceDate(raw, fallback = Date.now()) {
+  if (!raw) return fallback;
+  const t = new Date(raw).getTime();
+  if (Number.isNaN(t)) {
+    console.warn('[date] Date invalide reçue :', raw);
+    return fallback;
+  }
+  return t;
+}
 
 /* =====================================================================
    3) ADAPTATEUR OCTOPIA  (Cdiscount, Rakuten, Alltricks, …)
@@ -259,60 +268,72 @@ const mirakl = {
 
   extractThreads(data) {
     return (
-      data.data ||
-      data.threads ||
-      data.items ||
-      data.results ||
-      data.inbox_threads ||
+      data?.data ||
+      data?.threads ||
+      data?.items ||
+      data?.results ||
+      data?.inbox_threads ||
       []
     );
   },
-  async fetchThread(provider, ctx) {
-    const base = miraklApiBase(provider.url);
 
-    const res = await fetch(
-      `${base}/api/inbox/threads/${encodeURIComponent(ctx.threadId)}?with_messages=true`,
-      {
-        headers: {
-          Authorization: provider.key,
-          Accept: 'application/json',
-        },
-      }
+  extractMessages(thread) {
+    return (
+      thread?.messages ||
+      thread?.data?.messages ||
+      thread?.thread?.messages ||
+      thread?.inbox_messages ||
+      thread?.message_list ||
+      []
     );
+  },
 
-    await throwHttpError('Mirakl', res);
-    const t = await res.json();
+  mapMessage(m, customerName) {
+    const rawDate = m.date_created || m.created_at || m.date_updated || m.updated_at || m.date || null;
+    const rawFrom = m.from?.type || m.from_type || m.author_type || m.sender?.type || m.sender_type || m.user_type || '';
+    const isCustomer = String(rawFrom).toUpperCase().includes('CUSTOMER') || String(rawFrom).toUpperCase().includes('BUYER');
 
-    const thread = t.data || t.thread || t;
+    return {
+      from: isCustomer ? 'client' : 'seller',
+      author: m.from?.display_name || m.from?.name || m.author?.name || m.sender?.name || (isCustomer ? customerName : 'Agent'),
+      at: parseMarketplaceDate(rawDate),
+      rawAt: rawDate,
+      text: m.body || m.text || m.message || m.content || m.description || '',
+      attachments: (m.attachments || m.files || []).map(a => ({
+        name: a.name || a.file_name || a.filename || 'Pièce jointe',
+        url: a.url || a.href || a.download_url || '',
+        size: a.size || a.file_size || null,
+      })),
+    };
+  },
+
+  mapThread(provider, thread, ctx = {}) {
+    const id = thread.id || thread.thread_id || thread.threadId || ctx.threadId;
+    const customer = thread.from?.display_name || thread.from?.name || thread.customer?.name || thread.buyer?.name || 'Client';
+    const rawUpdatedAt = thread.date_updated || thread.updated_at || thread.last_message_date || thread.date_created || thread.created_at || null;
+    const messages = this.extractMessages(thread).map(m => this.mapMessage(m, customer));
 
     return makeClaim(provider.code, {
       providerType: 'mirakl',
-      id: thread.id || thread.thread_id || thread.threadId || ctx.threadId,
-      customer: thread.from?.display_name || thread.from?.name || thread.customer?.name || 'Client',
-      subject: thread.topic?.value || thread.subject || thread.title || 'Réclamation',
-      orderId: thread.entities?.[0]?.id || thread.order_id || thread.orderId || '',
-      product: thread.entities?.[0]?.label || thread.product_title || thread.product || '',
+      id,
+      customer,
+      subject: thread.topic?.value || thread.topic?.label || thread.subject || thread.title || 'Réclamation',
+      orderId: thread.entities?.[0]?.id || thread.order_id || thread.orderId || thread.order?.id || '',
+      product: thread.entities?.[0]?.label || thread.product_title || thread.product || thread.offer?.sku || '',
       status: thread.status === 'CLOSED' || thread.closed === true ? 'resolu' : 'nouveau',
-      updatedAt: new Date(thread.date_updated || thread.updated_at || thread.date_created || Date.now()).getTime(),
-      messages: (thread.messages || []).map(m => ({
-        from:
-          m.from?.type === 'CUSTOMER' ||
-            m.from_type === 'CUSTOMER' ||
-            m.author_type === 'CUSTOMER'
-            ? 'client'
-            : 'seller',
-        at: new Date(m.date_created || m.created_at || m.date_updated || Date.now()).getTime(),
-        text: m.body || m.text || m.message || '',
-      })),
-      ctx: { threadId: thread.id || thread.thread_id || thread.threadId || ctx.threadId },
+      updatedAt: parseMarketplaceDate(rawUpdatedAt),
+      messages,
+      ctx: { threadId: id, rawUpdatedAt },
     });
   },
+
   async fetchAllThreads(provider) {
     const all = [];
 
     const max = Number(process.env.MIRAKL_PAGE_SIZE || 10);
     const maxPages = Number(process.env.MIRAKL_MAX_PAGES || 1);
     const withMessages = String(process.env.MIRAKL_WITH_MESSAGES || 'false') === 'true';
+    const monthsBack = Number(process.env.MIRAKL_MONTHS_BACK || 0);
 
     let offset = 0;
     let pageCount = 0;
@@ -323,8 +344,11 @@ const mirakl = {
       params.set('max', String(max));
       params.set('offset', String(offset));
 
-      if (withMessages) {
-        params.set('with_messages', 'true');
+      if (withMessages) params.set('with_messages', 'true');
+      if (monthsBack > 0) {
+        const since = new Date();
+        since.setMonth(since.getMonth() - monthsBack);
+        params.set('date_created_from', since.toISOString());
       }
 
       const data = await this.api(provider, `/inbox/threads?${params.toString()}`);
@@ -349,28 +373,17 @@ const mirakl = {
 
   async fetchClaims(provider) {
     const threads = await this.fetchAllThreads(provider);
+    return threads.map(t => this.mapThread(provider, t));
+  },
 
-    return threads.map(t => makeClaim(provider.code, {
-      providerType: 'mirakl',
-      id: t.id || t.thread_id || t.threadId,
-      customer: t.from?.display_name || t.from?.name || t.customer?.name || 'Client',
-      subject: t.topic?.value || t.subject || t.title || 'Réclamation',
-      orderId: t.entities?.[0]?.id || t.order_id || t.orderId || '',
-      product: t.entities?.[0]?.label || t.product_title || t.product || '',
-      status: t.status === 'CLOSED' || t.closed === true ? 'resolu' : 'nouveau',
-      updatedAt: new Date(t.date_updated || t.updated_at || t.date_created || Date.now()).getTime(),
-      messages: (t.messages || []).map(m => ({
-        from:
-          m.from?.type === 'CUSTOMER' ||
-            m.from_type === 'CUSTOMER' ||
-            m.author_type === 'CUSTOMER'
-            ? 'client'
-            : 'seller',
-        at: new Date(m.date_created || m.created_at || Date.now()).getTime(),
-        text: m.body || m.text || m.message || '',
-      })),
-      ctx: { threadId: t.id || t.thread_id || t.threadId },
-    }));
+  async fetchThread(provider, ctx) {
+    if (!ctx?.threadId) throw new Error('Mirakl : threadId manquant');
+
+    // Certaines instances renvoient directement le fil, d'autres un wrapper {data:{...}} ou {thread:{...}}.
+    // On demande les messages uniquement au clic, pour garder le chargement initial rapide.
+    const data = await this.api(provider, `/inbox/threads/${encodeURIComponent(ctx.threadId)}?with_messages=true`);
+    const thread = data?.data || data?.thread || data;
+    return this.mapThread(provider, thread, ctx);
   },
 
   async sendReply(provider, ctx, body) {
@@ -751,6 +764,25 @@ app.get('/api/reclamations/threads', async (_req, res) => {
     }
   }
   res.json(all);
+});
+
+
+app.get('/api/reclamations/threads/:id', async (req, res) => {
+  try {
+    const entry = claimIndex.get(req.params.id);
+    if (!entry) throw new Error('Réclamation inconnue. Rechargez la liste avant d’ouvrir le détail.');
+
+    const { provider, ctx } = entry;
+    const adapter = ADAPTERS[provider.type];
+    if (!adapter.fetchThread) throw new Error(`Le détail n’est pas encore géré pour ${provider.type}`);
+
+    const claim = await adapter.fetchThread(provider, ctx);
+    claimIndex.set(claim.id, { provider, ctx: claim._ctx || ctx });
+    delete claim._ctx;
+    res.json(claim);
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
 });
 
 app.post('/api/reclamations/threads/:id/message', async (req, res) => {
