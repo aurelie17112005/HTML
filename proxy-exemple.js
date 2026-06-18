@@ -332,7 +332,9 @@ const mirakl = {
 
     const max = Number(process.env.MIRAKL_PAGE_SIZE || 10);
     const maxPages = Number(process.env.MIRAKL_MAX_PAGES || 1);
-    const withMessages = String(process.env.MIRAKL_WITH_MESSAGES || 'false') === 'true';
+    // Important : pour savoir si une réclamation est vraiment sans réponse,
+    // il faut récupérer les messages. Par défaut on les demande à Mirakl.
+    const withMessages = String(process.env.MIRAKL_WITH_MESSAGES || 'true') === 'true';
     const monthsBack = Number(process.env.MIRAKL_MONTHS_BACK || 0);
 
     let offset = 0;
@@ -731,6 +733,33 @@ function isConfigured(p) {
 }
 const configured = () => PROVIDERS.filter(p => ADAPTERS[p.type] && isConfigured(p));
 
+
+// Une réclamation "à répondre" = ouverte + dernier message utile envoyé par le client.
+// On ne se base pas uniquement sur le statut marketplace, car certains statuts restent "open"
+// même après une réponse vendeur. Le dernier message est donc la source la plus fiable.
+function normalizeMessageTime(m) {
+  const t = Number(m?.at) || parseMarketplaceDate(m?.rawAt || m?.date || m?.created_at || m?.createdAt, 0);
+  return Number.isFinite(t) ? t : 0;
+}
+function claimNeedsReply(claim) {
+  if (!claim || claim.status === 'resolu') return false;
+  const messages = Array.isArray(claim.messages) ? claim.messages.filter(m => m && m.from) : [];
+  if (!messages.length) return false; // impossible de confirmer "sans réponse" sans fil de messages
+  const last = [...messages].sort((a, b) => normalizeMessageTime(a) - normalizeMessageTime(b)).at(-1);
+  return last?.from === 'client';
+}
+async function ensureClaimHasMessages(provider, claim) {
+  if (claim?.messages?.length) return claim;
+  const adapter = ADAPTERS[provider.type];
+  if (!adapter?.fetchThread || !claim?._ctx) return claim;
+  try {
+    return await adapter.fetchThread(provider, claim._ctx);
+  } catch (e) {
+    console.warn(`[${provider.type}/${provider.code || ''}] détail ignoré pour ${claim?.id || '?'} : ${e.message}`);
+    return claim;
+  }
+}
+
 // Index des claims en mémoire pour retrouver le contexte (_ctx) à la réponse.
 const claimIndex = new Map();
 
@@ -751,18 +780,31 @@ app.get('/api/reclamations/health', (_req, res) => {
   });
 });
 
-app.get('/api/reclamations/threads', async (_req, res) => {
+app.get('/api/reclamations/threads', async (req, res) => {
   const all = [];
   claimIndex.clear();
+
+  // Par défaut, ce proxy renvoie uniquement les réclamations auxquelles il faut répondre.
+  // Pour tout afficher ponctuellement : /api/reclamations/threads?all=1
+  const onlyUnanswered = req.query.all !== '1' && String(req.query.unanswered || '1') !== '0';
+
   for (const p of configured()) {
     try {
-      const claims = await ADAPTERS[p.type].fetchClaims(p);
-      claims.forEach(c => { claimIndex.set(c.id, { provider: p, ctx: c._ctx }); delete c._ctx; });
-      all.push(...claims);
+      const fetched = await ADAPTERS[p.type].fetchClaims(p);
+
+      for (const rawClaim of fetched) {
+        const claim = onlyUnanswered ? await ensureClaimHasMessages(p, rawClaim) : rawClaim;
+        if (onlyUnanswered && !claimNeedsReply(claim)) continue;
+
+        claimIndex.set(claim.id, { provider: p, ctx: claim._ctx || rawClaim._ctx });
+        delete claim._ctx;
+        all.push(claim);
+      }
     } catch (e) {
       console.error(`[${p.type}/${p.code || ''}] ${e.message}`); // une MP en panne n'empêche pas les autres
     }
   }
+
   res.json(all);
 });
 
