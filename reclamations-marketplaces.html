@@ -1029,6 +1029,21 @@ function normalizeClaim(c){
   };
 }
 
+async function readApiError(r, fallback){
+  let msg=fallback || ("Erreur API "+r.status);
+  try{
+    const txt=await r.text();
+    if(txt){
+      try{
+        const j=JSON.parse(txt);
+        msg=j.error || j.message || txt;
+        if(j.provider || j.operation) msg += ` [${[j.provider,j.operation].filter(Boolean).join(' / ')}]`;
+      }catch(e){ msg=txt; }
+    }
+  }catch(e){}
+  return msg;
+}
+
 const DataAPI = {
   async fetchClaims(){
     if(CONFIG.USE_DEMO_DATA) return structuredClone(DEMO);
@@ -1044,7 +1059,7 @@ const DataAPI = {
     const r = await fetch(`${CONFIG.API_BASE}/threads/${encodeURIComponent(id)}`, {
       headers:{'Accept':'application/json'}
     });
-    if(!r.ok) throw new Error("Erreur détail "+r.status);
+    if(!r.ok) throw new Error(await readApiError(r,"Erreur détail "+r.status));
     return normalizeClaim(await r.json());
   },
   async sendReply(id,message,status,files){
@@ -1058,7 +1073,39 @@ const DataAPI = {
       opts={method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({body:message,status})};
     }
     const r = await fetch(`${CONFIG.API_BASE}/threads/${encodeURIComponent(id)}/message`,opts);
-    if(!r.ok) throw new Error("Échec de l'envoi ("+r.status+")");
+    if(!r.ok) throw new Error(await readApiError(r,"Échec de l'envoi ("+r.status+")"));
+    return await r.json();
+  },
+  async fetchIncidents(){
+    if(CONFIG.USE_DEMO_DATA){ await new Promise(r=>setTimeout(r,150)); return null; }
+    const r = await fetch(`${CONFIG.API_BASE}/incidents`, {headers:{'Accept':'application/json'}});
+    if(!r.ok) throw new Error(await readApiError(r,"Erreur incidents "+r.status));
+    return await r.json();
+  },
+  async sendIncidentReply(id,message){
+    if(CONFIG.USE_DEMO_DATA){ await new Promise(r=>setTimeout(r,350)); return {ok:true,mode:'demo'}; }
+    const r = await fetch(`${CONFIG.API_BASE}/incidents/${encodeURIComponent(id)}/message`,{
+      method:'POST',
+      headers:{'Content-Type':'application/json','Accept':'application/json'},
+      body:JSON.stringify({body:message})
+    });
+    if(!r.ok){
+      throw new Error(await readApiError(r,"Échec de l'envoi incident ("+r.status+")"));
+    }
+    return await r.json();
+  },
+  async updateIncidentState(id,state){
+    if(CONFIG.USE_DEMO_DATA){ await new Promise(r=>setTimeout(r,120)); return {ok:true,persisted:false}; }
+    const r = await fetch(`${CONFIG.API_BASE}/incidents/${encodeURIComponent(id)}`,{
+      method:'PATCH',
+      headers:{'Content-Type':'application/json','Accept':'application/json'},
+      body:JSON.stringify({status:state})
+    });
+    if(!r.ok){
+      let msg="Échec de mise à jour incident ("+r.status+")";
+      try{ const j=await r.json(); if(j.error) msg=j.error; }catch(e){}
+      throw new Error(msg);
+    }
     return await r.json();
   },
   /* Récupération automatique du suivi auprès du transporteur (via le proxy).
@@ -1764,10 +1811,53 @@ const INC_SEED=[
   {openedAt:"2026-06-03T15:36",openedBy:"client",state:"en_cours",motif:"non_recu",orderId:"F905NM21185-A",orderAt:"2026-05-24T17:35",channel:"fnac",product:"Smartphone SAMSUNG Galaxy A26 Blanc 128G",sku:"000000000001218886",total:247.91,customer:"NATHALIE BARAUD",msgs:5,lastBy:"boutique",lastAt:"2026-06-04T09:12"},
   {openedAt:"2026-05-31T16:22",openedBy:"client",state:"en_cours",motif:"non_recu",orderId:"F905NL72799-A",orderAt:"2026-05-21T05:00",channel:"fnac",product:"Sans Fil DeathAdder V2 X HyperSpeed",sku:"000000009000699175",total:63.63,customer:"IMAN EL AAFIF",msgs:13,lastBy:"boutique",lastAt:"2026-06-11T12:49"}
 ];
-let INCIDENTS=[]; try{INCIDENTS=JSON.parse(localStorage.getItem("incidents_v2")||"null");}catch(e){INCIDENTS=null;}
-if(!INCIDENTS){ INCIDENTS=INC_SEED.map((r,i)=>Object.assign({id:"inc"+i},r)); }
-function saveIncidents(){ try{localStorage.setItem("incidents_v2",JSON.stringify(INCIDENTS));}catch(e){} }
+let INCIDENTS=[];
+let incidentsFromApi=false;
+function initDemoIncidents(){
+  let stored=null; try{stored=JSON.parse(localStorage.getItem("incidents_v2")||"null");}catch(e){stored=null;}
+  INCIDENTS=Array.isArray(stored)?stored:INC_SEED.map((r,i)=>Object.assign({id:"inc"+i},r));
+}
+if(CONFIG.USE_DEMO_DATA) initDemoIncidents();
+function saveIncidents(){ if(!CONFIG.USE_DEMO_DATA && incidentsFromApi) return; try{localStorage.setItem("incidents_v2",JSON.stringify(INCIDENTS));}catch(e){} }
 function incOptions(map,sel){ return Object.entries(map).map(([k,v])=>`<option value="${k}"${k===sel?" selected":""}>${v}</option>`).join(""); }
+function normalizeIncidentRow(r){
+  return {
+    id:r.id||r.claimId||"inc"+Math.random().toString(36).slice(2),
+    claimId:r.claimId||r.id||"",
+    remote:!!r.remote,
+    canReply:r.canReply!==false,
+    replyMode:r.replyMode||"",
+    openedAt:r.openedAt||new Date().toISOString().slice(0,16),
+    openedBy:r.openedBy||"client",
+    state:r.state||"en_cours",
+    motif:r.motif||"autre",
+    orderId:r.orderId||"",
+    orderAt:r.orderAt||r.openedAt||"",
+    channel:r.channel||r.marketplace||"",
+    product:r.product||"",
+    sku:r.sku||r.ean||"",
+    total:r.total??null,
+    customer:r.customer||"Client",
+    msgs:Number(r.msgs ?? (Array.isArray(r.conv)?r.conv.length:0))||0,
+    lastBy:r.lastBy||((Array.isArray(r.conv)&&r.conv.at(-1)?.by)||"client"),
+    lastAt:r.lastAt||r.openedAt||"",
+    conv:Array.isArray(r.conv)?r.conv:[]
+  };
+}
+async function refreshIncidents(){
+  if(CONFIG.USE_DEMO_DATA){ renderIncidents(); updateIncCount(); return; }
+  const badge=$("#incBadge"); if(badge) badge.textContent="…";
+  try{
+    const rows=await DataAPI.fetchIncidents();
+    INCIDENTS=(rows||[]).map(normalizeIncidentRow);
+    incidentsFromApi=true; incPage=1;
+    renderIncidents(); updateIncCount();
+  }catch(e){
+    incidentsFromApi=false;
+    toast("Incidents indisponibles : "+e.message,true);
+    renderIncidents(); updateIncCount();
+  }
+}
 function incDT(s){ if(!s) return "—"; const d=new Date(s); if(isNaN(d)) return s;
   return d.toLocaleDateString('fr-FR',{day:'numeric',month:'long',year:'numeric'})+' à '+String(d.getHours()).padStart(2,"0")+':'+String(d.getMinutes()).padStart(2,"0"); }
 function updateIncCount(){ const el=$("#incBadge"); if(!el)return; const n=INCIDENTS.filter(x=>x.state==="en_cours").length; el.textContent=n; el.classList.toggle("zero",n===0); }
@@ -1800,12 +1890,25 @@ function renderIncidents(){
     <td><div class="inc-main">Message</div><div class="inc-sub">${INC_BY[r.lastBy]||""} · ${incDT(r.lastAt)}</div></td>
     <td><button class="rm-row" data-id="${r.id}" title="Supprimer">🗑</button></td>
   </tr>`).join("");
-  $("#incBody").querySelectorAll("select[data-f]").forEach(el=>el.addEventListener("change",()=>{
+  $("#incBody").querySelectorAll("select[data-f]").forEach(el=>el.addEventListener("change",async()=>{
     const r=INCIDENTS.find(x=>x.id===el.dataset.id); if(!r)return;
-    r[el.dataset.f]=el.value; saveIncidents(); renderIncidents(); updateIncCount();
+    const old=r[el.dataset.f];
+    r[el.dataset.f]=el.value; renderIncidents(); updateIncCount();
+    try{
+      if(r.remote && el.dataset.f==="state") {
+        const res=await DataAPI.updateIncidentState(r.id,el.value);
+        if(res && res.persisted===false) toast("Statut modifié dans l'interface ; clôture marketplace non disponible via l'API actuelle.");
+      } else saveIncidents();
+    }catch(e){
+      r[el.dataset.f]=old; renderIncidents(); updateIncCount(); toast("Statut incident : "+e.message,true);
+    }
   }));
   $("#incBody").querySelectorAll(".ordref").forEach(el=>el.onclick=e=>copyCode(e,el,el.dataset.lbl||"Valeur"));
-  $("#incBody").querySelectorAll(".rm-row").forEach(b=>b.onclick=()=>{INCIDENTS=INCIDENTS.filter(x=>x.id!==b.dataset.id);saveIncidents();renderIncidents();updateIncCount();toast("Incident supprimé");});
+  $("#incBody").querySelectorAll(".rm-row").forEach(b=>b.onclick=()=>{
+    const r=INCIDENTS.find(x=>x.id===b.dataset.id);
+    if(r?.remote){ toast("Suppression locale désactivée pour un incident marketplace.",true); return; }
+    INCIDENTS=INCIDENTS.filter(x=>x.id!==b.dataset.id);saveIncidents();renderIncidents();updateIncCount();toast("Incident supprimé");
+  });
   $("#incBody").querySelectorAll("tr[data-id]").forEach(tr=>tr.addEventListener("click",e=>{
     if(e.target.closest("select,button,.ordref")) return;
     openIncident(tr.dataset.id);
@@ -1824,6 +1927,7 @@ function fillIncFilters(){
   const mp=$("#ifMp"); if(mp&&mp.options.length<=1){ CONFIG.OPERATORS.forEach(o=>{const op=document.createElement("option");op.value=o.code;op.textContent=o.label;mp.appendChild(op);}); }
 }
 function addIncident(){
+  if(!CONFIG.USE_DEMO_DATA && incidentsFromApi){ toast("Création locale désactivée : les incidents viennent de la marketplace.",true); return; }
   const nowS=new Date().toISOString().slice(0,16);
   INCIDENTS.unshift({id:"inc"+Date.now(),openedAt:nowS,openedBy:"client",state:"en_cours",motif:"non_conforme",orderId:"",orderAt:nowS,channel:"",product:"",sku:"",total:null,customer:"",msgs:0,lastBy:"boutique",lastAt:nowS});
   saveIncidents(); incPage=1; renderIncidents(); updateIncCount(); toast("Incident ajouté");
@@ -1841,19 +1945,35 @@ function openIncident(id){
   const inc=INCIDENTS.find(x=>x.id===id); if(!inc) return;
   incSelectedId=id;
   $("#incmTitle").innerHTML=(mpBadge(inc.channel))+" "+esc(INC_MOTIFS[inc.motif]||inc.motif||"Incident");
-  $("#incmMeta").innerHTML=esc(inc.customer||"")+" · Commande "+esc(inc.orderId||"—")+" · "+esc(inc.product||"");
-  $("#incReply").value=""; renderIncConv(inc);
+  const replyInfo = inc.remote ? (inc.replyMode==="order_comment" ? " · réponse via commentaire commande" : " · réponse marketplace") : "";
+  $("#incmMeta").innerHTML=esc(inc.customer||"")+" · Commande "+esc(inc.orderId||"—")+" · "+esc(inc.product||"")+esc(replyInfo);
+  $("#incReply").value="";
+  $("#incReply").disabled = inc.canReply===false;
+  $("#incSend").disabled = inc.canReply===false;
+  if(inc.canReply===false) $("#incReply").placeholder="Impossible de répondre : aucun identifiant message/commande exploitable.";
+  else $("#incReply").placeholder="Bonjour, merci pour votre message…";
+  renderIncConv(inc);
   $("#incModalBg").classList.add("show"); $("#incModal").classList.add("show");
-  setTimeout(()=>{const t=$("#incReply"); if(t) t.focus();},50);
+  setTimeout(()=>{const t=$("#incReply"); if(t && !t.disabled) t.focus();},50);
 }
 function closeIncident(){ $("#incModalBg").classList.remove("show"); $("#incModal").classList.remove("show"); incSelectedId=null; }
-function sendIncidentMsg(){
+async function sendIncidentMsg(){
   const inc=INCIDENTS.find(x=>x.id===incSelectedId); if(!inc) return;
   const text=$("#incReply").value.trim(); if(!text){ toast("Saisissez un message.",true); return; }
-  inc.conv=inc.conv||[]; inc.conv.push({at:Date.now(),by:"boutique",text});
-  inc.msgs=(inc.msgs||0)+1; inc.lastBy="boutique"; inc.lastAt=new Date().toISOString().slice(0,16);
-  saveIncidents(); renderIncConv(inc); renderIncidents(); updateIncCount();
-  $("#incReply").value=""; playSendAnimation(); toast("Message envoyé à "+(inc.customer||"client"));
+  if(inc.canReply===false){ toast("Impossible de répondre à cet incident : identifiant message/commande manquant.",true); return; }
+  const btn=$("#incSend"); btn.disabled=true; btn.textContent="Envoi…";
+  try{
+    let result={mode:'local'};
+    if(inc.remote) result=await DataAPI.sendIncidentReply(inc.id,text);
+    inc.conv=inc.conv||[]; inc.conv.push({at:Date.now(),by:"boutique",text});
+    inc.msgs=(inc.msgs||0)+1; inc.lastBy="boutique"; inc.lastAt=new Date().toISOString().slice(0,16);
+    if(!inc.remote) saveIncidents();
+    renderIncConv(inc); renderIncidents(); updateIncCount();
+    $("#incReply").value=""; playSendAnimation();
+    const suffix=result.mode==="client_order_comments_update"?" (commentaire commande)":"";
+    toast("Message envoyé à "+(inc.customer||"client")+suffix);
+  }catch(e){ toast("Erreur incident : "+e.message,true); }
+  finally{ btn.disabled=false; btn.textContent="Envoyer le message"; }
 }
 
 /* ===== Réponses types (bibliothèque, mémorisée) ===== */
@@ -2500,6 +2620,7 @@ async function load(){
     claims.forEach(c=>{ if(c.status==="encours"||c.status==="attente") c.status="nouveau"; c.slaHours=slaInfo(c).hours; });
     syncEuroRefunds();
     renderKPIs(); renderEvo(); renderCharts(); renderTable();
+    refreshIncidents().catch(e=>toast("Incidents : "+e.message,true));
   }catch(e){toast("Chargement impossible : "+e.message,true);}
   finally{$("#btnRefresh").textContent="↻ Actualiser";}
 }
