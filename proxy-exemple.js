@@ -120,6 +120,74 @@ function parseMarketplaceDate(raw, fallback = Date.now()) {
   return t;
 }
 
+function cleanText(v) {
+  return String(v ?? '')
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+function isBadSubject(v) {
+  const s = cleanText(v);
+  if (!s) return true;
+  // Certains Mirakl, notamment Boulanger, renvoient un code numérique dans topic.value.
+  // Ce code ne doit jamais être affiché comme sujet client.
+  if (/^[#_\-\s]*\d+[#_\-\s]*$/.test(s)) return true;
+  if (/^(topic|subject|reason|motif)[_\-\s]*\d+$/i.test(s)) return true;
+  return false;
+}
+function firstReadableSubject(...values) {
+  for (const v of values) {
+    if (v && typeof v === 'object') {
+      const nested = firstReadableSubject(v.label, v.name, v.title, v.value, v.code);
+      if (nested) return nested;
+      continue;
+    }
+    const s = cleanText(v);
+    if (!isBadSubject(s)) return s;
+  }
+  return '';
+}
+function inferSubjectFromText(text) {
+  const s = cleanText(text);
+  if (!s) return '';
+  const t = s.toLowerCase();
+  if (/(colis|commande).*(pas|non|jamais).*(reçu|recu|livré|livre)|livré.*rien reçu|non[ -]?reçu/.test(t)) return 'Colis non reçu';
+  if (/endommag|cass[ée]e?|fissur|ab[iî]m/.test(t)) return 'Produit endommagé';
+  if (/d[ée]fect|panne|ne fonctionne|fonctionne pas|ne s.allume/.test(t)) return 'Produit défectueux';
+  if (/non conforme|mauvais[e]? r[ée]f[ée]rence|erreur de r[ée]f[ée]rence|pas celui command/.test(t)) return 'Produit non conforme';
+  if (/retour|renvoi|renvoyer|retractation|rétractation/.test(t)) return 'Demande de retour';
+  if (/rembours/.test(t)) return 'Remboursement';
+  if (/facture/.test(t)) return 'Facture manquante';
+  if (/garantie|sav/.test(t)) return 'Question SAV / garantie';
+  if (/retard|d[ée]lai|livraison.*d[ée]pass/.test(t)) return 'Retard de livraison';
+  return s.length > 70 ? `${s.slice(0, 67)}…` : s;
+}
+function normalizeSubject(subject, fallbackText = '') {
+  return firstReadableSubject(subject) || inferSubjectFromText(fallbackText) || 'Réclamation client';
+}
+async function fetchWithTimeout(url, options = {}, timeoutMs = Number(process.env.PROVIDER_TIMEOUT_MS || 15000)) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: ctrl.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+async function mapLimit(items, limit, fn) {
+  const out = new Array(items.length);
+  let i = 0;
+  const workers = Array.from({ length: Math.min(Math.max(1, limit), items.length) }, async () => {
+    while (i < items.length) {
+      const idx = i++;
+      out[idx] = await fn(items[idx], idx);
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}
+
 /* =====================================================================
    3) ADAPTATEUR OCTOPIA  (Cdiscount, Rakuten, Alltricks, …)
    API Discussions v2 — endpoints réels.
@@ -132,7 +200,7 @@ const octopia = (() => {
     const body = new URLSearchParams({
       client_id: auth.clientId, client_secret: auth.clientSecret, grant_type: 'client_credentials',
     });
-    const res = await fetch(auth.tokenUrl, {
+    const res = await fetchWithTimeout(auth.tokenUrl, {
       method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body,
     });
     if (!res.ok) throw new Error(`Octopia auth ${res.status}`);
@@ -144,7 +212,7 @@ const octopia = (() => {
   async function api(provider, path, opts = {}) {
     const auth = provider.auth;
     const token = await getToken(auth);
-    const res = await fetch(`${auth.apiBase}${path}`, {
+    const res = await fetchWithTimeout(`${auth.apiBase}${path}`, {
       ...opts,
       headers: {
         Authorization: `Bearer ${token}`,
@@ -240,7 +308,7 @@ const mirakl = {
     const base = miraklApiBase(provider.url);
     const url = `${base}/api${path.startsWith('/') ? path : '/' + path}`;
 
-    const res = await fetch(url, {
+    const res = await fetchWithTimeout(url, {
       headers: {
         Authorization: provider.key,
         Accept: 'application/json',
@@ -312,14 +380,27 @@ const mirakl = {
     const customer = thread.from?.display_name || thread.from?.name || thread.customer?.name || thread.buyer?.name || 'Client';
     const rawUpdatedAt = thread.date_updated || thread.updated_at || thread.last_message_date || thread.date_created || thread.created_at || null;
     const messages = this.extractMessages(thread).map(m => this.mapMessage(m, customer));
+    const lastClientText = [...messages].reverse().find(m => m.from === 'client')?.text || '';
+
+    const subject = firstReadableSubject(
+      thread.topic?.label,
+      thread.reason?.label,
+      thread.reason_label,
+      thread.category?.label,
+      thread.subject,
+      thread.title,
+      thread.topic?.name,
+      thread.topic?.value,
+      thread.reason?.value
+    ) || inferSubjectFromText(lastClientText);
 
     return makeClaim(provider.code, {
       providerType: 'mirakl',
       id,
       customer,
-      subject: thread.topic?.value || thread.topic?.label || thread.subject || thread.title || 'Réclamation',
-      orderId: thread.entities?.[0]?.id || thread.order_id || thread.orderId || thread.order?.id || '',
-      product: thread.entities?.[0]?.label || thread.product_title || thread.product || thread.offer?.sku || '',
+      subject: normalizeSubject(subject, lastClientText),
+      orderId: thread.entities?.find?.(e => /order/i.test(e.type || e.entity_type || ''))?.id || thread.entities?.[0]?.id || thread.order_id || thread.orderId || thread.order?.id || '',
+      product: thread.entities?.find?.(e => /product|offer/i.test(e.type || e.entity_type || ''))?.label || thread.entities?.[0]?.label || thread.product_title || thread.product || thread.offer?.sku || '',
       status: thread.status === 'CLOSED' || thread.closed === true ? 'resolu' : 'nouveau',
       updatedAt: parseMarketplaceDate(rawUpdatedAt),
       messages,
@@ -439,7 +520,7 @@ const bomp = (() => {
   }
 
   async function postXml(provider, operation, body) {
-    const res = await fetch(serviceUrl(provider, operation), {
+    const res = await fetchWithTimeout(serviceUrl(provider, operation), {
       method: 'POST',
       headers: { 'Content-Type': 'text/xml', Accept: 'text/xml, application/xml' },
       body,
@@ -493,7 +574,7 @@ ${inner}
       providerType: 'bomp',
       id: incidentId || orderId || Math.random().toString(36).slice(2),
       customer: it['@_customer'] || it.customer || it.buyer || 'Client',
-      subject: it['@_reason'] || it.reason || it.subject || 'Réclamation',
+      subject: normalizeSubject(it['@_reason'] || it.reason || it.subject, msgs.at(-1)?.text),
       orderId,
       product: it['@_product'] || it.product_name,
       priority: 'haute',
@@ -510,7 +591,7 @@ ${inner}
       providerType: 'bomp',
       id,
       customer: m.client_id || m.customer || 'Client',
-      subject: m.subject || m.message_subject || 'Message client',
+      subject: normalizeSubject(m.subject || m.message_subject, m.description || m.message || m.body),
       orderId: m.order_fnac_id || m.order_id || '',
       product: m.offer_seller_id || m.offer_fnac_id || '',
       priority: 'moyenne',
@@ -787,24 +868,35 @@ app.get('/api/reclamations/threads', async (req, res) => {
   // Par défaut, ce proxy renvoie uniquement les réclamations auxquelles il faut répondre.
   // Pour tout afficher ponctuellement : /api/reclamations/threads?all=1
   const onlyUnanswered = req.query.all !== '1' && String(req.query.unanswered || '1') !== '0';
+  const providers = configured();
+  const concurrency = Number(req.query.concurrency || process.env.PROVIDER_CONCURRENCY || 6);
 
-  for (const p of configured()) {
+  await mapLimit(providers, concurrency, async (p) => {
     try {
       const fetched = await ADAPTERS[p.type].fetchClaims(p);
+      const kept = [];
 
       for (const rawClaim of fetched) {
         const claim = onlyUnanswered ? await ensureClaimHasMessages(p, rawClaim) : rawClaim;
         if (onlyUnanswered && !claimNeedsReply(claim)) continue;
 
+        claim.subject = normalizeSubject(
+          claim.subject,
+          Array.isArray(claim.messages) ? [...claim.messages].reverse().find(m => m.from === 'client')?.text : ''
+        );
         claimIndex.set(claim.id, { provider: p, ctx: claim._ctx || rawClaim._ctx });
         delete claim._ctx;
-        all.push(claim);
+        kept.push(claim);
       }
+
+      all.push(...kept);
+      console.log(`[${p.type}/${p.code || 'octopia'}] ${kept.length}/${fetched.length} réclamation(s) à répondre`);
     } catch (e) {
       console.error(`[${p.type}/${p.code || ''}] ${e.message}`); // une MP en panne n'empêche pas les autres
     }
-  }
+  });
 
+  all.sort((a, b) => Number(b.updatedAt || 0) - Number(a.updatedAt || 0));
   res.json(all);
 });
 

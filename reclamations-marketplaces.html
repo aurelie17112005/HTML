@@ -976,12 +976,47 @@ const CONFIG = {
   SLA_LATE: 0, SLA_SOON: 8,
 };
 
+function cleanSubjectText(v){
+  return String(v ?? "")
+    .replace(/<[^>]*>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+function isBadDisplaySubject(v){
+  const s=cleanSubjectText(v);
+  if(!s) return true;
+  return /^[#_\-\s]*\d+[#_\-\s]*$/.test(s) || /^(topic|subject|reason|motif)[_\-\s]*\d+$/i.test(s);
+}
+function inferDisplaySubject(text){
+  const s=cleanSubjectText(text);
+  if(!s) return "";
+  const t=s.toLowerCase();
+  if(/(colis|commande).*(pas|non|jamais).*(reçu|recu|livré|livre)|livré.*rien reçu|non[ -]?reçu/.test(t)) return "Colis non reçu";
+  if(/endommag|cass[ée]e?|fissur|ab[iî]m/.test(t)) return "Produit endommagé";
+  if(/d[ée]fect|panne|ne fonctionne|fonctionne pas|ne s.allume/.test(t)) return "Produit défectueux";
+  if(/non conforme|mauvais[e]? r[ée]f[ée]rence|erreur de r[ée]f[ée]rence|pas celui command/.test(t)) return "Produit non conforme";
+  if(/retour|renvoi|renvoyer|retractation|rétractation/.test(t)) return "Demande de retour";
+  if(/rembours/.test(t)) return "Remboursement";
+  if(/facture/.test(t)) return "Facture manquante";
+  if(/garantie|sav/.test(t)) return "Question SAV / garantie";
+  if(/retard|d[ée]lai|livraison.*d[ée]pass/.test(t)) return "Retard de livraison";
+  return s.length>70 ? s.slice(0,67)+"…" : s;
+}
+function normalizeDisplaySubject(subject,messages){
+  const s=cleanSubjectText(subject);
+  if(!isBadDisplaySubject(s)) return s;
+  const lastClient=[...(Array.isArray(messages)?messages:[])].reverse().find(m=>m.from==="client")?.text || "";
+  return inferDisplaySubject(lastClient) || "Réclamation client";
+}
+
 function normalizeClaim(c){
+  const messages = Array.isArray(c.messages) ? c.messages : [];
   return {
     id: c.id || `${c.marketplace || "unknown"}-${Math.random().toString(36).slice(2)}`,
     marketplace: c.marketplace || "unknown",
     customer: c.customer || "Client",
-    subject: c.subject || "Réclamation",
+    subject: normalizeDisplaySubject(c.subject, messages),
     orderId: c.orderId || "",
     product: c.product || "",
     ean: c.ean || "",
@@ -989,7 +1024,7 @@ function normalizeClaim(c){
     status: c.status || "nouveau",
     updatedAt: c.updatedAt || Date.now(),
     dueAt: c.dueAt || Date.now() + 24 * 3600 * 1000,
-    messages: Array.isArray(c.messages) ? c.messages : [],
+    messages,
     tracking: c.tracking || null,
   };
 }
@@ -2461,7 +2496,7 @@ function closeAllTabs(){ showPage("tabStats"); }
 
 async function load(){
   try{ $("#btnRefresh").textContent="↻ Chargement…";
-    claims=await DataAPI.fetchClaims();
+    claims=(await DataAPI.fetchClaims()).map(normalizeClaim);
     claims.forEach(c=>{ if(c.status==="encours"||c.status==="attente") c.status="nouveau"; c.slaHours=slaInfo(c).hours; });
     syncEuroRefunds();
     renderKPIs(); renderEvo(); renderCharts(); renderTable();
