@@ -1195,16 +1195,23 @@ const bomp = (() => {
     return cleanText(firstValue(err['#text'], err.message, err.description, err.label, err.code, JSON.stringify(err)));
   }
 
-  async function postXml(provider, operation, body) {
+  function isBompAuthFailureText(txt = '') {
+    return /ERR_097|Authentication failed|authentification|authentication/i.test(String(txt || ''));
+  }
+
+  function maskBompSecrets(body = '') {
+    return String(body || '')
+      .replace(/<key>.*?<\/key>/is, '<key>***</key>')
+      .replace(/token="[^"]*"/i, 'token="***"')
+      .slice(0, 1200);
+  }
+
+  async function postXmlOnce(provider, operation, body) {
     const url = serviceUrl(provider, operation);
 
     if (String(process.env.BOMP_DEBUG || '') === '1') {
       console.log(`[bomp/${provider.code}] POST ${operation} -> ${url}`);
-      // On masque les secrets avant d'afficher le XML.
-      console.log(String(body || '')
-        .replace(/<key>.*?<\/key>/is, '<key>***</key>')
-        .replace(/token="[^"]+"/i, 'token="***"')
-        .slice(0, 1200));
+      console.log(maskBompSecrets(body));
     }
 
     const res = await fetchWithTimeout(url, {
@@ -1224,29 +1231,59 @@ const bomp = (() => {
       console.log(String(txt || '').slice(0, 2000));
     }
 
+    return { res, txt };
+  }
+
+  async function postXml(provider, operation, body, opts = {}) {
+    const { res, txt } = await postXmlOnce(provider, operation, body);
+    const authFailedHttp = isBompAuthFailureText(txt);
+
+    // Fnac/Darty peut renvoyer ERR_097 lorsqu'un token BOMP gardé en cache est refusé.
+    // Dans ce cas on supprime le token, on refait une auth, puis on rejoue UNE fois la requête.
+    // Si ça échoue encore, le problème vient réellement des identifiants .env ou des accès API.
     if (!res.ok) {
-      // On garde le vrai code HTTP dans statusCode. Avant, tout devenait 502,
-      // ce qui cachait les 401/403 d'identifiants ou d'accès API.
+      if (operation !== 'auth' && authFailedHttp && !opts.retriedAfterAuthRefresh) {
+        tokens.delete(provider.code);
+        if (String(process.env.BOMP_DEBUG || '') === '1') {
+          console.warn(`[bomp/${provider.code}] ${operation}: token refusé (ERR_097), ré-authentification puis retry une fois.`);
+        }
+        const freshToken = await getToken(provider, { force: true });
+        const retriedBody = String(body || '').replace(/token="[^"]*"/i, `token="${xmlEscape(freshToken)}"`);
+        return postXml(provider, operation, retriedBody, { retriedAfterAuthRefresh: true });
+      }
+
       throw Object.assign(
         new Error(`BOMP ${operation} HTTP ${res.status}${txt ? ' — ' + txt.slice(0, 1000) : ''}`),
-        { statusCode: res.status, provider: provider.code, operation }
+        { statusCode: res.status, provider: provider.code, operation, authFailed: authFailedHttp }
       );
     }
 
     const parsed = parser.parse(txt || '<empty/>');
     const apiError = findBompError(parsed, operation);
+    const authFailedApi = isBompAuthFailureText(apiError || txt);
+
     if (apiError) {
+      if (operation !== 'auth' && authFailedApi && !opts.retriedAfterAuthRefresh) {
+        tokens.delete(provider.code);
+        if (String(process.env.BOMP_DEBUG || '') === '1') {
+          console.warn(`[bomp/${provider.code}] ${operation}: token refusé par API (${apiError}), ré-authentification puis retry une fois.`);
+        }
+        const freshToken = await getToken(provider, { force: true });
+        const retriedBody = String(body || '').replace(/token="[^"]*"/i, `token="${xmlEscape(freshToken)}"`);
+        return postXml(provider, operation, retriedBody, { retriedAfterAuthRefresh: true });
+      }
+
       throw Object.assign(
         new Error(`BOMP ${operation} refusé : ${apiError}`),
-        { statusCode: 400, provider: provider.code, operation }
+        { statusCode: 400, provider: provider.code, operation, authFailed: authFailedApi }
       );
     }
     return parsed;
   }
 
-  async function getToken(provider) {
+  async function getToken(provider, opts = {}) {
     const cached = tokens.get(provider.code);
-    if (cached && Date.now() < cached.exp) return cached.value;
+    if (!opts.force && String(process.env.BOMP_DISABLE_TOKEN_CACHE || '') !== '1' && cached && Date.now() < cached.exp) return cached.value;
     // Schéma réel Fnac/Darty : les identifiants sont des BALISES, pas des attributs.
     const body = `<?xml version="1.0" encoding="utf-8"?>
 <auth xmlns="${FNAC_NS}">
@@ -1490,6 +1527,9 @@ ${inner}
   }
 
   function bompQueryXml(provider, token, operation, elements = {}, resultsCount = 100) {
+    // Si une requête précédente a forcé une ré-authentification, on prend
+    // automatiquement le dernier token en cache plutôt que l'ancien token local.
+    const activeToken = tokens.get(provider.code)?.value || token;
     const inner = Object.entries(elements)
       .filter(([, v]) => v !== undefined && v !== null && v !== '')
       .map(([k, v]) => Array.isArray(v)
@@ -1498,7 +1538,7 @@ ${inner}
       .filter(Boolean)
       .join('\n') || '  <paging>1</paging>';
     const attrs = resultsCount ? ` results_count="${xmlEscape(resultsCount)}"` : '';
-    return authedRequest(provider, token, operation, inner, attrs);
+    return authedRequest(provider, activeToken, operation, inner, attrs);
   }
 
   function mergeClaimDetails(base, detail) {
@@ -1835,6 +1875,20 @@ ${inner}
   }
 
   return {
+    async authCheck(provider) {
+      tokens.delete(provider.code);
+      const token = await getToken(provider, { force: true });
+      return {
+        ok: Boolean(token),
+        code: provider.code,
+        label: provider.label,
+        type: 'bomp',
+        apiBase: provider.apiBase,
+        hasToken: Boolean(token),
+        tokenPreview: token ? `${String(token).slice(0, 6)}…${String(token).slice(-4)}` : ''
+      };
+    },
+
     async fetchProductNotes(provider, options = {}) {
       const token = await getToken(provider);
       const notes = [];
@@ -2426,6 +2480,31 @@ app.get('/api/reclamations/diagnostic', (_req, res) => {
       missing: missingConfig(p),
       apiBase: p.type === 'octopia' ? p.auth.apiBase : (p.apiBase || miraklApiBase(p.url || '')),
     })),
+  });
+});
+
+app.get('/api/reclamations/bomp-auth-check', async (_req, res) => {
+  const providers = configured().filter(p => p.type === 'bomp');
+  const results = await Promise.all(providers.map(async p => {
+    try {
+      return await bomp.authCheck(p);
+    } catch (e) {
+      return {
+        ok: false,
+        code: p.code,
+        label: p.label,
+        type: 'bomp',
+        apiBase: p.apiBase,
+        missing: missingConfig(p),
+        authFailed: Boolean(e.authFailed || /ERR_097|Authentication failed/i.test(String(e.message || ''))),
+        error: e.message
+      };
+    }
+  }));
+  res.status(results.some(r => !r.ok) ? 500 : 200).json({
+    ok: results.length > 0 && results.every(r => r.ok),
+    count: results.length,
+    results
   });
 });
 
