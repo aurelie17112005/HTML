@@ -107,6 +107,55 @@ function makeClaim(marketplace, o) {
     _ctx: o.ctx || {},                                // données techniques utiles à la réponse
   };
 }
+
+function normalizeRatingValue(raw) {
+  const s = scalarValue(raw).replace(',', '.');
+  const m = s.match(/-?\d+(?:\.\d+)?/);
+  if (!m) return null;
+  const n = Number(m[0]);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  // Certaines APIs renvoient 10/20/100 ; on ramène tout sur 5 étoiles.
+  if (n > 20) return Math.max(1, Math.min(5, Math.round((n / 100) * 5)));
+  if (n > 5 && n <= 10) return Math.max(1, Math.min(5, Math.round(n / 2)));
+  if (n > 10 && n <= 20) return Math.max(1, Math.min(5, Math.round(n / 4)));
+  return Math.max(1, Math.min(5, Math.round(n)));
+}
+
+function makeProductNote(marketplace, o = {}) {
+  const rating = normalizeRatingValue(o.rating ?? o.rate ?? o.score ?? o.grade ?? o.stars);
+  const idBase = scalarFirst(o.id, o.commentId, o.evaluationId, o.orderId, o.ean, o.product, Date.now());
+  return {
+    id: `${marketplace}:note:${idBase}`,
+    marketplace,
+    orderId: scalarFirst(o.orderId, o.order_id, o.orderFnacId, o.orderReference),
+    customer: cleanText(scalarFirst(o.customer, o.customerName, o.buyer, o.client)) || 'Client',
+    product: cleanText(scalarFirst(o.product, o.productName, o.product_title, o.title, o.offerSellerId, o.sku)),
+    ean: cleanText(scalarFirst(o.ean, o.gtin, o.product_reference, o.productReference, o.offerSellerId, o.sellerSku)),
+    rating,
+    visible: o.visible !== false,
+    comment: cleanText(scalarFirst(o.comment, o.review, o.body, o.text, o.message, o.description)),
+    at: parseMarketplaceDate(scalarFirst(o.at, o.createdAt, o.updatedAt, o.date), Date.now()),
+    reply: cleanText(scalarFirst(o.reply, o.sellerReply, o.answer, o.seller_answer)),
+    repliedBy: cleanText(scalarFirst(o.repliedBy, o.agent, o.seller, o.author)),
+    source: cleanText(scalarFirst(o.source, o.providerType, 'api')),
+    _ctx: o.ctx || {},
+  };
+}
+
+function productNoteIsUsable(n) {
+  return Boolean(n && n.rating && (n.comment || n.orderId || n.product || n.ean));
+}
+
+function dedupeProductNotes(notes) {
+  const seen = new Set();
+  return (notes || []).filter(n => {
+    if (!productNoteIsUsable(n)) return false;
+    const key = [n.marketplace, n.orderId, n.ean, n.rating, n.comment, n.at].map(v => String(v || '').toLowerCase()).join('|');
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -148,12 +197,34 @@ function publicErrorPayload(e, fallbackStatus = 502) {
   };
 }
 function parseMarketplaceDate(raw, fallback = Date.now()) {
-  if (!raw) return fallback;
+  if (raw == null || raw === '') {
+    return fallback;
+  }
+
+  // timestamp numérique (ms ou secondes)
+  if (
+    typeof raw === 'number' ||
+    /^\d+$/.test(String(raw))
+  ) {
+    const n = Number(raw);
+
+    const ms =
+      String(Math.abs(n)).length >= 13
+        ? n
+        : n * 1000;
+
+    return Number.isFinite(ms)
+      ? ms
+      : fallback;
+  }
+
   const t = new Date(raw).getTime();
+
   if (Number.isNaN(t)) {
     console.warn('[date] Date invalide reçue :', raw);
     return fallback;
   }
+
   return t;
 }
 
@@ -167,10 +238,11 @@ function cleanText(v) {
 function isBadSubject(v) {
   const s = cleanText(v);
   if (!s) return true;
-  // Certains Mirakl, notamment Boulanger, renvoient un code numérique dans topic.value.
-  // Ce code ne doit jamais être affiché comme sujet client.
+  // Certains opérateurs renvoient un code numérique ou un libellé générique.
+  // Ce code/libellé ne doit jamais être affiché comme sujet client.
   if (/^[#_\-\s]*\d+[#_\-\s]*$/.test(s)) return true;
   if (/^(topic|subject|reason|motif)[_\-\s]*\d+$/i.test(s)) return true;
+  if (/^(r[ée]clamation|r[ée]clamation client|incident|message client|demande client|customer claim|customer complaint|claim|echanger avec le vendeur partenaire|échanger avec le vendeur partenaire)$/i.test(s)) return true;
   return false;
 }
 function firstReadableSubject(...values) {
@@ -337,6 +409,148 @@ async function mapLimit(items, limit, fn) {
   return out;
 }
 
+
+function parseBoolFlag(v, defaultValue = false) {
+  if (v === undefined || v === null || v === '') return defaultValue;
+  return /^(1|true|yes|on)$/i.test(String(v));
+}
+
+function positiveInt(v, fallback, min = 0, max = Number.MAX_SAFE_INTEGER) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, Math.round(n)));
+}
+
+function promiseWithTimeout(promise, timeoutMs, label = 'opération') {
+  const ms = Number(timeoutMs || 0);
+  if (!ms || ms <= 0) return promise;
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(Object.assign(new Error(`${label} trop longue (${ms} ms)`), { statusCode: 504 })), ms);
+    })
+  ]).finally(() => clearTimeout(timer));
+}
+
+const notesCache = new Map();
+const notesInFlight = new Map();
+
+function notesRequestOptions(query = {}) {
+  const fast = String(query.fast ?? process.env.NOTES_FAST_MODE ?? '1') !== '0';
+  return {
+    fast,
+    providers: cleanText(query.providers || process.env.NOTES_PROVIDERS || ''),
+    includeMirakl: parseBoolFlag(query.includeMirakl ?? process.env.MIRAKL_NOTES_FAST_ENABLE, !fast),
+    enrich: parseBoolFlag(query.enrich ?? process.env.NOTES_ENRICH, !fast),
+    pages: positiveInt(query.pages || query.maxPages, fast ? 1 : 3, 1, 50),
+    pageSize: positiveInt(query.pageSize || query.limitPerPage, fast ? 50 : 100, 1, 500),
+    maxOrders: positiveInt(query.maxOrders, fast ? 8 : 40, 0, 500),
+    limit: positiveInt(query.limit, fast ? 150 : 0, 0, 5000),
+    concurrency: positiveInt(query.concurrency || process.env.NOTES_PROVIDER_CONCURRENCY || process.env.PROVIDER_CONCURRENCY, fast ? 2 : 4, 1, 20),
+    providerTimeoutMs: positiveInt(query.providerTimeoutMs || process.env.NOTES_PROVIDER_TIMEOUT_MS, fast ? 9000 : 30000, 0, 120000),
+    cacheTtlMs: positiveInt(query.cacheTtlMs || process.env.NOTES_CACHE_TTL_MS, 10 * 60 * 1000, 0, 24 * 60 * 60 * 1000),
+    staleWhileRefresh: String(query.stale ?? process.env.NOTES_STALE_WHILE_REFRESH ?? '1') !== '0',
+  };
+}
+
+function notesCacheKey(opts) {
+  return JSON.stringify({
+    fast: opts.fast,
+    providers: opts.providers,
+    includeMirakl: opts.includeMirakl,
+    enrich: opts.enrich,
+    pages: opts.pages,
+    pageSize: opts.pageSize,
+    maxOrders: opts.maxOrders,
+    limit: opts.limit,
+  });
+}
+
+function filterNoteProviders(providers, opts) {
+  const wanted = new Set(String(opts.providers || '')
+    .split(',')
+    .map(s => s.trim().toLowerCase())
+    .filter(Boolean));
+
+  return providers.filter(p => {
+    const code = String(p.code || 'octopia').toLowerCase();
+    const type = String(p.type || '').toLowerCase();
+    if (wanted.size && !wanted.has(code) && !wanted.has(type)) return false;
+
+    // Mode rapide : Mirakl est le plus coûteux car OR51 est appelé commande par commande.
+    // Il reste activable avec ?includeMirakl=1 ou ?fast=0.
+    if (opts.fast && type === 'mirakl' && !opts.includeMirakl) return false;
+    return true;
+  });
+}
+
+async function collectProductNotes(options = {}) {
+  const all = [];
+  const providers = filterNoteProviders(
+    configured().filter(p => typeof ADAPTERS[p.type]?.fetchProductNotes === 'function'),
+    options
+  );
+
+  await mapLimit(providers, options.concurrency, async (p) => {
+    try {
+      const fetched = await promiseWithTimeout(
+        ADAPTERS[p.type].fetchProductNotes(p, options),
+        options.providerTimeoutMs,
+        `notes ${p.type}/${p.code || 'octopia'}`
+      );
+      const clean = dedupeProductNotes(fetched).map(n => {
+        const copy = { ...n };
+        delete copy._ctx;
+        return copy;
+      });
+      all.push(...clean);
+      console.log(`[${p.type}/${p.code || 'octopia'}] ${clean.length} note(s) produit/client récupérée(s)`);
+    } catch (e) {
+      console.error(`[notes/${p.type}/${p.code || ''}] ${e.message}`);
+    }
+  });
+
+  all.sort((a, b) => Number(b.at || 0) - Number(a.at || 0));
+  return options.limit ? all.slice(0, options.limit) : all;
+}
+
+async function getProductNotesCached(options = {}, forceRefresh = false) {
+  const key = notesCacheKey(options);
+  const now = Date.now();
+  const cached = notesCache.get(key);
+
+  if (!forceRefresh && cached && options.cacheTtlMs > 0 && (now - cached.at) < options.cacheTtlMs) {
+    return { data: cached.data, cache: 'HIT', key };
+  }
+
+  if (!forceRefresh && cached && options.staleWhileRefresh) {
+    if (!notesInFlight.has(key)) {
+      const refresh = collectProductNotes(options)
+        .then(data => notesCache.set(key, { at: Date.now(), data }))
+        .catch(e => console.error('[notes/cache refresh]', e.message))
+        .finally(() => notesInFlight.delete(key));
+      notesInFlight.set(key, refresh);
+    }
+    return { data: cached.data, cache: 'STALE', key };
+  }
+
+  if (!forceRefresh && notesInFlight.has(key)) {
+    const data = await notesInFlight.get(key);
+    return { data: data || notesCache.get(key)?.data || [], cache: 'WAIT', key };
+  }
+
+  const task = collectProductNotes(options)
+    .then(data => {
+      notesCache.set(key, { at: Date.now(), data });
+      return data;
+    })
+    .finally(() => notesInFlight.delete(key));
+  notesInFlight.set(key, task);
+  const data = await task;
+  return { data, cache: 'MISS', key };
+}
+
 /* =====================================================================
    3) ADAPTATEUR OCTOPIA  (Cdiscount, Rakuten, Alltricks, …)
    API Discussions v2 — endpoints réels.
@@ -465,6 +679,55 @@ const octopia = (() => {
       if (!discussionId) throw Object.assign(new Error('Octopia : discussionId manquant pour le détail'), { statusCode: 400, provider: 'octopia', operation: 'fetchThread' });
       const raw = await api(provider, `/discussions/${encodeURIComponent(discussionId)}`);
       return mapDiscussion(provider, raw);
+    },
+
+    async fetchProductNotes(provider, options = {}) {
+      // Octopia ne fournit pas ici les avis textuels unitaires. En revanche,
+      // GET /offers?salesChannelId=...&expand=salesChannelFeedback renvoie les métriques
+      // productReviewsAverageRating / productReviewsCount par produit.
+      const notes = [];
+      const pageSize = positiveInt(options.pageSize || process.env.OCTOPIA_NOTES_PAGE_SIZE, options.fast ? 50 : 100, 1, 500);
+      const maxPages = positiveInt(options.pages || process.env.OCTOPIA_NOTES_MAX_PAGES, 1, 1, 10);
+      const channels = Object.keys(provider.channelMap || {}).length ? Object.keys(provider.channelMap || {}) : ['CDISFR'];
+
+      for (const salesChannelId of channels) {
+        const marketplace = provider.channelMap?.[salesChannelId] || String(salesChannelId || 'octopia').toLowerCase();
+        for (let page = 1; page <= maxPages; page++) {
+          const qs = new URLSearchParams({
+            salesChannelId,
+            limit: String(pageSize),
+            expand: 'salesChannelFeedback',
+          });
+          const data = await api(provider, `/offers?${qs.toString()}`);
+          const offers = extractList(data);
+          for (const offer of offers) {
+            const fbRaw = offer.salesChannelFeedback || offer.sales_channel_feedback || offer.feedback || {};
+            const feedbacks = Array.isArray(fbRaw) ? fbRaw : [fbRaw];
+            for (const fb of feedbacks) {
+              const pi = fb?.productInformation || fb?.product_information || offer.productInformation || offer.product_information || {};
+              const rating = normalizeRatingValue(pi.productReviewsAverageRating ?? pi.product_reviews_average_rating);
+              const count = Number(pi.productReviewsCount ?? pi.product_reviews_count ?? 0);
+              if (!rating && !count) continue;
+              const product = scalarFirst(offer.product?.title, offer.productTitle, offer.product_title, offer.title, offer.offerId, offer.sellerExternalReference);
+              const ean = scalarFirst(offer.gtin, offer.product?.gtin, offer.productReference, offer.product_reference, offer.sellerExternalReference);
+              notes.push(makeProductNote(marketplace, {
+                providerType: 'octopia',
+                id: scalarFirst(offer.offerId, offer.id, offer.sellerExternalReference, ean),
+                product,
+                ean,
+                rating,
+                visible: true,
+                comment: count ? `${count} avis produit — moyenne ${rating}/5 (donnée agrégée Octopia)` : `Moyenne produit ${rating}/5 (donnée agrégée Octopia)`,
+                at: scalarFirst(pi.updatedAt, pi.updated_at, fb.updatedAt, offer.updatedAt),
+                source: 'octopia_offer_feedback',
+                ctx: { salesChannelId, aggregate: true, reviewsCount: count }
+              }));
+            }
+          }
+          if (!offers.length || offers.length < pageSize) break;
+        }
+      }
+      return dedupeProductNotes(notes);
     },
 
     async sendReply(provider, ctx, body) {
@@ -726,6 +989,94 @@ const mirakl = {
     return all;
   },
 
+  extractOrders(data) {
+    return data?.orders || data?.data || data?.items || data?.results || [];
+  },
+
+  mapOrderForNote(order) {
+    const orderId = scalarFirst(order.order_id, order.id, order.commercial_id, order.orderId);
+    const customer = scalarFirst(
+      order.customer?.firstname && order.customer?.lastname ? `${order.customer.firstname} ${order.customer.lastname}` : '',
+      order.customer?.name, order.customer_name, order.buyer?.name, order.customer?.email
+    );
+    const lines = order.order_lines || order.lines || order.orderLines || [];
+    const firstLine = Array.isArray(lines) ? (lines[0] || {}) : lines;
+    const product = scalarFirst(
+      firstLine.product_title, firstLine.product?.title, firstLine.offer_sku, firstLine.offer_id,
+      firstLine.product?.sku, order.product_title
+    );
+    const ean = scalarFirst(
+      firstLine.product_sku, firstLine.product?.sku, firstLine.product?.id, firstLine.offer_sku,
+      firstLine.product_id, firstLine.product_reference
+    );
+    return { orderId, customer, product, ean };
+  },
+
+  mapEvaluationToNote(provider, order, evaluationPayload) {
+    const ev = evaluationPayload?.evaluation || evaluationPayload?.data || evaluationPayload || {};
+    const orderInfo = this.mapOrderForNote(order || {});
+    const rating = normalizeRatingValue(
+      ev.grade || ev.rate || ev.rating || ev.score || ev.mark || ev.note || ev.evaluation_grade || ev.order_evaluation_grade
+    );
+    const comment = scalarFirst(
+      ev.comment, ev.assessment, ev.review, ev.message, ev.description, ev.evaluation_comment,
+      ev.customer_comment, ev.reason
+    );
+    return makeProductNote(provider.code, {
+      providerType: 'mirakl',
+      id: scalarFirst(ev.id, ev.evaluation_id, orderInfo.orderId),
+      orderId: orderInfo.orderId,
+      customer: scalarFirst(orderInfo.customer, ev.customer?.name, ev.customer_name),
+      product: orderInfo.product,
+      ean: orderInfo.ean,
+      rating,
+      comment,
+      visible: ev.visible !== false,
+      at: scalarFirst(ev.date_created, ev.created_at, ev.updated_at, ev.date, order.date_created),
+      reply: scalarFirst(ev.reply, ev.seller_reply, ev.answer),
+      source: 'mirakl_or51',
+      ctx: { orderId: orderInfo.orderId }
+    });
+  },
+
+  async fetchProductNotes(provider, options = {}) {
+    // Mirakl expose l'évaluation d'une commande via OR51 : GET /api/orders/{order_id}/evaluation.
+    // Comme OR51 est par commande, on récupère d'abord un échantillon de commandes récentes.
+    const notes = [];
+    const fast = options.fast !== false;
+    const maxOrders = positiveInt(options.maxOrders || process.env.MIRAKL_NOTES_MAX_ORDERS, fast ? 8 : 40, 0, 500);
+    if (maxOrders <= 0) return [];
+    const pageSize = Math.min(positiveInt(options.pageSize || process.env.MIRAKL_NOTES_PAGE_SIZE, fast ? 8 : 20, 1, 100), maxOrders);
+    const evalConcurrency = positiveInt(options.evalConcurrency || process.env.MIRAKL_NOTES_CONCURRENCY, fast ? 2 : 3, 1, 10);
+    const params = new URLSearchParams({ max: String(pageSize), offset: '0' });
+    const monthsBack = Number(process.env.MIRAKL_NOTES_MONTHS_BACK || process.env.MIRAKL_MONTHS_BACK || 0);
+    if (monthsBack > 0) {
+      const since = new Date();
+      since.setMonth(since.getMonth() - monthsBack);
+      params.set('start_date', since.toISOString());
+    }
+
+    const ordersPayload = await this.api(provider, `/orders?${params.toString()}`);
+    const orders = this.extractOrders(ordersPayload).slice(0, maxOrders);
+
+    await mapLimit(orders, evalConcurrency, async (order) => {
+      const orderId = scalarFirst(order.order_id, order.id, order.commercial_id, order.orderId);
+      if (!orderId) return;
+      try {
+        const evaluation = await this.api(provider, `/orders/${encodeURIComponent(orderId)}/evaluation`);
+        const note = this.mapEvaluationToNote(provider, order, evaluation);
+        if (productNoteIsUsable(note)) notes.push(note);
+      } catch (e) {
+        // Beaucoup de commandes n'ont tout simplement pas d'évaluation : on ignore 404/204/empty.
+        if (String(process.env.MIRAKL_DEBUG || '') === '1') {
+          console.warn(`[mirakl/${provider.code}] note OR51 ignorée pour ${orderId}: ${e.message}`);
+        }
+      }
+    });
+
+    return dedupeProductNotes(notes);
+  },
+
   async fetchClaims(provider) {
     const threads = await this.fetchAllThreads(provider);
     return threads.map(t => this.mapThread(provider, t));
@@ -845,19 +1196,50 @@ const bomp = (() => {
   }
 
   async function postXml(provider, operation, body) {
-    const res = await fetchWithTimeout(serviceUrl(provider, operation), {
+    const url = serviceUrl(provider, operation);
+
+    if (String(process.env.BOMP_DEBUG || '') === '1') {
+      console.log(`[bomp/${provider.code}] POST ${operation} -> ${url}`);
+      // On masque les secrets avant d'afficher le XML.
+      console.log(String(body || '')
+        .replace(/<key>.*?<\/key>/is, '<key>***</key>')
+        .replace(/token="[^"]+"/i, 'token="***"')
+        .slice(0, 1200));
+    }
+
+    const res = await fetchWithTimeout(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'text/xml', Accept: 'text/xml, application/xml' },
+      headers: {
+        'Content-Type': 'text/xml; charset=utf-8',
+        Accept: 'text/xml, application/xml, */*',
+        'User-Agent': '2KINGS-reclamations-proxy/1.0'
+      },
       body,
     });
+
     const txt = await res.text().catch(() => '');
-    if (!res.ok) {
-      throw Object.assign(new Error(`BOMP ${operation} ${res.status}${txt ? ' — ' + txt.slice(0, 500) : ''}`), { statusCode: 502, provider: provider.code, operation });
+
+    if (String(process.env.BOMP_DEBUG || '') === '1') {
+      console.log(`[bomp/${provider.code}] ${operation} status=${res.status}`);
+      console.log(String(txt || '').slice(0, 2000));
     }
+
+    if (!res.ok) {
+      // On garde le vrai code HTTP dans statusCode. Avant, tout devenait 502,
+      // ce qui cachait les 401/403 d'identifiants ou d'accès API.
+      throw Object.assign(
+        new Error(`BOMP ${operation} HTTP ${res.status}${txt ? ' — ' + txt.slice(0, 1000) : ''}`),
+        { statusCode: res.status, provider: provider.code, operation }
+      );
+    }
+
     const parsed = parser.parse(txt || '<empty/>');
     const apiError = findBompError(parsed, operation);
     if (apiError) {
-      throw Object.assign(new Error(`BOMP ${operation} refusé : ${apiError}`), { statusCode: 502, provider: provider.code, operation });
+      throw Object.assign(
+        new Error(`BOMP ${operation} refusé : ${apiError}`),
+        { statusCode: 400, provider: provider.code, operation }
+      );
     }
     return parsed;
   }
@@ -939,6 +1321,9 @@ ${inner}
   function parseBompAuthor(v) {
     const t = normLower(v);
     if (/client|customer|buyer|acheteur/.test(t)) return 'client';
+    // Sur BOMP Fnac/Darty, CALLCENTER correspond souvent au service client marketplace
+    // qui transmet une demande au vendeur. Comme can_answer=true, c'est bien une ligne à traiter.
+    if (/call\s*center|callcenter|service\s*client|support|marketplace|op[ée]rateur|operator|fnac|darty/.test(t)) return 'client';
     if (/seller|shop|boutique|merchant|vendeur/.test(t)) return 'seller';
     return t ? (t.includes('client') ? 'client' : 'seller') : 'client';
   }
@@ -950,6 +1335,263 @@ ${inner}
 
   function bompText(...values) {
     return cleanText(firstValue(...values));
+  }
+
+  // Les réponses XML Fnac/Darty ne sont pas toujours nommées pareil selon les flux
+  // (snake_case, camelCase, attributs XML @_, objets imbriqués). Ces helpers évitent
+  // de perdre les infos et de finir avec des lignes vides côté front.
+  function bompNormKey(k) {
+    return String(k || '').replace(/^@_/, '').replace(/[^a-z0-9]/gi, '').toLowerCase();
+  }
+
+  function bompDeepValues(obj, keys, out = [], seen = new Set()) {
+    if (!obj || typeof obj !== 'object' || seen.has(obj)) return out;
+    seen.add(obj);
+    const wanted = new Set(keys.map(bompNormKey));
+    if (Array.isArray(obj)) {
+      obj.forEach(v => bompDeepValues(v, keys, out, seen));
+      return out;
+    }
+    for (const [k, v] of Object.entries(obj)) {
+      if (wanted.has(bompNormKey(k))) out.push(v);
+      bompDeepValues(v, keys, out, seen);
+    }
+    return out;
+  }
+
+  function bompDeepText(obj, keys) {
+    for (const v of bompDeepValues(obj, keys)) {
+      const got = bompText(v);
+      if (got) return got;
+    }
+    return '';
+  }
+
+  function bompDeepDate(obj, keys, fallback = Date.now()) {
+    const got = bompDeepText(obj, keys);
+    return parseMarketplaceDate(got, fallback);
+  }
+
+
+  function bompKeyHas(k, parts) {
+    const nk = bompNormKey(k);
+    return (parts || []).some(part => nk.includes(bompNormKey(part)));
+  }
+
+  function bompScalarText(v) {
+    const got = bompText(v);
+    if (!got || got === '[object Object]') return '';
+    return got;
+  }
+
+  function bompFuzzyText(obj, includeParts, excludeParts = [], validate = null, seen = new Set()) {
+    if (!obj || typeof obj !== 'object' || seen.has(obj)) return '';
+    seen.add(obj);
+
+    if (Array.isArray(obj)) {
+      for (const item of obj) {
+        const got = bompFuzzyText(item, includeParts, excludeParts, validate, seen);
+        if (got) return got;
+      }
+      return '';
+    }
+
+    for (const [k, v] of Object.entries(obj)) {
+      const keyMatches = bompKeyHas(k, includeParts) && !bompKeyHas(k, excludeParts);
+      if (keyMatches) {
+        const got = bompScalarText(v);
+        if (got && (!validate || validate(got, k))) return got;
+      }
+      const nested = bompFuzzyText(v, includeParts, excludeParts, validate, seen);
+      if (nested) return nested;
+    }
+    return '';
+  }
+
+  function looksLikeBompOrderId(v) {
+    const s = cleanText(v);
+    // Exemples Fnac vus dans la doc/librairies : 07LWQ6278YJUI, LDJEDEAS123.
+    // On évite de prendre un statut, une date ou un compteur à la place du numéro.
+    return /^[A-Z0-9][A-Z0-9_-]{5,40}$/i.test(s)
+      && !/^(true|false|yes|no|open|opened|closed|created|accepted|refused|unread|read|archived|client|seller)$/i.test(s);
+  }
+
+  function extractBompOrderId(obj) {
+    // BOMP/Fnac-Darty met très souvent le n° de commande dans :
+    // <message_referer type="ORDER"><![CDATA[89592381_118817-A]]></message_referer>
+    // Sans ce champ, les messages sont bien récupérés mais restent orphelins côté front.
+    const refererType = normLower(firstValue(
+      obj?.message_referer?.['@_type'], obj?.message_referer?.type, obj?.['@_message_referer_type']
+    ));
+    const referer = bompText(obj?.message_referer, obj?.messageReferer, obj?.referer, obj?.reference);
+    if (referer && (!refererType || /order/.test(refererType)) && looksLikeBompOrderId(referer)) return referer;
+
+    const exact = bompText(
+      obj?.['@_order_id'], obj?.['@_order_fnac_id'], obj?.['@_order_reference'], obj?.['@_order_number'],
+      obj?.order_fnac_id, obj?.order_id, obj?.orderId, obj?.order_reference, obj?.order_ref, obj?.order_number,
+      obj?.order?.order_fnac_id, obj?.order?.order_id, obj?.order?.['@_order_id'], obj?.order?.['@_id'], obj?.order
+    ) || bompDeepText(obj, [
+      'order_fnac_id', 'order_id', 'orderId', 'fnac_order_id', 'darty_order_id',
+      'order_reference', 'order_ref', 'order_number', 'client_order_id', '@_order_id', '@_order_fnac_id'
+    ]);
+    if (exact && looksLikeBompOrderId(exact)) return exact;
+    return bompFuzzyText(obj, [
+      'order_fnac_id', 'orderid', 'order_id', 'fnacorderid', 'dartyorderid', 'orderreference', 'ordernumber', 'orderref', 'messagereferer'
+    ], [
+      'orderdetail', 'detailid', 'lineid', 'nbmessage', 'messagecount', 'status', 'state', 'date', 'rate', 'amount', 'price'
+    ], looksLikeBompOrderId);
+  }
+
+  function extractBompOrderDetailId(obj) {
+    return bompText(
+      obj?.order_detail_id, obj?.orderDetailId, obj?.order_detail?.order_detail_id,
+      obj?.order_detail?.['@_order_detail_id'], obj?.['@_order_detail_id']
+    ) || bompDeepText(obj, ['order_detail_id', 'orderDetailId', 'order_detail_fnac_id', 'order_line_id', 'line_id', '@_order_detail_id'])
+      || bompFuzzyText(obj, ['orderdetailid', 'lineid'], ['orderid']);
+  }
+
+  function extractBompMessageId(obj) {
+    return bompText(obj?.message_id, obj?.messageId, obj?.id, obj?.['@_id'], obj?.['@_message_id'])
+      || bompDeepText(obj, ['message_id', 'messageId', 'last_message_id', 'thread_id', 'discussion_id', '@_message_id'])
+      || bompFuzzyText(obj, ['messageid', 'threadid', 'discussionid'], ['orderid']);
+  }
+
+  function extractBompClientText(obj) {
+    // Ne jamais utiliser un #text imbriqué en fallback général : dans les messages BOMP,
+    // message_referer possède aussi un #text, qui est le numéro de commande. C'est ce
+    // qui affichait 89592381_118817-A comme si le client avait écrit ce message.
+    const direct = bompText(
+      obj?.message_description, obj?.messageDescription, obj?.client_comment, obj?.customer_message,
+      obj?.client_message, obj?.opening_message, obj?.description, obj?.body, obj?.content,
+      obj?.text, obj?.message_text, obj?.comment_text, obj?.comment,
+      typeof obj?.message === 'string' ? obj.message : '',
+      obj?.['#text']
+    );
+    if (direct && !looksLikeBompOrderId(direct)) return direct;
+
+    const exact = bompDeepText(obj, [
+      'message_description', 'messageDescription', 'client_comment', 'customer_message',
+      'client_message', 'opening_message', 'description', 'body', 'content',
+      'message_text', 'comment_text', 'comment'
+    ]);
+    if (exact && !looksLikeBompOrderId(exact)) return exact;
+
+    const fuzzy = bompFuzzyText(obj, [
+      'messagedescription', 'clientcomment', 'customermessage', 'clientmessage',
+      'openingmessage', 'description', 'body', 'content', 'messagetext', 'commenttext'
+    ], ['referer', 'reference', 'order', 'reply', 'answer', 'id', 'date', 'status', 'state']);
+    return fuzzy && !looksLikeBompOrderId(fuzzy) ? fuzzy : '';
+  }
+
+  function extractBompSellerText(obj) {
+    return bompText(obj?.comment_reply, obj?.seller_comment, obj?.seller_answer, obj?.reply, obj?.answer)
+      || bompDeepText(obj, ['comment_reply', 'seller_comment', 'seller_answer', 'reply', 'answer'])
+      || bompFuzzyText(obj, ['sellercomment', 'selleranswer', 'commentreply', 'reply', 'answer'], ['id', 'date', 'status', 'state']);
+  }
+
+  function bompQueryXml(provider, token, operation, elements = {}, resultsCount = 100) {
+    const inner = Object.entries(elements)
+      .filter(([, v]) => v !== undefined && v !== null && v !== '')
+      .map(([k, v]) => Array.isArray(v)
+        ? v.map(item => `  <${k}>${xmlEscape(item)}</${k}>`).join('\n')
+        : `  <${k}>${xmlEscape(v)}</${k}>`)
+      .filter(Boolean)
+      .join('\n') || '  <paging>1</paging>';
+    const attrs = resultsCount ? ` results_count="${xmlEscape(resultsCount)}"` : '';
+    return authedRequest(provider, token, operation, inner, attrs);
+  }
+
+  function mergeClaimDetails(base, detail) {
+    if (!base || !detail) return base;
+    if (!base.orderId && detail.orderId) base.orderId = detail.orderId;
+    if ((!base.customer || base.customer === 'Client') && detail.customer && detail.customer !== 'Client') base.customer = detail.customer;
+    if (!base.product && detail.product) base.product = detail.product;
+    if (isBadSubject(base.subject) && detail.subject && !isBadSubject(detail.subject)) base.subject = detail.subject;
+    if ((!base.messages || !base.messages.length) && detail.messages?.length) base.messages = detail.messages;
+    else base.messages = dedupeMessages([...(base.messages || []), ...(detail.messages || [])]);
+    base.updatedAt = Math.max(Number(base.updatedAt || 0), Number(detail.updatedAt || 0)) || base.updatedAt || detail.updatedAt;
+    base.dueAt = computeDueAt(base.messages || []);
+    base._ctx = { ...(base._ctx || {}), ...(detail._ctx || {}), orderId: base.orderId || detail.orderId || base._ctx?.orderId };
+    return base;
+  }
+
+  function mergeClaimsByIncidentOrOrder(claims) {
+    const out = [];
+    const byKey = new Map();
+    for (const claim of claims || []) {
+      const key = claim?._ctx?.incidentId
+        ? `incident:${claim._ctx.incidentId}`
+        : claim?.orderId
+          ? `order:${claim.orderId}`
+          : claim?.id;
+      if (!key || !byKey.has(key)) {
+        byKey.set(key, claim);
+        out.push(claim);
+      } else {
+        mergeClaimDetails(byKey.get(key), claim);
+      }
+    }
+    return out;
+  }
+
+  function mapOrderInfo(o) {
+    const orderId = extractBompOrderId(o);
+    if (!orderId) return null;
+    const first = bompDeepText(o, ['client_firstname', 'buyer_firstname', 'firstname']);
+    const last = bompDeepText(o, ['client_lastname', 'buyer_lastname', 'lastname']);
+    const customer = [first, last].filter(Boolean).join(' ').trim()
+      || bompDeepText(o, ['client_id', 'client_email', 'customer_name', 'buyer_name', 'client_name']);
+    const product = bompDeepText(o, ['product_name', 'product_label', 'product_title', 'title', 'description'])
+      || bompDeepText(o, ['offer_seller_id', 'offer_fnac_id', 'seller_sku', 'sku', 'ean']);
+    const ean = bompDeepText(o, ['ean', 'product_ean', 'gtin', 'offer_seller_id', 'seller_sku', 'sku']);
+    return { orderId, customer: cleanText(customer), product: cleanText(product), ean: cleanText(ean) };
+  }
+
+  function enrichClaimFromOrderInfo(claim, infoByOrderId) {
+    const info = claim?.orderId ? infoByOrderId.get(claim.orderId) : null;
+    if (!info) return claim;
+    if ((!claim.customer || claim.customer === 'Client') && info.customer) claim.customer = info.customer;
+    if (!claim.product && info.product) claim.product = info.product;
+    claim._ctx = { ...(claim._ctx || {}), orderId: claim.orderId };
+    return claim;
+  }
+
+  function uniqueBompNodes(nodes) {
+    const seen = new Set();
+    return (nodes || []).filter(x => {
+      if (!x || typeof x !== 'object') return false;
+      const key = JSON.stringify(x).slice(0, 700);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
+
+  function embeddedBompMessages(obj) {
+    return uniqueBompNodes([
+      ...oneOrMany(obj?.message),
+      ...oneOrMany(obj?.messages?.message),
+      ...oneOrMany(obj?.thread?.message),
+      ...oneOrMany(obj?.conversation?.message),
+      ...oneOrMany(obj?.discussion?.message),
+      ...oneOrMany(obj?.comment),
+      ...oneOrMany(obj?.comments?.comment),
+      ...collectNodes(obj, ['message', 'comment', 'client_order_comment', 'discussion_message'])
+    ]);
+  }
+
+  function mapEmbeddedBompMessage(m, defaultAuthor = 'client') {
+    return {
+      from: parseBompAuthor(firstValue(
+        m['@_from'], m.from, m.author, m.message_from, m.from_type, m.sender_type,
+        m.created_by, m.origin, m.source, m.is_customer ? 'client' : '', defaultAuthor
+      )),
+      at: parseBompDate(
+        m['@_date'], m.date, m.created_at, m.createdAt, m.updated_at, m.updatedAt,
+        m.sent_at, m.creation_date, m.modification_date
+      ),
+      text: extractBompClientText(m)
+    };
   }
 
   function dedupeMessages(messages) {
@@ -1006,38 +1648,56 @@ ${inner}
   }
 
   function mapIncident(provider, it) {
-    const rawMessages = oneOrMany(
-      it.message || it.messages?.message || it.thread?.message || it.conversation?.message || it.comment || it.comments?.comment
-    );
-    const msgs = dedupeMessages(rawMessages.map(m => ({
-      from: parseBompAuthor(firstValue(m['@_from'], m.from, m.author, m.message_from, m.from_type, m.sender_type)),
-      at: parseBompDate(m['@_date'], m.date, m.created_at, m.updated_at, m.sent_at),
-      text: firstValue(m['#text'], m.content, m.message, m.description, m.body, m.text),
-    })));
+    const msgs = dedupeMessages(embeddedBompMessages(it).map(m => mapEmbeddedBompMessage(m)));
 
-    const incidentId = bompText(it['@_id'], it.incident_id, it.id, it.incidentId);
-    const orderId = bompText(it['@_order_id'], it.order_id, it.order_fnac_id, it.order, it.orderId);
-    const orderDetailId = bompText(it.order_detail_id, it.order_detail?.order_detail_id, it['@_order_detail_id']);
+    const incidentId = bompText(it['@_id'], it.incident_id, it.id, it.incidentId) || bompDeepText(it, [
+      'incident_id', 'incidentId', 'claim_id', 'claimId', 'case_id', 'caseId', 'id'
+    ]);
+    const orderId = extractBompOrderId(it);
+    const orderDetailId = extractBompOrderDetailId(it);
+    const fallbackText = findNewestClientMessage({ messages: msgs })?.text || bompText(it.description, it.message, it.comment) || bompDeepText(it, [
+      'customer_message', 'client_message', 'opening_message', 'description', 'comment', 'body', 'text'
+    ]);
     const subject = normalizeSubject(
-      firstReadableSubject(it['@_reason'], it.reason, it.type, it.incident_type, it.subject, it.title),
-      findNewestClientMessage({ messages: msgs })?.text || bompText(it.description, it.message, it.comment)
+      firstReadableSubject(
+        it['@_reason'], it.reason, it.reason_label, it.incident_reason, it.incident_reason_label,
+        it.type, it.incident_type, it.incident_type_label, it.subject, it.title,
+        bompDeepText(it, ['reason_label', 'incident_reason', 'incident_reason_label', 'incident_type_label', 'subject', 'title', 'motif'])
+      ),
+      fallbackText
     );
-    const statusRaw = normLower(firstValue(it['@_status'], it.status, it.incident_status, it.state));
+    const statusRaw = normLower(firstValue(it['@_status'], it.status, it.incident_status, it.state) || bompDeepText(it, [
+      'status', 'incident_status', 'state', 'state_label'
+    ]));
     const waitingForSeller = truthyBomp(firstValue(
       it.waiting_for_seller_answer, it['@_waiting_for_seller_answer'],
-      it.waiting_seller_answer, it.seller_answer_required, it.answer_required
+      it.waiting_seller_answer, it.seller_answer_required, it.answer_required,
+      bompDeepText(it, ['waiting_for_seller_answer', 'waiting_seller_answer', 'seller_answer_required', 'answer_required'])
     ));
-    const openedByRaw = firstValue(it.opened_by, it['@_opened_by'], it.created_by, it.author, it.from);
-    const openedAt = parseBompDate(it['@_created_at'], it.created_at, it.date_created, it.opened_at, it.date);
-    const updatedAt = parseBompDate(it['@_updated_at'], it.updated_at, it.date_updated, it.modified_at, it.last_update, openedAt);
+    const openedByRaw = firstValue(it.opened_by, it['@_opened_by'], it.created_by, it.author, it.from) || bompDeepText(it, [
+      'opened_by', 'created_by', 'author', 'from', 'sender_type'
+    ]);
+    const openedAt = parseBompDate(
+      it['@_created_at'], it.created_at, it.date_created, it.opened_at, it.date,
+      bompDeepText(it, ['created_at', 'createdAt', 'date_created', 'opening_date', 'opened_at', 'date'])
+    );
+    const updatedAt = parseBompDate(
+      it['@_updated_at'], it.updated_at, it.date_updated, it.modified_at, it.last_update,
+      bompDeepText(it, ['updated_at', 'updatedAt', 'date_updated', 'modified_at', 'last_update', 'last_message_date']),
+      openedAt
+    );
 
     return makeClaim(provider.code, {
       providerType: 'bomp',
       id: incidentId || orderId || Math.random().toString(36).slice(2),
-      customer: bompText(it['@_customer'], it.customer, it.buyer, it.client, it.client_id) || 'Client',
+      customer: bompText(it['@_customer'], it.customer, it.buyer, it.client, it.client_id) || bompDeepText(it, [
+        'customer', 'customer_name', 'buyer', 'buyer_name', 'client', 'client_name', 'client_id', 'buyer_id'
+      ]) || 'Client',
       subject,
       orderId,
-      product: bompText(it['@_product'], it.product_name, it.product, it.offer_seller_id, it.offer_fnac_id),
+      product: bompText(it['@_product'], it.product_name, it.product, it.offer_seller_id, it.offer_fnac_id) || bompDeepText(it, [
+        'product', 'product_name', 'product_label', 'product_title', 'title', 'offer_seller_id', 'offer_fnac_id', 'seller_sku', 'sku', 'ean'
+      ]),
       priority: 'haute',
       status: /closed|close|clos|resolved|resolu|résolu/.test(statusRaw) ? 'resolu' : 'nouveau',
       updatedAt,
@@ -1048,64 +1708,345 @@ ${inner}
         incidentId,
         orderId,
         orderDetailId,
-        messageId: bompText(it.message_id, it.message?.message_id, it.last_message_id),
-        rawType: bompText(it.type, it.incident_type, it.reason),
+        messageId: extractBompMessageId(it),
+        rawType: bompText(it.type, it.incident_type, it.reason) || bompDeepText(it, ['type', 'incident_type', 'reason', 'motif']),
         openedAt,
+        updatedAt,
         openedBy: parseBompAuthor(openedByRaw),
         waitingForSeller,
-        needsReply: waitingForSeller || parseBompAuthor(openedByRaw) === 'client' || findNewestClientMessage({ messages: msgs }),
+        // Ne pas considérer "un client a écrit un jour" comme "à répondre" :
+        // la vraie décision se fait plus bas avec le dernier message.
+        // Exception : certains incidents Fnac/Darty n'ont pas de conversation exploitable.
+        needsReply: waitingForSeller || (!msgs.length && parseBompAuthor(openedByRaw) === 'client'),
       },
     });
   }
 
-  function mapMessage(provider, m) {
-    const id = bompText(m.message_id, m.id, m['@_id']);
-    const orderId = bompText(m.order_fnac_id, m.order_id, m.order);
-    const text = bompText(m.description, m.message, m.body, m.content, m.text);
+  function mapMessage(provider, m, defaultOrderId = '') {
+    const id = extractBompMessageId(m);
+    const orderId = extractBompOrderId(m) || defaultOrderId;
+    const text = extractBompClientText(m);
     const author = parseBompAuthor(firstValue(m.message_from, m.from, m.author, m.from_type, m.sender_type, 'customer'));
+    const at = parseBompDate(
+      m.date, m.created_at, m.createdAt, m.updated_at, m.updatedAt, m.sent_at, m.creation_date,
+      bompDeepText(m, ['date', 'created_at', 'createdAt', 'updated_at', 'updatedAt', 'sent_at', 'creation_date'])
+    );
     return makeClaim(provider.code, {
       providerType: 'bomp',
-      id,
-      customer: bompText(m.client_id, m.customer, m.buyer) || 'Client',
-      subject: normalizeSubject(firstReadableSubject(m.subject, m.message_subject, m.type), text),
+      id: id || orderId || Math.random().toString(36).slice(2),
+      customer: bompText(m.client_id, m.customer, m.buyer) || bompDeepText(m, [
+        'customer', 'customer_name', 'buyer', 'buyer_name', 'client', 'client_name', 'client_id', 'buyer_id'
+      ]) || 'Client',
+      subject: normalizeSubject(firstReadableSubject(
+        m.subject, m.message_subject, m.type,
+        bompDeepText(m, ['subject', 'message_subject', 'reason', 'reason_label', 'motif', 'type'])
+      ), text),
       orderId,
-      product: bompText(m.offer_seller_id, m.offer_fnac_id, m.product_name),
+      product: bompText(m.offer_seller_id, m.offer_fnac_id, m.product_name) || bompDeepText(m, [
+        'product', 'product_name', 'product_label', 'product_title', 'offer_seller_id', 'offer_fnac_id', 'seller_sku', 'sku', 'ean'
+      ]),
       priority: 'moyenne',
       status: String(m.message_state || m.state || '').toLowerCase().includes('read') ? 'attente' : 'nouveau',
-      updatedAt: parseBompDate(m.date, m.created_at, m.updated_at),
-      messages: [{ from: author, at: parseBompDate(m.date, m.created_at, m.updated_at), text }],
+      updatedAt: at,
+      messages: text ? [{ from: author, at, text }] : [],
       ctx: { kind: 'message', messageId: id, orderId, needsReply: author === 'client' },
     });
   }
 
+  function mapClientOrderComment(provider, c, defaultOrderId = '') {
+    const commentId = bompText(c.client_order_comment_id, c.comment_id, c.id, c['@_id']) || bompDeepText(c, [
+      'client_order_comment_id', 'comment_id', 'id'
+    ]);
+    const orderId = extractBompOrderId(c) || defaultOrderId;
+    const clientText = extractBompClientText(c);
+    const sellerReply = extractBompSellerText(c);
+    const at = parseBompDate(
+      c.date, c.created_at, c.createdAt, c.updated_at, c.updatedAt, c.creation_date,
+      bompDeepText(c, ['date', 'created_at', 'createdAt', 'updated_at', 'updatedAt', 'creation_date'])
+    );
+    const messages = [];
+    if (clientText) messages.push({ from: 'client', at, text: clientText });
+    if (sellerReply) messages.push({ from: 'seller', at, text: sellerReply });
+
+    return makeClaim(provider.code, {
+      providerType: 'bomp',
+      id: commentId || orderId || Math.random().toString(36).slice(2),
+      customer: bompText(c.client_id, c.customer, c.buyer) || bompDeepText(c, [
+        'customer', 'customer_name', 'buyer', 'buyer_name', 'client', 'client_name', 'client_id', 'buyer_id'
+      ]) || 'Client',
+      subject: normalizeSubject(firstReadableSubject(
+        c.subject, c.type, bompDeepText(c, ['subject', 'message_subject', 'reason', 'reason_label', 'motif', 'type'])
+      ), clientText),
+      orderId,
+      product: bompText(c.offer_seller_id, c.offer_fnac_id, c.product_name) || bompDeepText(c, [
+        'product', 'product_name', 'product_label', 'product_title', 'offer_seller_id', 'offer_fnac_id', 'seller_sku', 'sku', 'ean'
+      ]),
+      priority: 'moyenne',
+      status: sellerReply ? 'attente' : 'nouveau',
+      updatedAt: at,
+      messages,
+      ctx: {
+        kind: 'order_comment',
+        commentId,
+        orderId,
+        needsReply: Boolean(clientText && !sellerReply),
+      },
+    });
+  }
+
+  function mapClientOrderCommentToNote(provider, c, defaultOrderId = '') {
+    const commentId = bompText(c.client_order_comment_id, c.comment_id, c.id, c['@_id']) || bompDeepText(c, [
+      'client_order_comment_id', 'comment_id', 'id'
+    ]);
+    const orderId = extractBompOrderId(c) || defaultOrderId;
+    const rating = normalizeRatingValue(
+      bompText(c.rate, c.rating, c.note, c.score, c.mark, c.grade)
+      || bompDeepText(c, ['rate', 'rating', 'note', 'score', 'mark', 'grade'])
+    );
+    const clientText = extractBompClientText(c)
+      || bompDeepText(c, ['client_order_comment', 'order_comment', 'review', 'avis', 'comment_description']);
+    const sellerReply = extractBompSellerText(c);
+    const at = parseBompDate(
+      c.date, c.created_at, c.createdAt, c.updated_at, c.updatedAt, c.creation_date,
+      bompDeepText(c, ['date', 'created_at', 'createdAt', 'updated_at', 'updatedAt', 'creation_date'])
+    );
+    const product = bompText(c.offer_seller_id, c.offer_fnac_id, c.product_name) || bompDeepText(c, [
+      'product', 'product_name', 'product_label', 'product_title', 'offer_seller_id', 'offer_fnac_id', 'seller_sku', 'sku', 'ean'
+    ]);
+    const ean = bompDeepText(c, ['ean', 'product_ean', 'gtin', 'offer_seller_id', 'seller_sku', 'sku']);
+
+    return makeProductNote(provider.code, {
+      providerType: 'bomp',
+      id: commentId || orderId,
+      orderId,
+      customer: bompText(c.client_id, c.customer, c.buyer) || bompDeepText(c, [
+        'customer', 'customer_name', 'buyer', 'buyer_name', 'client', 'client_name', 'client_id', 'buyer_id'
+      ]) || 'Client',
+      product,
+      ean,
+      rating,
+      comment: clientText,
+      reply: sellerReply,
+      at,
+      visible: true,
+      source: 'bomp_client_order_comments',
+      ctx: { commentId, orderId }
+    });
+  }
+
   return {
+    async fetchProductNotes(provider, options = {}) {
+      const token = await getToken(provider);
+      const notes = [];
+      const errors = [];
+      const fast = options.fast !== false;
+      const pageSize = positiveInt(options.pageSize || process.env.BOMP_NOTES_PAGE_SIZE, fast ? 50 : 100, 1, 500);
+      const maxPages = positiveInt(options.pages || process.env.BOMP_NOTES_MAX_PAGES, fast ? 1 : 3, 1, 50);
+      const enrichRequested = options.enrich === true || parseBoolFlag(process.env.BOMP_NOTES_ENRICH, !fast);
+      const enrichLimit = enrichRequested ? positiveInt(options.enrichLimit || process.env.BOMP_NOTES_ENRICH_LIMIT, fast ? 20 : 50, 0, 500) : 0;
+      const enrichConcurrency = positiveInt(options.enrichConcurrency || process.env.BOMP_NOTES_ENRICH_CONCURRENCY, fast ? 4 : 6, 1, 20);
+
+      async function safeQuery(operation, xml, label = operation) {
+        try {
+          return await postXml(provider, operation, xml);
+        } catch (e) {
+          errors.push({ operation: label, message: e.message, statusCode: e.statusCode });
+          console.warn(`[bomp/${provider.code}] ${label} ignoré pour les notes : ${e.message}`);
+          return null;
+        }
+      }
+
+      for (let page = 1; page <= maxPages; page++) {
+        const response = await safeQuery(
+          'client_order_comments_query',
+          bompQueryXml(provider, token, 'client_order_comments_query', { paging: page }, pageSize),
+          `client_order_comments_query/page:${page}`
+        );
+        const root = response?.client_order_comments_query_response || response?.client_order_comments || response || {};
+        const comments = response ? extractBompNodes(root, ['client_order_comment', 'comment']) : [];
+        notes.push(...comments.map(c => mapClientOrderCommentToNote(provider, c)).filter(productNoteIsUsable));
+        if (!comments.length || comments.length < pageSize) break;
+      }
+
+      const orderIds = enrichLimit > 0
+        ? [...new Set(notes.map(n => n.orderId).filter(Boolean))].slice(0, enrichLimit)
+        : [];
+      const orderInfoById = new Map();
+      await mapLimit(orderIds, enrichConcurrency, async (orderId) => {
+        const orderResponse = await safeQuery(
+          'orders_query',
+          bompQueryXml(provider, token, 'orders_query', { paging: 1, order_fnac_id: orderId }, 20),
+          `orders_query/order_fnac_id:${orderId}`
+        );
+        const root = orderResponse?.orders_query_response || orderResponse?.orders || orderResponse || {};
+        const orders = orderResponse ? extractBompNodes(root, ['order']) : [];
+        for (const info of orders.map(mapOrderInfo).filter(Boolean)) orderInfoById.set(info.orderId, info);
+      });
+
+      for (const note of notes) {
+        const info = note.orderId ? orderInfoById.get(note.orderId) : null;
+        if (!info) continue;
+        if ((!note.customer || note.customer === 'Client') && info.customer) note.customer = info.customer;
+        if (!note.product && info.product) note.product = info.product;
+        if (!note.ean && info.ean) note.ean = info.ean;
+      }
+
+      if (String(process.env.BOMP_DEBUG || '') === '1') {
+        console.log(`[bomp/${provider.code}] notes comments=${notes.length}, ordersEnriched=${orderInfoById.size}, errors=${errors.length}`);
+      }
+      return dedupeProductNotes(notes);
+    },
+
     async fetchClaims(provider) {
       const token = await getToken(provider);
       const claims = [];
+      const errors = [];
+      const enrichLimit = Number(process.env.BOMP_ENRICH_LIMIT || 50);
 
-      // Réclamations / incidents.
-      // On ne filtre pas uniquement sur le dernier message : Darty/Fnac renvoie souvent
-      // des incidents sans conversation intégrée, avec seulement le flag waiting_for_seller_answer.
-      const incidentBody = authedRequest(provider, token, 'incidents_query', '  <paging>1</paging>', ' results_count="100"');
-      const incidentsResponse = await postXml(provider, 'incidents_query', incidentBody);
+      async function safeQuery(operation, xml, label = operation) {
+        try {
+          return await postXml(provider, operation, xml);
+        } catch (e) {
+          errors.push({ operation: label, message: e.message, statusCode: e.statusCode });
+          console.warn(`[bomp/${provider.code}] ${label} ignoré : ${e.message}`);
+          return null;
+        }
+      }
+
+      // 1) Requêtes larges : on récupère les incidents, messages et commentaires disponibles.
+      const incidentsResponse = await safeQuery(
+        'incidents_query',
+        bompQueryXml(provider, token, 'incidents_query', { paging: 1 }, 100)
+      );
       const ir = incidentsResponse?.incidents_query_response || incidentsResponse?.incidents || incidentsResponse || {};
-      const incidents = extractBompNodes(ir, ['incident']);
-      const mappedIncidents = incidents.map(it => mapIncident(provider, it));
+      const incidents = incidentsResponse ? extractBompNodes(ir, ['incident']) : [];
+      let mappedIncidents = incidents.map(it => mapIncident(provider, it));
 
-      // Messages clients Fnac/Darty. Le parsing est volontairement tolérant car les réponses XML
-      // changent légèrement selon Fnac, Darty, messages de commande et messages d'offre.
-      const msgBody = authedRequest(provider, token, 'messages_query', '  <paging>1</paging>', ' results_count="100"');
-      const messagesResponse = await postXml(provider, 'messages_query', msgBody);
+      const messagesResponse = await safeQuery(
+        'messages_query',
+        bompQueryXml(provider, token, 'messages_query', { paging: 1 }, 100)
+      );
       const mr = messagesResponse?.messages_query_response || messagesResponse?.messages || messagesResponse || {};
-      const messages = extractBompNodes(mr, ['message']);
-      const mappedMessages = messages.map(m => mapMessage(provider, m)).filter(c => c._ctx.messageId || c.orderId || c.messages.length);
+      const messages = messagesResponse ? extractBompNodes(mr, ['message']) : [];
+      let mappedMessages = messages
+        .map(m => mapMessage(provider, m))
+        .filter(c => c._ctx.messageId || c.orderId || c.messages.length);
 
-      // Les incidents Fnac/Darty sont parfois séparés de la messagerie.
-      // On rattache donc le dernier message de même commande à l'incident pour pouvoir répondre.
-      claims.push(...mergeBompMessagesIntoIncidents(mappedIncidents, mappedMessages));
-      claims.push(...mappedMessages);
+      const commentsResponse = await safeQuery(
+        'client_order_comments_query',
+        bompQueryXml(provider, token, 'client_order_comments_query', { paging: 1 }, 100)
+      );
+      const cr = commentsResponse?.client_order_comments_query_response || commentsResponse?.client_order_comments || commentsResponse || {};
+      const comments = commentsResponse ? extractBompNodes(cr, ['client_order_comment', 'comment']) : [];
+      let mappedComments = comments
+        .map(c => mapClientOrderComment(provider, c))
+        .filter(c => c.orderId || c.messages.length);
 
-      return claims;
+      // 2) Certains retours incidents BOMP sont des résumés : on redemande le détail par incident_id.
+      // Ça récupère souvent le order_id/order_fnac_id qui n'était pas dans la liste principale.
+      const incidentIdsToExpand = [...new Set(mappedIncidents
+        .filter(c => !c.orderId && c._ctx?.incidentId)
+        .map(c => c._ctx.incidentId))]
+        .slice(0, enrichLimit);
+
+      for (const incidentId of incidentIdsToExpand) {
+        const detailResponse = await safeQuery(
+          'incidents_query',
+          bompQueryXml(provider, token, 'incidents_query', { paging: 1, incident_id: incidentId }, 20),
+          `incidents_query/incident_id:${incidentId}`
+        );
+        const dr = detailResponse?.incidents_query_response || detailResponse?.incidents || detailResponse || {};
+        const detailIncidents = detailResponse ? extractBompNodes(dr, ['incident']) : [];
+        const detailMapped = detailIncidents.map(it => mapIncident(provider, it));
+        for (const detail of detailMapped) {
+          const base = mappedIncidents.find(c => c._ctx?.incidentId === detail._ctx?.incidentId || c.id === detail.id);
+          if (base) mergeClaimDetails(base, detail);
+          else mappedIncidents.push(detail);
+        }
+      }
+      mappedIncidents = mergeClaimsByIncidentOrOrder(mappedIncidents);
+
+      // 3) Deuxième passe par numéro de commande.
+      // D'après l'API Fnac, messages_query et client_order_comments_query acceptent order_fnac_id.
+      // Sans cette passe, les incidents peuvent s'afficher sans conversation.
+      const orderIds = [...new Set([
+        ...mappedIncidents.map(c => c.orderId),
+        ...mappedMessages.map(c => c.orderId),
+        ...mappedComments.map(c => c.orderId),
+      ].filter(Boolean))].slice(0, enrichLimit);
+
+      const perOrderMessages = [];
+      const perOrderComments = [];
+      const orderInfos = [];
+
+      for (const orderId of orderIds) {
+        const msgByOrderResponse = await safeQuery(
+          'messages_query',
+          bompQueryXml(provider, token, 'messages_query', { paging: 1, order_fnac_id: orderId }, 100),
+          `messages_query/order_fnac_id:${orderId}`
+        );
+        const mor = msgByOrderResponse?.messages_query_response || msgByOrderResponse?.messages || msgByOrderResponse || {};
+        const msgByOrder = msgByOrderResponse ? extractBompNodes(mor, ['message']) : [];
+        perOrderMessages.push(...msgByOrder.map(m => mapMessage(provider, m, orderId)).filter(c => c._ctx.messageId || c.orderId || c.messages.length));
+
+        const comByOrderResponse = await safeQuery(
+          'client_order_comments_query',
+          bompQueryXml(provider, token, 'client_order_comments_query', { paging: 1, order_fnac_id: orderId }, 100),
+          `client_order_comments_query/order_fnac_id:${orderId}`
+        );
+        const cor = comByOrderResponse?.client_order_comments_query_response || comByOrderResponse?.client_order_comments || comByOrderResponse || {};
+        const comByOrder = comByOrderResponse ? extractBompNodes(cor, ['client_order_comment', 'comment']) : [];
+        perOrderComments.push(...comByOrder.map(c => mapClientOrderComment(provider, c, orderId)).filter(c => c.orderId || c.messages.length));
+
+        // Optionnel mais utile : enrichit client / produit depuis la commande.
+        const orderResponse = await safeQuery(
+          'orders_query',
+          bompQueryXml(provider, token, 'orders_query', { paging: 1, order_fnac_id: orderId }, 20),
+          `orders_query/order_fnac_id:${orderId}`
+        );
+        const or = orderResponse?.orders_query_response || orderResponse?.orders || orderResponse || {};
+        const orders = orderResponse ? extractBompNodes(or, ['order']) : [];
+        orderInfos.push(...orders.map(mapOrderInfo).filter(Boolean));
+      }
+
+      mappedMessages = mergeClaimsByIncidentOrOrder([...mappedMessages, ...perOrderMessages]);
+      mappedComments = mergeClaimsByIncidentOrOrder([...mappedComments, ...perOrderComments]);
+      const orderInfoById = new Map(orderInfos.map(info => [info.orderId, info]));
+
+      mappedIncidents.forEach(c => enrichClaimFromOrderInfo(c, orderInfoById));
+      mappedMessages.forEach(c => enrichClaimFromOrderInfo(c, orderInfoById));
+      mappedComments.forEach(c => enrichClaimFromOrderInfo(c, orderInfoById));
+
+      // Les incidents Fnac/Darty sont souvent séparés de la messagerie.
+      // On rattache les messages/commentaires par order_fnac_id puis on conserve aussi les messages orphelins.
+      const messageLikeClaims = mergeClaimsByIncidentOrOrder([...mappedMessages, ...mappedComments]);
+      const mergedIncidents = mergeBompMessagesIntoIncidents(mappedIncidents, messageLikeClaims);
+      claims.push(...mergedIncidents);
+      claims.push(...messageLikeClaims.filter(m => !mergedIncidents.some(i => i.orderId && i.orderId === m.orderId)));
+
+      if (String(process.env.BOMP_DEBUG || '') === '1') {
+        const allMapped = [...mappedIncidents, ...mappedMessages, ...mappedComments];
+        const finalMerged = mergeClaimsByIncidentOrOrder(claims);
+        const emptyCount = allMapped.filter(c => !c.orderId && !c.product && !c.messages?.length).length;
+        console.log(`[bomp/${provider.code}] raw incidents=${incidents.length}, messages=${messages.length}, comments=${comments.length}, ordersEnriched=${orderInfos.length}, mapped=${allMapped.length}, finalMerged=${finalMerged.length}, emptyLike=${emptyCount}`);
+        const sample = finalMerged.slice(0, 8).map(c => ({
+          id: c.id, orderId: c.orderId, subject: c.subject, messages: c.messages?.length || 0,
+          firstMessage: c.messages?.[0]?.text ? c.messages[0].text.slice(0, 90) : '',
+          ctx: { kind: c._ctx?.kind, incidentId: c._ctx?.incidentId, messageId: c._ctx?.messageId, orderId: c._ctx?.orderId }
+        }));
+        console.log(`[bomp/${provider.code}] final sample`, JSON.stringify(sample, null, 2));
+      }
+
+      if (!claims.length && errors.length) {
+        const details = errors.map(e => `${e.operation}: ${e.statusCode || '?'} ${e.message}`).join(' | ');
+        throw Object.assign(new Error(`BOMP ${provider.code}: aucune donnée récupérée. ${details}`), {
+          statusCode: errors.find(e => e.statusCode)?.statusCode || 502,
+          provider: provider.code,
+          operation: 'fetchClaims'
+        });
+      }
+
+      return mergeClaimsByIncidentOrOrder(claims);
     },
 
     async sendReply(provider, ctx, body) {
@@ -1346,18 +2287,55 @@ function normalizeMessageTime(m) {
 function claimNeedsReply(claim) {
   if (!claim || claim.status === 'resolu') return false;
   const ctx = claim._ctx || {};
-  if (ctx.needsReply || ctx.waitingForSeller) return true;
-
   const messages = Array.isArray(claim.messages) ? claim.messages.filter(m => m && m.from) : [];
 
-  // Fnac/Darty : certains incidents Darty remontent sans conversation dans incidents_query.
-  // Avant, ils étaient donc supprimés de /threads car "pas de message".
-  if (!messages.length && claim.providerType === 'bomp') return ctx.kind === 'incident' || Boolean(ctx.incidentId);
-  if (!messages.length && ctx.kind === 'incident') return true;
+  // Source la plus fiable : le dernier message de la conversation.
+  // Si la boutique a répondu après le client, on ne doit plus afficher la réclamation.
+  if (messages.length) {
+    const last = [...messages].sort((a, b) => normalizeMessageTime(a) - normalizeMessageTime(b)).at(-1);
+    return last?.from === 'client';
+  }
 
-  if (!messages.length) return false;
-  const last = [...messages].sort((a, b) => normalizeMessageTime(a) - normalizeMessageTime(b)).at(-1);
-  return last?.from === 'client';
+  // Flags explicites renvoyés par la marketplace ou déduits au mapping.
+  if (ctx.waitingForSeller === true || ctx.needsReply === true) return true;
+
+  // Cas BOMP important : incidents_query renvoie parfois uniquement un résumé d'incident
+  // avec incident_id + order_id, mais sans fil de messages. Avant, on les supprimait tous,
+  // ce qui donnait 0 réclamation côté Fnac/Darty malgré raw incidents/mapped > 0.
+  // La fenêtre de date reste appliquée juste après pour éviter de ressortir l'historique.
+  if (ctx.kind === 'incident' && ctx.incidentId && claim.marketplace && ['fnac', 'darty'].includes(String(claim.marketplace).toLowerCase())) {
+    return true;
+  }
+
+  return false;
+}
+
+function claimActivityTime(claim) {
+  const ctx = claim?._ctx || {};
+  const messages = Array.isArray(claim?.messages) ? claim.messages : [];
+  const times = [
+    Number(claim?.updatedAt || 0),
+    Number(ctx.updatedAt || 0),
+    Number(ctx.openedAt || 0),
+    ...messages.map(normalizeMessageTime),
+  ].filter(t => Number.isFinite(t) && t > 0);
+  return times.length ? Math.max(...times) : 0;
+}
+
+function claimIsRecentEnough(claim, maxAgeDays) {
+  const days = Number(maxAgeDays || 0);
+  if (!Number.isFinite(days) || days <= 0) return true;
+  const t = claimActivityTime(claim);
+  if (!t) return true; // en cas de date absente côté API, on garde pour éviter un faux négatif
+  return t >= Date.now() - days * 24 * H;
+}
+
+function resolveMaxAgeDays(req, onlyUnanswered, provider = null) {
+  const explicit = req.query.days || req.query.maxAgeDays;
+  const providerDefault = provider?.type === 'bomp' ? process.env.BOMP_MAX_AGE_DAYS : undefined;
+  const raw = explicit || providerDefault || process.env.RECLAMATIONS_MAX_AGE_DAYS || (onlyUnanswered ? 45 : 0);
+  const days = Number(raw);
+  return Number.isFinite(days) ? days : 45;
 }
 async function ensureClaimHasMessages(provider, claim) {
   if (claim?.messages?.length) return claim;
@@ -1451,6 +2429,22 @@ app.get('/api/reclamations/diagnostic', (_req, res) => {
   });
 });
 
+app.get('/api/reclamations/notes', async (req, res) => {
+  try {
+    const options = notesRequestOptions(req.query || {});
+    const forceRefresh = parseBoolFlag(req.query.refresh, false);
+    const { data, cache } = await getProductNotesCached(options, forceRefresh);
+
+    res.set('Cache-Control', `private, max-age=${Math.floor((options.cacheTtlMs || 0) / 1000)}`);
+    res.set('X-Notes-Cache', cache);
+    res.set('X-Notes-Fast-Mode', options.fast ? '1' : '0');
+    res.json(data);
+  } catch (e) {
+    const payload = publicErrorPayload(e);
+    res.status(payload.status >= 400 && payload.status < 500 ? payload.status : 502).json(payload);
+  }
+});
+
 app.get('/api/reclamations/threads', async (req, res) => {
   const all = [];
   claimIndex.clear();
@@ -1458,29 +2452,33 @@ app.get('/api/reclamations/threads', async (req, res) => {
   // Par défaut, ce proxy renvoie uniquement les réclamations auxquelles il faut répondre.
   // Pour tout afficher ponctuellement : /api/reclamations/threads?all=1
   const onlyUnanswered = req.query.all !== '1' && String(req.query.unanswered || '1') !== '0';
+  const maxAgeDays = resolveMaxAgeDays(req, onlyUnanswered);
   const providers = configured();
   const concurrency = Number(req.query.concurrency || process.env.PROVIDER_CONCURRENCY || 6);
 
   await mapLimit(providers, concurrency, async (p) => {
     try {
       const fetched = await ADAPTERS[p.type].fetchClaims(p);
+      const providerMaxAgeDays = resolveMaxAgeDays(req, onlyUnanswered, p);
       const kept = [];
 
       for (const rawClaim of fetched) {
         const claim = onlyUnanswered ? await ensureClaimHasMessages(p, rawClaim) : rawClaim;
         if (onlyUnanswered && !claimNeedsReply(claim)) continue;
+        if (!claimIsRecentEnough(claim, providerMaxAgeDays)) continue;
 
         claim.subject = normalizeSubject(
           claim.subject,
           Array.isArray(claim.messages) ? [...claim.messages].reverse().find(m => m.from === 'client')?.text : ''
         );
-        claimIndex.set(claim.id, { provider: p, ctx: claim._ctx || rawClaim._ctx });
+        const ctx = claim._ctx || rawClaim._ctx;
+        claimIndex.set(claim.id, { provider: p, ctx, claim: { ...claim, _ctx: ctx } });
         delete claim._ctx;
         kept.push(claim);
       }
 
       all.push(...kept);
-      console.log(`[${p.type}/${p.code || 'octopia'}] ${kept.length}/${fetched.length} réclamation(s) à répondre`);
+      console.log(`[${p.type}/${p.code || 'octopia'}] ${kept.length}/${fetched.length} réclamation(s) à répondre, fenêtre=${providerMaxAgeDays || 'illimitée'}j`);
     } catch (e) {
       console.error(`[${p.type}/${p.code || ''}] ${e.message}`); // une MP en panne n'empêche pas les autres
     }
@@ -1495,18 +2493,31 @@ app.get('/api/reclamations/incidents', async (req, res) => {
   const all = [];
   incidentIndex.clear();
 
+  const onlyUnanswered = req.query.all !== '1' && String(req.query.unanswered || '1') !== '0';
+  const maxAgeDays = resolveMaxAgeDays(req, onlyUnanswered);
   const providers = configured().filter(p => p.type === 'bomp');
   const concurrency = Number(req.query.concurrency || process.env.PROVIDER_CONCURRENCY || 6);
 
   await mapLimit(providers, concurrency, async (p) => {
     try {
       const fetched = await ADAPTERS[p.type].fetchClaims(p);
-      for (const claim of fetched) {
-        const ctx = claim._ctx || {};
+      const providerMaxAgeDays = resolveMaxAgeDays(req, onlyUnanswered, p);
+      for (const rawClaim of fetched) {
+        const claim = onlyUnanswered ? await ensureClaimHasMessages(p, rawClaim) : rawClaim;
+        const ctx = claim._ctx || rawClaim._ctx || {};
         if (ctx.kind !== 'incident' && !ctx.incidentId) continue;
-        incidentIndex.set(claim.id, { provider: p, ctx });
-        claimIndex.set(claim.id, { provider: p, ctx });
-        all.push(mapClaimToIncidentRow(claim));
+        if (onlyUnanswered && !claimNeedsReply(claim)) continue;
+        if (!claimIsRecentEnough(claim, providerMaxAgeDays)) continue;
+
+        // Important : on garde aussi l'objet complet en cache.
+        // L'IHM peut ensuite appeler /threads/:id pour afficher le détail BOMP.
+        // Avant, seul le contexte était stocké, ce qui provoquait
+        // “Réclamation BOMP absente du cache” au clic sur le détail.
+        const cachedClaim = { ...claim, _ctx: ctx };
+        incidentIndex.set(claim.id, { provider: p, ctx, claim: cachedClaim });
+        claimIndex.set(claim.id, { provider: p, ctx, claim: cachedClaim });
+
+        all.push(mapClaimToIncidentRow(cachedClaim));
       }
     } catch (e) {
       console.error(`[incidents/${p.code || ''}] ${e.message}`);
@@ -1554,47 +2565,188 @@ app.patch('/api/reclamations/incidents/:id', async (req, res) => {
   }
 });
 
-
 app.get('/api/reclamations/threads/:id', async (req, res) => {
   try {
-    const entry = claimIndex.get(req.params.id);
-    if (!entry) throw new Error('Réclamation inconnue. Rechargez la liste avant d’ouvrir le détail.');
+    // Le détail peut être demandé depuis l'onglet Réclamations ou depuis l'onglet Incidents.
+    // On consulte donc les deux caches en mémoire.
+    const entry = claimIndex.get(req.params.id) || incidentIndex.get(req.params.id);
 
-    const { provider, ctx } = entry;
+    if (!entry) {
+      throw new Error(
+        'Réclamation inconnue. Rechargez la liste avant d’ouvrir le détail.'
+      );
+    }
+
+    const { provider, ctx, claim } = entry;
+
+    // Cas Fnac / Darty
+    if (provider.type === 'bomp') {
+      if (!claim) {
+        throw Object.assign(
+          new Error('Réclamation BOMP absente du cache. Rechargez la liste Fnac/Darty puis rouvrez le détail.'),
+          { statusCode: 404, provider: provider.code, operation: 'fetchThread' }
+        );
+      }
+
+      const copy = typeof structuredClone === 'function'
+        ? structuredClone(claim)
+        : JSON.parse(JSON.stringify(claim));
+
+      delete copy._ctx;
+
+      return res.json(copy);
+    }
+
     const adapter = ADAPTERS[provider.type];
-    if (!adapter.fetchThread) throw new Error(`Le détail n’est pas encore géré pour ${provider.type}`);
 
-    const claim = await adapter.fetchThread(provider, ctx);
-    claimIndex.set(claim.id, { provider, ctx: claim._ctx || ctx });
-    delete claim._ctx;
-    res.json(claim);
+    if (!adapter.fetchThread) {
+      throw new Error(
+        `Le détail n’est pas encore géré pour ${provider.type}`
+      );
+    }
+
+    const fullClaim =
+      await adapter.fetchThread(
+        provider,
+        ctx
+      );
+
+    claimIndex.set(fullClaim.id, {
+      provider,
+      ctx: fullClaim._ctx || ctx,
+      claim: fullClaim
+    });
+
+    delete fullClaim._ctx;
+
+    res.json(fullClaim);
+
   } catch (e) {
     const payload = publicErrorPayload(e);
-    res.status(payload.status >= 400 && payload.status < 500 ? payload.status : 502).json(payload);
+
+    res
+      .status(
+        payload.status >= 400 &&
+        payload.status < 500
+          ? payload.status
+          : 502
+      )
+      .json(payload);
   }
 });
 
 app.post('/api/reclamations/threads/:id/message', async (req, res) => {
   try {
+    console.log('\n========== ENVOI MESSAGE ==========');
+    console.log('[SEND] ID demandé :', req.params.id);
+
     const entry = claimIndex.get(req.params.id);
-    if (!entry) throw new Error('Réclamation inconnue (rechargez la liste)');
-    const { provider, ctx } = entry;
-    const adapter = ADAPTERS[provider.type];
-    const { body, status, files } = await readReplyPayload(req);
-    if (!body) throw Object.assign(new Error('Message vide'), { statusCode: 400 });
-    await adapter.sendReply(provider, ctx, body, files);
-    // Si le statut passe à "resolu", on clôt côté marketplace quand c'est supporté.
-    const closeId = ctx.discussionId || ctx.incidentId;
-    if (status === 'resolu' && adapter.close && closeId) {
-      await adapter.close(provider, closeId);
+
+    if (!entry) {
+      console.error('[SEND] Réclamation absente du claimIndex');
+      throw new Error('Réclamation inconnue (rechargez la liste)');
     }
-    res.json({ ok: true, status, files: files.length });
+
+    const { provider, ctx } = entry;
+
+    console.log('[SEND] Provider :', {
+      code: provider.code,
+      type: provider.type
+    });
+
+    console.log('[SEND] Context :');
+    console.dir(ctx, { depth: null });
+
+    const adapter = ADAPTERS[provider.type];
+
+    const { body, status, files } =
+      await readReplyPayload(req);
+
+    console.log('[SEND] Message :');
+    console.log(body);
+
+    console.log('[SEND] Status :', status);
+
+    console.log(
+      '[SEND] Fichiers :',
+      files.map(f => ({
+        name: f.originalname,
+        size: f.size,
+        type: f.mimetype
+      }))
+    );
+
+    if (!body) {
+      throw Object.assign(
+        new Error('Message vide'),
+        { statusCode: 400 }
+      );
+    }
+
+    console.log('[SEND] Appel adapter.sendReply()...');
+
+    const result =
+      await adapter.sendReply(
+        provider,
+        ctx,
+        body,
+        files
+      );
+
+    console.log('[SEND] Résultat sendReply :');
+    console.dir(result, { depth: null });
+
+    const closeId =
+      ctx.discussionId ||
+      ctx.incidentId;
+
+    console.log('[SEND] closeId :', closeId);
+
+    if (
+      status === 'resolu' &&
+      adapter.close &&
+      closeId
+    ) {
+      console.log(
+        '[SEND] Fermeture de la réclamation...'
+      );
+
+      await adapter.close(
+        provider,
+        closeId
+      );
+
+      console.log(
+        '[SEND] Réclamation fermée'
+      );
+    }
+
+    console.log('[SEND] Réponse OK');
+    console.log('==================================\n');
+
+    res.json({
+      ok: true,
+      status,
+      files: files.length
+    });
   } catch (e) {
+    console.error('\n========== ERREUR ENVOI ==========');
+    console.error(e);
+    console.error('Stack :');
+    console.error(e.stack);
+    console.error('=================================\n');
+
     const payload = publicErrorPayload(e);
-    res.status(payload.status >= 400 && payload.status < 500 ? payload.status : 502).json(payload);
+    res
+      .status(
+        payload.status >= 400 &&
+          payload.status < 500
+          ? payload.status
+          : 502
+      )
+      .json(payload);
   }
 });
-
 // Suivi de livraison : GET /api/reclamations/tracking?carrier=colissimo&number=...
 app.get('/api/reclamations/tracking', async (req, res) => {
   try {

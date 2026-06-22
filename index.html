@@ -994,6 +994,26 @@ function normalizeClaim(c){
   };
 }
 
+function normalizeNote(n){
+  const rawRating = n.rating ?? n.rate ?? n.score ?? n.note ?? n.grade;
+  const rating = Math.max(1, Math.min(5, Math.round(Number(rawRating)||0)));
+  return {
+    id: n.id || `${n.marketplace || "unknown"}:note:${n.orderId || n.ean || Math.random().toString(36).slice(2)}`,
+    marketplace: n.marketplace || "unknown",
+    orderId: n.orderId || "",
+    customer: n.customer || "Client",
+    product: n.product || "",
+    ean: n.ean || "",
+    rating: rating || 0,
+    visible: n.visible !== false,
+    comment: n.comment || n.review || n.message || "",
+    at: n.at || n.createdAt || n.updatedAt || Date.now(),
+    reply: n.reply || "",
+    repliedBy: n.repliedBy || "",
+    source: n.source || "api",
+  };
+}
+
 const DataAPI = {
  async fetchClaims(){
   if(CONFIG.USE_DEMO_DATA) return structuredClone(DEMO);
@@ -1008,6 +1028,25 @@ const DataAPI = {
   console.log("Données reçues depuis l'API :", data);
 
   return Array.isArray(data) ? data.map(normalizeClaim) : [];
+},
+ async fetchNotes(options={}){
+  if(CONFIG.USE_DEMO_DATA) return structuredClone(NOTES);
+  const params = new URLSearchParams({
+    fast: options.full ? '0' : '1',
+    limit: String(options.limit || 150),
+    providerTimeoutMs: String(options.providerTimeoutMs || 9000),
+    cacheTtlMs: String(options.cacheTtlMs || 600000)
+  });
+  if(options.refresh) params.set('refresh','1');
+  if(options.includeMirakl) params.set('includeMirakl','1');
+  if(options.enrich) params.set('enrich','1');
+  const r = await fetch(`${CONFIG.API_BASE}/notes?${params.toString()}`, {
+    headers:{'Accept':'application/json'}
+  });
+  if(!r.ok) throw new Error("Erreur API notes "+r.status);
+  const data = await r.json();
+  console.log("Notes reçues depuis l'API :", data, "cache=", r.headers.get('X-Notes-Cache'));
+  return Array.isArray(data) ? data.map(normalizeNote).filter(n=>n.rating>0) : [];
 },
   async fetchClaimDetail(id){
     if(CONFIG.USE_DEMO_DATA){
@@ -1216,6 +1255,7 @@ const USERS=["Claude","Sandy","Guillaume"];
 let currentUser="Guillaume";   // utilisateur courant (modifiable via le sélecteur)
 
 let claims=[], sort={key:"updatedAt",dir:1}, selectedId=null;  // défaut : du plus ancien au plus récent
+let notesLoading=false, notesLoaded=CONFIG.USE_DEMO_DATA;
 const RECLAM_PER_PAGE=25; let reclamPage=1;                    // pagination des réclamations (25/page)
 function answered(c){ const m=c.messages; return !!(m && m.length && m[m.length-1].from==="seller"); }  // dernière réponse = vendeur
 function everReplied(c){ return (c.messages||[]).some(m=>m.from==="seller"); }  // a-t-on déjà répondu au moins une fois ?
@@ -2369,6 +2409,15 @@ function renderNotes(){
     if(fret==="no" && req) return false;
     return true;
   }).slice();
+  const emptyEl = $("#notesEmpty");
+  if(notesLoading && !NOTES.length){
+    emptyEl.textContent = "Chargement des notes produit… Les réclamations restent utilisables pendant ce temps.";
+    emptyEl.style.display = "block";
+    $("#notesBody").innerHTML = "";
+    $("#notesPager").innerHTML = "";
+    return;
+  }
+  emptyEl.textContent = notesLoaded ? "Aucune note client." : "Notes produit non chargées.";
   list.sort((a,b)=>{
     switch(sortv){
       case "rating-desc": return b.rating-a.rating||b.at-a.at;
@@ -2467,12 +2516,36 @@ function initTabs(){
 /* Accueil : revient à la page Statistiques (clic sur le logo) */
 function closeAllTabs(){ showPage("tabStats"); }
 
+async function loadNotesAsync(options={}){
+  if(CONFIG.USE_DEMO_DATA) return;
+  notesLoading=true;
+  notesLoaded=false;
+  renderNotes();
+  try{
+    const liveNotes = await DataAPI.fetchNotes(options);
+    NOTES.splice(0, NOTES.length, ...liveNotes);
+    notesLoaded=true;
+  }catch(ne){
+    console.warn("Chargement des notes impossible", ne);
+    toast("Notes produit indisponibles : "+ne.message, true);
+  }finally{
+    notesLoading=false;
+    renderNotes();
+  }
+}
+
 async function load(){
   try{ $("#btnRefresh").textContent="↻ Chargement…";
     claims=await DataAPI.fetchClaims();
     claims.forEach(c=>{ if(c.status==="encours"||c.status==="attente") c.status="nouveau"; c.slaHours=slaInfo(c).hours; });
+    if(!CONFIG.USE_DEMO_DATA){
+      NOTES.splice(0, NOTES.length);
+      notesLoading=true;
+      notesLoaded=false;
+    }
     syncEuroRefunds();
     renderKPIs(); renderEvo(); renderCharts(); renderTable();
+    if(!CONFIG.USE_DEMO_DATA) loadNotesAsync().catch(()=>{});
   }catch(e){toast("Chargement impossible : "+e.message,true);}
   finally{$("#btnRefresh").textContent="↻ Actualiser";}
 }
