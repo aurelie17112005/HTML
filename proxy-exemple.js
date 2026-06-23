@@ -435,6 +435,7 @@ function promiseWithTimeout(promise, timeoutMs, label = 'opération') {
 
 const notesCache = new Map();
 const notesInFlight = new Map();
+const notesLastRefreshStart = new Map();
 
 function notesRequestOptions(query = {}) {
   const fast = String(query.fast ?? process.env.NOTES_FAST_MODE ?? '1') !== '0';
@@ -451,6 +452,7 @@ function notesRequestOptions(query = {}) {
     providerTimeoutMs: positiveInt(query.providerTimeoutMs || process.env.NOTES_PROVIDER_TIMEOUT_MS, fast ? 9000 : 30000, 0, 120000),
     cacheTtlMs: positiveInt(query.cacheTtlMs || process.env.NOTES_CACHE_TTL_MS, 10 * 60 * 1000, 0, 24 * 60 * 60 * 1000),
     staleWhileRefresh: String(query.stale ?? process.env.NOTES_STALE_WHILE_REFRESH ?? '1') !== '0',
+    refreshCooldownMs: positiveInt(query.refreshCooldownMs || process.env.NOTES_REFRESH_COOLDOWN_MS, 60000, 0, 24 * 60 * 60 * 1000),
   };
 }
 
@@ -524,22 +526,38 @@ async function getProductNotesCached(options = {}, forceRefresh = false) {
     return { data: cached.data, cache: 'HIT', key };
   }
 
-  if (!forceRefresh && cached && options.staleWhileRefresh) {
-    if (!notesInFlight.has(key)) {
-      const refresh = collectProductNotes(options)
-        .then(data => notesCache.set(key, { at: Date.now(), data }))
-        .catch(e => console.error('[notes/cache refresh]', e.message))
-        .finally(() => notesInFlight.delete(key));
-      notesInFlight.set(key, refresh);
+  if (forceRefresh && cached && options.refreshCooldownMs > 0) {
+    const last = notesLastRefreshStart.get(key) || cached.at || 0;
+    if (now - last < options.refreshCooldownMs) {
+      return { data: cached.data, cache: 'COOLDOWN', key };
     }
-    return { data: cached.data, cache: 'STALE', key };
   }
 
-  if (!forceRefresh && notesInFlight.has(key)) {
+  if (notesInFlight.has(key)) {
+    if (cached && options.staleWhileRefresh) {
+      return { data: cached.data, cache: 'WAIT-STALE', key };
+    }
     const data = await notesInFlight.get(key);
     return { data: data || notesCache.get(key)?.data || [], cache: 'WAIT', key };
   }
 
+  if (!forceRefresh && cached && options.staleWhileRefresh) {
+    notesLastRefreshStart.set(key, now);
+    const refresh = collectProductNotes(options)
+      .then(data => {
+        notesCache.set(key, { at: Date.now(), data });
+        return data;
+      })
+      .catch(e => {
+        console.error('[notes/cache refresh]', e.message);
+        return cached.data;
+      })
+      .finally(() => notesInFlight.delete(key));
+    notesInFlight.set(key, refresh);
+    return { data: cached.data, cache: 'STALE', key };
+  }
+
+  notesLastRefreshStart.set(key, now);
   const task = collectProductNotes(options)
     .then(data => {
       notesCache.set(key, { at: Date.now(), data });
@@ -1526,17 +1544,70 @@ ${inner}
       || bompFuzzyText(obj, ['sellercomment', 'selleranswer', 'commentreply', 'reply', 'answer'], ['id', 'date', 'status', 'state']);
   }
 
+  function bompBoolText(v) {
+    if (typeof v === 'boolean') return v ? 'TRUE' : 'FALSE';
+    const s = String(v ?? '').trim();
+    if (/^(true|1|yes|oui)$/i.test(s)) return 'TRUE';
+    if (/^(false|0|no|non)$/i.test(s)) return 'FALSE';
+    return s.toUpperCase();
+  }
+
+  function bompElementXml(key, value) {
+    if (value === undefined || value === null || value === '') return '';
+
+    // BOMP/Fnac-Darty est strict : les booléens XML sont souvent en TRUE/FALSE.
+    // Exemples : message_archived, waiting_for_seller_answer.
+    if (typeof value === 'boolean' || ['message_archived', 'waiting_for_seller_answer'].includes(key)) {
+      return `  <${key}>${xmlEscape(bompBoolText(value))}</${key}>`;
+    }
+
+    // Le schéma refuse <message_from_types>CLIENT</message_from_types> :
+    // c'est un élément composé et l'élément enfant attendu est <from_type>.
+    if (key === 'message_from_types') {
+      const vals = (Array.isArray(value) ? value : String(value).split(','))
+        .map(v => String(v || '').trim().toUpperCase())
+        .filter(Boolean);
+      if (!vals.length) return '';
+      return `  <message_from_types>\n${vals.map(v => `    <from_type>${xmlEscape(v)}</from_type>`).join('\n')}\n  </message_from_types>`;
+    }
+
+    if (Array.isArray(value)) {
+      return value.map(item => `  <${key}>${xmlEscape(item)}</${key}>`).join('\n');
+    }
+
+    return `  <${key}>${xmlEscape(value)}</${key}>`;
+  }
+
+  function bompOrderedElements(operation, elements = {}) {
+    const order = {
+      messages_query: [
+        'paging', 'date', 'message_type', 'message_archived', 'message_state',
+        'message_id', 'order_fnac_id', 'offer_fnac_id', 'offer_seller_id',
+        'sort_by', 'message_from_types'
+      ],
+      client_order_comments_query: ['paging', 'date', 'rate', 'client_order_comment_id', 'order_fnac_id'],
+      orders_query: ['paging', 'date', 'sort_by', 'product_fnac_id', 'offer_fnac_id', 'offer_seller_id', 'state', 'states', 'order_fnac_id', 'orders_fnac_id'],
+      incidents_query: ['paging', 'date', 'status', 'type', 'types', 'incident_id', 'incidents_id', 'closed_statuses', 'closed_status', 'waiting_for_seller_answer', 'opened_by', 'closed_by', 'sort_by', 'order', 'orders'],
+    }[operation] || [];
+
+    const keys = [
+      ...order.filter(k => Object.prototype.hasOwnProperty.call(elements, k)),
+      ...Object.keys(elements).filter(k => !order.includes(k)),
+    ];
+
+    const inner = keys
+      .map(k => bompElementXml(k, elements[k]))
+      .filter(Boolean)
+      .join('\n');
+
+    return inner || '  <paging>1</paging>';
+  }
+
   function bompQueryXml(provider, token, operation, elements = {}, resultsCount = 100) {
     // Si une requête précédente a forcé une ré-authentification, on prend
     // automatiquement le dernier token en cache plutôt que l'ancien token local.
     const activeToken = tokens.get(provider.code)?.value || token;
-    const inner = Object.entries(elements)
-      .filter(([, v]) => v !== undefined && v !== null && v !== '')
-      .map(([k, v]) => Array.isArray(v)
-        ? v.map(item => `  <${k}>${xmlEscape(item)}</${k}>`).join('\n')
-        : `  <${k}>${xmlEscape(v)}</${k}>`)
-      .filter(Boolean)
-      .join('\n') || '  <paging>1</paging>';
+    const inner = bompOrderedElements(operation, elements);
     const attrs = resultsCount ? ` results_count="${xmlEscape(resultsCount)}"` : '';
     return authedRequest(provider, activeToken, operation, inner, attrs);
   }
@@ -1620,12 +1691,31 @@ ${inner}
     ]);
   }
 
+  function extractBompMessageFromType(m) {
+    // Dans le XML BOMP réel :
+    // <message_from type="CLIENT"><![CDATA[DOMINIQUE]]></message_from>
+    // Si on lit seulement le texte "DOMINIQUE", on classe le message comme vendeur.
+    // Il faut donc prioriser l'attribut type.
+    return firstValue(
+      m?.message_from?.['@_type'], m?.message_from?.type, m?.message_from_type, m?.['@_message_from_type'],
+      m?.from?.['@_type'], m?.from?.type, m?.from_type, m?.sender_type,
+      m?.['@_from_type'], m?.['@_sender_type'], m?.author_type,
+      m?.is_customer ? 'CLIENT' : '',
+      m?.is_seller ? 'SELLER' : '',
+      m?.message_from, m?.from, m?.author, m?.created_by, m?.origin, m?.source
+    );
+  }
+
+  function extractBompMessageFromLabel(m) {
+    return cleanText(firstValue(
+      m?.message_from?.['#text'], m?.message_from?.value, m?.message_from,
+      m?.from?.['#text'], m?.from?.value, m?.from, m?.author
+    ));
+  }
+
   function mapEmbeddedBompMessage(m, defaultAuthor = 'client') {
     return {
-      from: parseBompAuthor(firstValue(
-        m['@_from'], m.from, m.author, m.message_from, m.from_type, m.sender_type,
-        m.created_by, m.origin, m.source, m.is_customer ? 'client' : '', defaultAuthor
-      )),
+      from: parseBompAuthor(extractBompMessageFromType(m) || defaultAuthor),
       at: parseBompDate(
         m['@_date'], m.date, m.created_at, m.createdAt, m.updated_at, m.updatedAt,
         m.sent_at, m.creation_date, m.modification_date
@@ -1754,10 +1844,9 @@ ${inner}
         updatedAt,
         openedBy: parseBompAuthor(openedByRaw),
         waitingForSeller,
-        // Ne pas considérer "un client a écrit un jour" comme "à répondre" :
-        // la vraie décision se fait plus bas avec le dernier message.
-        // Exception : certains incidents Fnac/Darty n'ont pas de conversation exploitable.
-        needsReply: waitingForSeller || (!msgs.length && parseBompAuthor(openedByRaw) === 'client'),
+        // Ne pas considérer "un client a écrit un jour" comme "à répondre".
+        // Pour Fnac/Darty, la source fiable est waiting_for_seller_answer ou le dernier message.
+        needsReply: waitingForSeller,
       },
     });
   }
@@ -1766,7 +1855,8 @@ ${inner}
     const id = extractBompMessageId(m);
     const orderId = extractBompOrderId(m) || defaultOrderId;
     const text = extractBompClientText(m);
-    const author = parseBompAuthor(firstValue(m.message_from, m.from, m.author, m.from_type, m.sender_type, 'customer'));
+    const author = parseBompAuthor(extractBompMessageFromType(m) || 'CLIENT');
+    const fromLabel = extractBompMessageFromLabel(m);
     const at = parseBompDate(
       m.date, m.created_at, m.createdAt, m.updated_at, m.updatedAt, m.sent_at, m.creation_date,
       bompDeepText(m, ['date', 'created_at', 'createdAt', 'updated_at', 'updatedAt', 'sent_at', 'creation_date'])
@@ -1776,7 +1866,7 @@ ${inner}
       id: id || orderId || Math.random().toString(36).slice(2),
       customer: bompText(m.client_id, m.customer, m.buyer) || bompDeepText(m, [
         'customer', 'customer_name', 'buyer', 'buyer_name', 'client', 'client_name', 'client_id', 'buyer_id'
-      ]) || 'Client',
+      ]) || (author === 'client' && fromLabel && !/^(CLIENT|CALLCENTER|FNAC|DARTY)$/i.test(fromLabel) ? fromLabel : 'Client'),
       subject: normalizeSubject(firstReadableSubject(
         m.subject, m.message_subject, m.type,
         bompDeepText(m, ['subject', 'message_subject', 'reason', 'reason_label', 'motif', 'type'])
@@ -1951,50 +2041,183 @@ ${inner}
       return dedupeProductNotes(notes);
     },
 
-    async fetchClaims(provider) {
+    async fetchClaims(provider, options = {}) {
       const token = await getToken(provider);
       const claims = [];
       const errors = [];
-      const enrichLimit = Number(process.env.BOMP_ENRICH_LIMIT || 50);
+
+      // Mode par défaut pour le tableau : ne garder que ce qui attend une réponse.
+      // Cela évite de ramener tout l'historique BOMP/Fnac-Darty.
+      const onlyWaitingReply = parseBoolFlag(
+        process.env.BOMP_ONLY_WAITING_REPLY,
+        options.onlyUnanswered !== false
+      );
+      const enrichLimit = positiveInt(
+        process.env.BOMP_ENRICH_LIMIT,
+        onlyWaitingReply ? 40 : 50,
+        0,
+        500
+      );
+
+      let useMessageFromTypes = parseBoolFlag(process.env.BOMP_USE_MESSAGE_FROM_TYPES, true);
+      const broadQuery = parseBoolFlag(process.env.BOMP_BROAD_QUERY, true);
+      const includeGlobalMessages = parseBoolFlag(
+        process.env.BOMP_INCLUDE_GLOBAL_MESSAGES,
+        !onlyWaitingReply
+      );
+      const includeCommentsInThreads = parseBoolFlag(
+        process.env.BOMP_INCLUDE_ORDER_COMMENTS_IN_THREADS,
+        false
+      );
+      const fallbackGeneralIncidents = parseBoolFlag(
+        process.env.BOMP_WAITING_FALLBACK_GENERAL,
+        false
+      );
+      const messagePageSize = positiveInt(process.env.BOMP_MESSAGES_PAGE_SIZE, onlyWaitingReply ? 50 : 100, 1, 500);
+      const messageMaxPages = positiveInt(process.env.BOMP_MESSAGES_MAX_PAGES, onlyWaitingReply ? 1 : (broadQuery ? 3 : 1), 1, 50);
+      const orderMessageMaxPages = positiveInt(process.env.BOMP_ORDER_MESSAGES_MAX_PAGES, onlyWaitingReply ? 3 : (broadQuery ? 2 : 1), 1, 20);
 
       async function safeQuery(operation, xml, label = operation) {
         try {
           return await postXml(provider, operation, xml);
         } catch (e) {
           errors.push({ operation: label, message: e.message, statusCode: e.statusCode });
+          // Si l'environnement BOMP ne supporte pas notre forme imbriquée message_from_types,
+          // on désactive seulement ce filtre. Les requêtes simples continuent de récupérer CLIENT + CALLCENTER.
+          if (/message_from_types|message_from_type|from_type/i.test(String(e.message || ''))) useMessageFromTypes = false;
           console.warn(`[bomp/${provider.code}] ${label} ignoré : ${e.message}`);
           return null;
         }
       }
 
-      // 1) Requêtes larges : on récupère les incidents, messages et commentaires disponibles.
-      const incidentsResponse = await safeQuery(
-        'incidents_query',
-        bompQueryXml(provider, token, 'incidents_query', { paging: 1 }, 100)
-      );
-      const ir = incidentsResponse?.incidents_query_response || incidentsResponse?.incidents || incidentsResponse || {};
-      const incidents = incidentsResponse ? extractBompNodes(ir, ['incident']) : [];
+      async function collectBompMessages(elements = {}, labelPrefix = 'messages_query', maxPages = messageMaxPages) {
+        const nodes = [];
+        for (let page = 1; page <= maxPages; page++) {
+          const response = await safeQuery(
+            'messages_query',
+            bompQueryXml(provider, token, 'messages_query', { paging: page, ...elements }, messagePageSize),
+            page === 1 ? labelPrefix : `${labelPrefix}/page:${page}`
+          );
+          const root = response?.messages_query_response || response?.messages || response || {};
+          const pageNodes = response ? extractBompNodes(root, ['message']) : [];
+          nodes.push(...pageNodes);
+          if (!pageNodes.length || pageNodes.length < messagePageSize) break;
+        }
+        return nodes;
+      }
+
+      function bompCsvEnv(name, fallback) {
+        return String(process.env[name] || fallback || '')
+          .split(',')
+          .map(v => v.trim().toUpperCase())
+          .filter(Boolean);
+      }
+
+      function isBompThreadCandidate(claim) {
+        if (!claim) return false;
+        const ctx = claim._ctx || {};
+        if (ctx.waitingForSeller === true || ctx.needsReply === true) return true;
+        return claimNeedsReply(claim);
+      }
+
+      async function collectBompMessagesByOrder(orderId) {
+        const nodes = [];
+
+        // Important : on charge l'historique complet UNIQUEMENT pour les commandes déjà
+        // identifiées comme à traiter. Cela évite de scanner tout l'ancien historique,
+        // tout en récupérant les messages CLIENT + CALLCENTER + vos messages SELLER.
+        nodes.push(...await collectBompMessages(
+          { order_fnac_id: orderId },
+          `messages_query/order_fnac_id:${orderId}/thread-full`,
+          orderMessageMaxPages
+        ));
+
+        // Requêtes complémentaires ciblées par auteur. Fnac/Darty renvoie parfois
+        // des fils différents selon le filtre. On inclut aussi les types vendeur pour
+        // afficher les messages envoyés par la boutique / vous.
+        if (useMessageFromTypes) {
+          const fromTypes = [
+            ...bompCsvEnv('BOMP_CLIENT_FROM_TYPES', 'CLIENT,CALLCENTER'),
+            ...bompCsvEnv('BOMP_SELLER_FROM_TYPES', 'SELLER,SHOP,MERCHANT,PARTNER')
+          ];
+          for (const fromType of [...new Set(fromTypes)]) {
+            nodes.push(...await collectBompMessages(
+              { order_fnac_id: orderId, message_from_types: [fromType] },
+              `messages_query/order_fnac_id:${orderId}/from:${fromType}`,
+              orderMessageMaxPages
+            ));
+          }
+        }
+
+        return uniqueBompNodes(nodes);
+      }
+
+      // 1) Requêtes ciblées : en mode standard, on demande d'abord les dossiers
+      // explicitement en attente d'une réponse vendeur. On évite ainsi de charger
+      // tout l'historique Fnac/Darty.
+      const incidentQueries = onlyWaitingReply
+        ? [{ waiting_for_seller_answer: true }]
+        : [{ }];
+
+      let incidents = [];
+      for (const query of incidentQueries) {
+        const incidentsResponse = await safeQuery(
+          'incidents_query',
+          bompQueryXml(provider, token, 'incidents_query', { paging: 1, ...query }, 100),
+          query.waiting_for_seller_answer ? 'incidents_query/waiting_for_seller_answer:TRUE' : 'incidents_query'
+        );
+        const ir = incidentsResponse?.incidents_query_response || incidentsResponse?.incidents || incidentsResponse || {};
+        incidents.push(...(incidentsResponse ? extractBompNodes(ir, ['incident']) : []));
+      }
+
+      // Fallback désactivé par défaut : utile seulement si ton accès BOMP refuse le filtre
+      // waiting_for_seller_answer. Sinon, cela ramènerait de nouveau l'historique ancien.
+      if (onlyWaitingReply && !incidents.length && fallbackGeneralIncidents) {
+        const fallbackResponse = await safeQuery(
+          'incidents_query',
+          bompQueryXml(provider, token, 'incidents_query', { paging: 1 }, 100),
+          'incidents_query/fallback-general'
+        );
+        const fr = fallbackResponse?.incidents_query_response || fallbackResponse?.incidents || fallbackResponse || {};
+        incidents.push(...(fallbackResponse ? extractBompNodes(fr, ['incident']) : []));
+      }
+
+      incidents = uniqueBompNodes(incidents);
       let mappedIncidents = incidents.map(it => mapIncident(provider, it));
 
-      const messagesResponse = await safeQuery(
-        'messages_query',
-        bompQueryXml(provider, token, 'messages_query', { paging: 1 }, 100)
-      );
-      const mr = messagesResponse?.messages_query_response || messagesResponse?.messages || messagesResponse || {};
-      const messages = messagesResponse ? extractBompNodes(mr, ['message']) : [];
+      const messageNodes = [];
+      if (includeGlobalMessages) {
+        messageNodes.push(...await collectBompMessages({}, 'messages_query'));
+        if (useMessageFromTypes) {
+          messageNodes.push(...await collectBompMessages({ message_archived: false, message_from_types: ['CLIENT'] }, 'messages_query/from:CLIENT'));
+        }
+        if (useMessageFromTypes) {
+          messageNodes.push(...await collectBompMessages({ message_archived: false, message_from_types: ['CALLCENTER'] }, 'messages_query/from:CALLCENTER'));
+        }
+      } else {
+        // Petite requête de secours : messages non archivés et non lus uniquement.
+        // Elle ne doit pas remplacer le filtre incident ; elle sert juste à attraper
+        // les cas BOMP qui ne passent pas par incidents_query.
+        messageNodes.push(...await collectBompMessages({ message_archived: false, message_state: 'UNREAD' }, 'messages_query/unread-not-archived', 1));
+      }
+      const messages = uniqueBompNodes(messageNodes);
       let mappedMessages = messages
         .map(m => mapMessage(provider, m))
         .filter(c => c._ctx.messageId || c.orderId || c.messages.length);
 
-      const commentsResponse = await safeQuery(
-        'client_order_comments_query',
-        bompQueryXml(provider, token, 'client_order_comments_query', { paging: 1 }, 100)
-      );
-      const cr = commentsResponse?.client_order_comments_query_response || commentsResponse?.client_order_comments || commentsResponse || {};
-      const comments = commentsResponse ? extractBompNodes(cr, ['client_order_comment', 'comment']) : [];
-      let mappedComments = comments
-        .map(c => mapClientOrderComment(provider, c))
-        .filter(c => c.orderId || c.messages.length);
+      let comments = [];
+      let mappedComments = [];
+      if (includeCommentsInThreads || !onlyWaitingReply) {
+        const commentsResponse = await safeQuery(
+          'client_order_comments_query',
+          bompQueryXml(provider, token, 'client_order_comments_query', { paging: 1 }, 100)
+        );
+        const cr = commentsResponse?.client_order_comments_query_response || commentsResponse?.client_order_comments || commentsResponse || {};
+        comments = commentsResponse ? extractBompNodes(cr, ['client_order_comment', 'comment']) : [];
+        mappedComments = comments
+          .map(c => mapClientOrderComment(provider, c))
+          .filter(c => c.orderId || c.messages.length);
+      }
 
       // 2) Certains retours incidents BOMP sont des résumés : on redemande le détail par incident_id.
       // Ça récupère souvent le order_id/order_fnac_id qui n'était pas dans la liste principale.
@@ -2023,34 +2246,42 @@ ${inner}
       // 3) Deuxième passe par numéro de commande.
       // D'après l'API Fnac, messages_query et client_order_comments_query acceptent order_fnac_id.
       // Sans cette passe, les incidents peuvent s'afficher sans conversation.
-      const orderIds = [...new Set([
-        ...mappedIncidents.map(c => c.orderId),
-        ...mappedMessages.map(c => c.orderId),
-        ...mappedComments.map(c => c.orderId),
-      ].filter(Boolean))].slice(0, enrichLimit);
+      const unreadFallbackMaxAgeDays = positiveInt(process.env.BOMP_UNREAD_FALLBACK_MAX_AGE_DAYS, 14, 0, 365);
+      const isRecentUnreadFallback = (c) => {
+        if (!unreadFallbackMaxAgeDays) return true;
+        const t = claimActivityTime(c);
+        return !t || t >= Date.now() - unreadFallbackMaxAgeDays * 24 * H;
+      };
+
+      const threadCandidates = onlyWaitingReply
+        ? [
+            ...mappedIncidents.filter(isBompThreadCandidate),
+            ...mappedMessages.filter(c => isBompThreadCandidate(c) && isRecentUnreadFallback(c)),
+            ...mappedComments.filter(c => isBompThreadCandidate(c) && isRecentUnreadFallback(c)),
+          ]
+        : [...mappedIncidents, ...mappedMessages, ...mappedComments];
+
+      const orderIds = [...new Set(threadCandidates.map(c => c.orderId).filter(Boolean))].slice(0, enrichLimit);
+      const activeOrderIds = new Set(orderIds);
 
       const perOrderMessages = [];
       const perOrderComments = [];
       const orderInfos = [];
 
       for (const orderId of orderIds) {
-        const msgByOrderResponse = await safeQuery(
-          'messages_query',
-          bompQueryXml(provider, token, 'messages_query', { paging: 1, order_fnac_id: orderId }, 100),
-          `messages_query/order_fnac_id:${orderId}`
-        );
-        const mor = msgByOrderResponse?.messages_query_response || msgByOrderResponse?.messages || msgByOrderResponse || {};
-        const msgByOrder = msgByOrderResponse ? extractBompNodes(mor, ['message']) : [];
+        const msgByOrder = await collectBompMessagesByOrder(orderId);
         perOrderMessages.push(...msgByOrder.map(m => mapMessage(provider, m, orderId)).filter(c => c._ctx.messageId || c.orderId || c.messages.length));
 
-        const comByOrderResponse = await safeQuery(
-          'client_order_comments_query',
-          bompQueryXml(provider, token, 'client_order_comments_query', { paging: 1, order_fnac_id: orderId }, 100),
-          `client_order_comments_query/order_fnac_id:${orderId}`
-        );
-        const cor = comByOrderResponse?.client_order_comments_query_response || comByOrderResponse?.client_order_comments || comByOrderResponse || {};
-        const comByOrder = comByOrderResponse ? extractBompNodes(cor, ['client_order_comment', 'comment']) : [];
-        perOrderComments.push(...comByOrder.map(c => mapClientOrderComment(provider, c, orderId)).filter(c => c.orderId || c.messages.length));
+        if (includeCommentsInThreads || !onlyWaitingReply) {
+          const comByOrderResponse = await safeQuery(
+            'client_order_comments_query',
+            bompQueryXml(provider, token, 'client_order_comments_query', { paging: 1, order_fnac_id: orderId }, 100),
+            `client_order_comments_query/order_fnac_id:${orderId}`
+          );
+          const cor = comByOrderResponse?.client_order_comments_query_response || comByOrderResponse?.client_order_comments || comByOrderResponse || {};
+          const comByOrder = comByOrderResponse ? extractBompNodes(cor, ['client_order_comment', 'comment']) : [];
+          perOrderComments.push(...comByOrder.map(c => mapClientOrderComment(provider, c, orderId)).filter(c => c.orderId || c.messages.length));
+        }
 
         // Optionnel mais utile : enrichit client / produit depuis la commande.
         const orderResponse = await safeQuery(
@@ -2073,7 +2304,16 @@ ${inner}
 
       // Les incidents Fnac/Darty sont souvent séparés de la messagerie.
       // On rattache les messages/commentaires par order_fnac_id puis on conserve aussi les messages orphelins.
-      const messageLikeClaims = mergeClaimsByIncidentOrOrder([...mappedMessages, ...mappedComments]);
+      let messageLikeClaims = mergeClaimsByIncidentOrOrder([...mappedMessages, ...mappedComments]);
+      if (onlyWaitingReply) {
+        // On ne garde pas les vieux fils orphelins : seules les commandes candidates
+        // à traiter peuvent compléter l'affichage. Les messages boutique restent
+        // bien présents, mais uniquement dans ces conversations actives.
+        messageLikeClaims = messageLikeClaims.filter(m => {
+          if (m.orderId && activeOrderIds.has(m.orderId)) return true;
+          return isBompThreadCandidate(m) && isRecentUnreadFallback(m);
+        });
+      }
       const mergedIncidents = mergeBompMessagesIntoIncidents(mappedIncidents, messageLikeClaims);
       claims.push(...mergedIncidents);
       claims.push(...messageLikeClaims.filter(m => !mergedIncidents.some(i => i.orderId && i.orderId === m.orderId)));
@@ -2086,6 +2326,8 @@ ${inner}
         const sample = finalMerged.slice(0, 8).map(c => ({
           id: c.id, orderId: c.orderId, subject: c.subject, messages: c.messages?.length || 0,
           firstMessage: c.messages?.[0]?.text ? c.messages[0].text.slice(0, 90) : '',
+          authors: (c.messages || []).reduce((acc, m) => { acc[m.from || 'unknown'] = (acc[m.from || 'unknown'] || 0) + 1; return acc; }, {}),
+          lastFrom: (c.messages || []).slice(-1)[0]?.from || '',
           ctx: { kind: c._ctx?.kind, incidentId: c._ctx?.incidentId, messageId: c._ctx?.messageId, orderId: c._ctx?.orderId }
         }));
         console.log(`[bomp/${provider.code}] final sample`, JSON.stringify(sample, null, 2));
@@ -2100,7 +2342,11 @@ ${inner}
         });
       }
 
-      return mergeClaimsByIncidentOrOrder(claims);
+      let finalClaims = mergeClaimsByIncidentOrOrder(claims);
+      if (onlyWaitingReply) {
+        finalClaims = finalClaims.filter(c => claimNeedsReply(c));
+      }
+      return finalClaims;
     },
 
     async sendReply(provider, ctx, body) {
@@ -2341,9 +2587,15 @@ function normalizeMessageTime(m) {
 function claimNeedsReply(claim) {
   if (!claim || claim.status === 'resolu') return false;
   const ctx = claim._ctx || {};
+  const isBomp = claim.marketplace && ['fnac', 'darty'].includes(String(claim.marketplace).toLowerCase());
   const messages = Array.isArray(claim.messages) ? claim.messages.filter(m => m && m.from) : [];
 
-  // Source la plus fiable : le dernier message de la conversation.
+  // Pour Fnac/Darty, si l'API dit explicitement waiting_for_seller_answer=TRUE,
+  // on lui fait confiance : cela évite de perdre une réclamation à traiter parce que
+  // l'historique rattaché contient aussi d'anciens messages boutique.
+  if (isBomp && ctx.waitingForSeller === true) return true;
+
+  // Source fiable quand le fil est complet : le dernier message utile.
   // Si la boutique a répondu après le client, on ne doit plus afficher la réclamation.
   if (messages.length) {
     const last = [...messages].sort((a, b) => normalizeMessageTime(a) - normalizeMessageTime(b)).at(-1);
@@ -2353,13 +2605,8 @@ function claimNeedsReply(claim) {
   // Flags explicites renvoyés par la marketplace ou déduits au mapping.
   if (ctx.waitingForSeller === true || ctx.needsReply === true) return true;
 
-  // Cas BOMP important : incidents_query renvoie parfois uniquement un résumé d'incident
-  // avec incident_id + order_id, mais sans fil de messages. Avant, on les supprimait tous,
-  // ce qui donnait 0 réclamation côté Fnac/Darty malgré raw incidents/mapped > 0.
-  // La fenêtre de date reste appliquée juste après pour éviter de ressortir l'historique.
-  if (ctx.kind === 'incident' && ctx.incidentId && claim.marketplace && ['fnac', 'darty'].includes(String(claim.marketplace).toLowerCase())) {
-    return true;
-  }
+  // Cas BOMP : sans fil de messages et sans waiting_for_seller_answer, on ne garde pas.
+  if (isBomp && ctx.kind === 'incident' && ctx.incidentId) return false;
 
   return false;
 }
@@ -2453,6 +2700,395 @@ function inferIncidentMotif(subject, messages = []) {
 }
 
 
+
+
+/* =====================================================================
+   CACHE MUTUALISÉ RÉCLAMATIONS / INCIDENTS
+   ---------------------------------------------------------------------
+   Objectif : plusieurs utilisateurs peuvent charger la plateforme sans
+   relancer simultanément tous les appels Mirakl / Octopia / BOMP.
+   =====================================================================*/
+const threadsCache = new Map();
+const threadsInFlight = new Map();
+const threadsLastRefreshStart = new Map();
+const incidentsCache = new Map();
+const incidentsInFlight = new Map();
+const incidentsLastRefreshStart = new Map();
+
+function cacheStatePayload(cache, key, extra = {}) {
+  return {
+    cache,
+    key,
+    at: Date.now(),
+    ...extra,
+  };
+}
+
+function providerKey(p) {
+  return String(p.code || p.label || p.type || '').toLowerCase();
+}
+function providerPublicInfo(p) {
+  return {
+    type: p.type,
+    code: p.code || p.type,
+    label: p.label || p.code || p.type,
+  };
+}
+function providerMatchesFilter(p, rawFilter) {
+  const filter = cleanText(rawFilter).toLowerCase();
+  if (!filter) return true;
+  const wanted = new Set(filter.split(',').map(x => x.trim()).filter(Boolean));
+  if (!wanted.size) return true;
+  return wanted.has(String(p.type || '').toLowerCase()) ||
+    wanted.has(String(p.code || '').toLowerCase()) ||
+    wanted.has(String(p.label || '').toLowerCase()) ||
+    wanted.has(providerKey(p));
+}
+function filteredConfiguredProviders(rawFilter, baseProviders = configured()) {
+  return baseProviders.filter(p => providerMatchesFilter(p, rawFilter));
+}
+function stableCacheKey(obj) {
+  return JSON.stringify(Object.keys(obj).sort().reduce((acc, k) => {
+    acc[k] = obj[k];
+    return acc;
+  }, {}));
+}
+function threadsRequestOptions(req) {
+  const onlyUnanswered = req.query.all !== '1' && String(req.query.unanswered || '1') !== '0';
+  const maxAgeDays = resolveMaxAgeDays(req, onlyUnanswered);
+  return {
+    onlyUnanswered,
+    maxAgeDays,
+    providersFilter: cleanText(req.query.providers || req.query.provider || ''),
+    concurrency: positiveInt(req.query.concurrency || process.env.PROVIDER_CONCURRENCY, 6, 1, 20),
+    providerTimeoutMs: positiveInt(req.query.providerTimeoutMs || process.env.THREADS_PROVIDER_TIMEOUT_MS || process.env.PROVIDER_TIMEOUT_MS, 15000, 0, 120000),
+    cacheTtlMs: positiveInt(req.query.cacheTtlMs || process.env.THREADS_CACHE_TTL_MS, 180000, 0, 24 * 60 * 60 * 1000),
+    staleWhileRefresh: String(req.query.stale ?? process.env.THREADS_STALE_WHILE_REFRESH ?? '1') !== '0',
+    refreshCooldownMs: positiveInt(req.query.refreshCooldownMs || process.env.THREADS_REFRESH_COOLDOWN_MS, 60000, 0, 24 * 60 * 60 * 1000),
+    enrichDetails: parseBoolFlag(req.query.enrichDetails ?? process.env.THREADS_ENRICH_DETAILS, false),
+  };
+}
+function threadsCacheKey(options) {
+  return stableCacheKey({
+    scope: 'threads',
+    onlyUnanswered: options.onlyUnanswered ? 1 : 0,
+    maxAgeDays: options.maxAgeDays || 0,
+    providers: options.providersFilter || '',
+    enrichDetails: options.enrichDetails ? 1 : 0,
+  });
+}
+
+function getThreadsCacheSnapshot(options = {}, allowStale = false) {
+  const key = threadsCacheKey(options);
+  const cached = threadsCache.get(key);
+  if (!cached) return null;
+
+  const now = Date.now();
+  const ageMs = Math.max(0, now - Number(cached.at || 0));
+  const fresh = options.cacheTtlMs > 0 && ageMs < options.cacheTtlMs;
+
+  if (!fresh && !allowStale) return null;
+
+  restoreThreadsResult(cached);
+  return {
+    ...cached,
+    key,
+    cache: fresh ? 'HIT' : 'STALE',
+    ageMs,
+    fresh,
+  };
+}
+
+function threadsCacheDiagnostics() {
+  const now = Date.now();
+  return Array.from(threadsCache.entries()).map(([key, value]) => ({
+    key,
+    count: Array.isArray(value?.data) ? value.data.length : 0,
+    providers: Array.isArray(value?.providers) ? value.providers.length : 0,
+    providerChunks: Array.isArray(value?.providerChunks) ? value.providerChunks.length : 0,
+    ageMs: Math.max(0, now - Number(value?.at || 0)),
+    at: value?.at || null,
+  }));
+}
+
+function incidentsRequestOptions(req) {
+  const onlyUnanswered = req.query.all !== '1' && String(req.query.unanswered || '1') !== '0';
+  const maxAgeDays = resolveMaxAgeDays(req, onlyUnanswered);
+  return {
+    onlyUnanswered,
+    maxAgeDays,
+    providersFilter: cleanText(req.query.providers || req.query.provider || 'fnac,darty'),
+    concurrency: positiveInt(req.query.concurrency || process.env.INCIDENTS_PROVIDER_CONCURRENCY || process.env.PROVIDER_CONCURRENCY, 2, 1, 10),
+    providerTimeoutMs: positiveInt(req.query.providerTimeoutMs || process.env.INCIDENTS_PROVIDER_TIMEOUT_MS || process.env.PROVIDER_TIMEOUT_MS, 15000, 0, 120000),
+    cacheTtlMs: positiveInt(req.query.cacheTtlMs || process.env.INCIDENTS_CACHE_TTL_MS, 180000, 0, 24 * 60 * 60 * 1000),
+    staleWhileRefresh: String(req.query.stale ?? process.env.INCIDENTS_STALE_WHILE_REFRESH ?? '1') !== '0',
+    refreshCooldownMs: positiveInt(req.query.refreshCooldownMs || process.env.INCIDENTS_REFRESH_COOLDOWN_MS || process.env.THREADS_REFRESH_COOLDOWN_MS, 60000, 0, 24 * 60 * 60 * 1000),
+  };
+}
+function incidentsCacheKey(options) {
+  return stableCacheKey({
+    scope: 'incidents',
+    onlyUnanswered: options.onlyUnanswered ? 1 : 0,
+    maxAgeDays: options.maxAgeDays || 0,
+    providers: options.providersFilter || '',
+  });
+}
+function cloneForPublic(claim) {
+  const copy = { ...claim };
+  delete copy._ctx;
+  return copy;
+}
+function restoreClaimIndexFromEntries(entries = [], clear = true) {
+  if (clear) claimIndex.clear();
+  for (const item of entries) {
+    if (!item || !item.id || !item.entry) continue;
+    claimIndex.set(item.id, item.entry);
+  }
+}
+function restoreIncidentIndexFromEntries(entries = [], clear = true) {
+  if (clear) incidentIndex.clear();
+  for (const item of entries) {
+    if (!item || !item.id || !item.entry) continue;
+    incidentIndex.set(item.id, item.entry);
+    claimIndex.set(item.id, item.entry);
+  }
+}
+function restoreThreadsResult(result) {
+  restoreClaimIndexFromEntries(result?.claimEntries || [], true);
+  if (Array.isArray(result?.incidentEntries) && result.incidentEntries.length) {
+    restoreIncidentIndexFromEntries(result.incidentEntries, false);
+  }
+}
+function restoreIncidentsResult(result) {
+  restoreIncidentIndexFromEntries(result?.incidentEntries || [], true);
+}
+async function collectClaimsForCache(options = {}, onProvider = null) {
+  const all = [];
+  const claimEntries = [];
+  const incidentEntries = [];
+  const providerChunks = [];
+  const providers = filteredConfiguredProviders(options.providersFilter, configured());
+  let completed = 0;
+
+  await mapLimit(providers, options.concurrency, async (p, idx) => {
+    const info = providerPublicInfo(p);
+    try {
+      const fetched = await promiseWithTimeout(
+        ADAPTERS[p.type].fetchClaims(p, { onlyUnanswered: options.onlyUnanswered, maxAgeDays: options.maxAgeDays }),
+        options.providerTimeoutMs,
+        `threads ${p.type}/${p.code || 'octopia'}`
+      );
+      const providerMaxAgeDays = options.maxAgeDays || 0;
+      const kept = [];
+
+      for (const rawClaim of (Array.isArray(fetched) ? fetched : [])) {
+        const shouldFetchDetail = options.enrichDetails || options.onlyUnanswered;
+        const claim = shouldFetchDetail ? await ensureClaimHasMessages(p, rawClaim) : rawClaim;
+        if (options.onlyUnanswered && !claimNeedsReply(claim)) continue;
+        if (!claimIsRecentEnough(claim, providerMaxAgeDays)) continue;
+
+        claim.subject = normalizeSubject(
+          claim.subject,
+          Array.isArray(claim.messages) ? [...claim.messages].reverse().find(m => m.from === 'client')?.text : ''
+        );
+        const ctx = claim._ctx || rawClaim._ctx || {};
+        const cachedClaim = { ...claim, _ctx: ctx };
+        const entry = { provider: p, ctx, claim: cachedClaim };
+        claimEntries.push({ id: claim.id, entry });
+        if (ctx.kind === 'incident' || ctx.incidentId) {
+          incidentEntries.push({ id: claim.id, entry });
+        }
+        const publicClaim = cloneForPublic(cachedClaim);
+        kept.push(publicClaim);
+        all.push(publicClaim);
+      }
+
+      completed += 1;
+      const payload = {
+        provider: info,
+        rows: kept,
+        fetched: Array.isArray(fetched) ? fetched.length : 0,
+        kept: kept.length,
+        completed,
+        total: providers.length,
+        ok: true,
+      };
+      providerChunks[idx] = payload;
+      if (onProvider) onProvider(payload);
+      console.log(`[${p.type}/${p.code || 'octopia'}] ${kept.length}/${Array.isArray(fetched) ? fetched.length : 0} réclamation(s) à répondre, fenêtre=${providerMaxAgeDays || 'illimitée'}j`);
+    } catch (e) {
+      completed += 1;
+      const payload = {
+        provider: info,
+        rows: [],
+        error: e.message,
+        completed,
+        total: providers.length,
+        ok: false,
+      };
+      providerChunks[idx] = payload;
+      if (onProvider) onProvider(payload);
+      console.error(`[${p.type}/${p.code || ''}] ${e.message}`);
+    }
+  });
+
+  all.sort((a, b) => Number(b.updatedAt || 0) - Number(a.updatedAt || 0));
+  return { data: all, claimEntries, incidentEntries, providerChunks: providerChunks.filter(Boolean), providers: providers.map(providerPublicInfo), at: Date.now() };
+}
+async function getThreadsCached(options = {}, forceRefresh = false, onProvider = null) {
+  const key = threadsCacheKey(options);
+  const now = Date.now();
+  const cached = threadsCache.get(key);
+  const fresh = cached && options.cacheTtlMs > 0 && (now - cached.at) < options.cacheTtlMs;
+
+  if (!forceRefresh && fresh) {
+    restoreThreadsResult(cached);
+    return { ...cached, cache: 'HIT', key };
+  }
+
+  if (forceRefresh && cached && options.refreshCooldownMs > 0) {
+    const last = threadsLastRefreshStart.get(key) || cached.at || 0;
+    if (now - last < options.refreshCooldownMs) {
+      restoreThreadsResult(cached);
+      return { ...cached, cache: 'COOLDOWN', key };
+    }
+  }
+
+  if (threadsInFlight.has(key)) {
+    if (cached && options.staleWhileRefresh) {
+      restoreThreadsResult(cached);
+      return { ...cached, cache: 'WAIT-STALE', key };
+    }
+    const result = await threadsInFlight.get(key);
+    restoreThreadsResult(result);
+    return { ...result, cache: 'WAIT', key };
+  }
+
+  if (!forceRefresh && cached && options.staleWhileRefresh) {
+    threadsLastRefreshStart.set(key, now);
+    const refresh = collectClaimsForCache(options)
+      .then(result => {
+        threadsCache.set(key, result);
+        restoreThreadsResult(result);
+        return result;
+      })
+      .catch(e => {
+        console.error('[threads/cache refresh]', e.message);
+        return cached;
+      })
+      .finally(() => threadsInFlight.delete(key));
+    threadsInFlight.set(key, refresh);
+    restoreThreadsResult(cached);
+    return { ...cached, cache: 'STALE', key };
+  }
+
+  threadsLastRefreshStart.set(key, now);
+  const task = collectClaimsForCache(options, onProvider)
+    .then(result => {
+      threadsCache.set(key, result);
+      restoreThreadsResult(result);
+      return result;
+    })
+    .finally(() => threadsInFlight.delete(key));
+  threadsInFlight.set(key, task);
+  const result = await task;
+  return { ...result, cache: 'MISS', key };
+}
+async function collectIncidentsForCache(options = {}) {
+  const rows = [];
+  const incidentEntries = [];
+  const providers = filteredConfiguredProviders(options.providersFilter, configured().filter(p => p.type === 'bomp'));
+
+  await mapLimit(providers, options.concurrency, async (p) => {
+    try {
+      const fetched = await promiseWithTimeout(
+        ADAPTERS[p.type].fetchClaims(p, { onlyUnanswered: options.onlyUnanswered, maxAgeDays: options.maxAgeDays }),
+        options.providerTimeoutMs,
+        `incidents ${p.type}/${p.code || ''}`
+      );
+      const providerMaxAgeDays = options.maxAgeDays || 0;
+
+      for (const rawClaim of (Array.isArray(fetched) ? fetched : [])) {
+        const claim = options.onlyUnanswered ? await ensureClaimHasMessages(p, rawClaim) : rawClaim;
+        const ctx = claim._ctx || rawClaim._ctx || {};
+        if (ctx.kind !== 'incident' && !ctx.incidentId) continue;
+        if (options.onlyUnanswered && !claimNeedsReply(claim)) continue;
+        if (!claimIsRecentEnough(claim, providerMaxAgeDays)) continue;
+
+        const cachedClaim = { ...claim, _ctx: ctx };
+        incidentEntries.push({ id: claim.id, entry: { provider: p, ctx, claim: cachedClaim } });
+        rows.push(mapClaimToIncidentRow(cachedClaim));
+      }
+      console.log(`[incidents/${p.code || ''}] ${rows.length} ligne(s) incident cumulée(s), fenêtre=${providerMaxAgeDays || 'illimitée'}j`);
+    } catch (e) {
+      console.error(`[incidents/${p.code || ''}] ${e.message}`);
+    }
+  });
+
+  rows.sort((a, b) => String(b.openedAt || '').localeCompare(String(a.openedAt || '')));
+  return { data: rows, incidentEntries, at: Date.now() };
+}
+async function getIncidentsCached(options = {}, forceRefresh = false) {
+  const key = incidentsCacheKey(options);
+  const now = Date.now();
+  const cached = incidentsCache.get(key);
+  const fresh = cached && options.cacheTtlMs > 0 && (now - cached.at) < options.cacheTtlMs;
+
+  if (!forceRefresh && fresh) {
+    restoreIncidentsResult(cached);
+    return { ...cached, cache: 'HIT', key };
+  }
+  if (forceRefresh && cached && options.refreshCooldownMs > 0) {
+    const last = incidentsLastRefreshStart.get(key) || cached.at || 0;
+    if (now - last < options.refreshCooldownMs) {
+      restoreIncidentsResult(cached);
+      return { ...cached, cache: 'COOLDOWN', key };
+    }
+  }
+  if (incidentsInFlight.has(key)) {
+    if (cached && options.staleWhileRefresh) {
+      restoreIncidentsResult(cached);
+      return { ...cached, cache: 'WAIT-STALE', key };
+    }
+    const result = await incidentsInFlight.get(key);
+    restoreIncidentsResult(result);
+    return { ...result, cache: 'WAIT', key };
+  }
+  if (!forceRefresh && cached && options.staleWhileRefresh) {
+    incidentsLastRefreshStart.set(key, now);
+    const refresh = collectIncidentsForCache(options)
+      .then(result => {
+        incidentsCache.set(key, result);
+        restoreIncidentsResult(result);
+        return result;
+      })
+      .catch(e => {
+        console.error('[incidents/cache refresh]', e.message);
+        return cached;
+      })
+      .finally(() => incidentsInFlight.delete(key));
+    incidentsInFlight.set(key, refresh);
+    restoreIncidentsResult(cached);
+    return { ...cached, cache: 'STALE', key };
+  }
+
+  incidentsLastRefreshStart.set(key, now);
+  const task = collectIncidentsForCache(options)
+    .then(result => {
+      incidentsCache.set(key, result);
+      restoreIncidentsResult(result);
+      return result;
+    })
+    .finally(() => incidentsInFlight.delete(key));
+  incidentsInFlight.set(key, task);
+  const result = await task;
+  return { ...result, cache: 'MISS', key };
+}
+function sseSend(res, event, payload) {
+  res.write(`event: ${event}\n`);
+  res.write(`data: ${JSON.stringify(payload || {})}\n\n`);
+}
+
 app.get('/api/reclamations/health', (_req, res) => {
   const active = configured().map(p => ({
     code: p.code || 'octopia',
@@ -2524,87 +3160,144 @@ app.get('/api/reclamations/notes', async (req, res) => {
   }
 });
 
+
+
+app.get('/api/reclamations/cache-status', (_req, res) => {
+  res.json({
+    ok: true,
+    threads: {
+      size: threadsCache.size,
+      inFlight: threadsInFlight.size,
+      entries: threadsCacheDiagnostics(),
+    },
+    incidents: {
+      size: incidentsCache.size,
+      inFlight: incidentsInFlight.size,
+    },
+    notes: {
+      size: notesCache.size,
+      inFlight: notesInFlight.size,
+    },
+    now: Date.now(),
+  });
+});
+
 app.get('/api/reclamations/threads', async (req, res) => {
-  const all = [];
-  claimIndex.clear();
+  try {
+    const options = threadsRequestOptions(req);
+    const forceRefresh = parseBoolFlag(req.query.refresh, false);
+    const cacheOnly = parseBoolFlag(req.query.cacheOnly, false);
+    const allowStale = parseBoolFlag(req.query.allowStale ?? req.query.stale, false);
 
-  // Par défaut, ce proxy renvoie uniquement les réclamations auxquelles il faut répondre.
-  // Pour tout afficher ponctuellement : /api/reclamations/threads?all=1
-  const onlyUnanswered = req.query.all !== '1' && String(req.query.unanswered || '1') !== '0';
-  const maxAgeDays = resolveMaxAgeDays(req, onlyUnanswered);
-  const providers = configured();
-  const concurrency = Number(req.query.concurrency || process.env.PROVIDER_CONCURRENCY || 6);
-
-  await mapLimit(providers, concurrency, async (p) => {
-    try {
-      const fetched = await ADAPTERS[p.type].fetchClaims(p);
-      const providerMaxAgeDays = resolveMaxAgeDays(req, onlyUnanswered, p);
-      const kept = [];
-
-      for (const rawClaim of fetched) {
-        const claim = onlyUnanswered ? await ensureClaimHasMessages(p, rawClaim) : rawClaim;
-        if (onlyUnanswered && !claimNeedsReply(claim)) continue;
-        if (!claimIsRecentEnough(claim, providerMaxAgeDays)) continue;
-
-        claim.subject = normalizeSubject(
-          claim.subject,
-          Array.isArray(claim.messages) ? [...claim.messages].reverse().find(m => m.from === 'client')?.text : ''
-        );
-        const ctx = claim._ctx || rawClaim._ctx;
-        claimIndex.set(claim.id, { provider: p, ctx, claim: { ...claim, _ctx: ctx } });
-        delete claim._ctx;
-        kept.push(claim);
+    // Mode lecture cache pure : aucun appel marketplace externe.
+    // Utile au front pour afficher instantanément les dernières réclamations connues.
+    if (cacheOnly) {
+      const cached = getThreadsCacheSnapshot(options, allowStale);
+      if (!cached) {
+        res.set('Cache-Control', 'no-store');
+        res.set('X-Threads-Cache', 'MISS');
+        return res.status(204).end();
       }
-
-      all.push(...kept);
-      console.log(`[${p.type}/${p.code || 'octopia'}] ${kept.length}/${fetched.length} réclamation(s) à répondre, fenêtre=${providerMaxAgeDays || 'illimitée'}j`);
-    } catch (e) {
-      console.error(`[${p.type}/${p.code || ''}] ${e.message}`); // une MP en panne n'empêche pas les autres
+      res.set('Cache-Control', `private, max-age=${Math.floor((options.cacheTtlMs || 0) / 1000)}`);
+      res.set('X-Threads-Cache', cached.cache);
+      res.set('X-Threads-Cache-Key', cached.key || '');
+      res.set('X-Threads-Cache-Age-Ms', String(cached.ageMs || 0));
+      res.set('X-Threads-Count', String(cached.data?.length || 0));
+      return res.json(Array.isArray(cached.data) ? cached.data : []);
     }
+
+    const result = await getThreadsCached(options, forceRefresh);
+
+    res.set('Cache-Control', `private, max-age=${Math.floor((options.cacheTtlMs || 0) / 1000)}`);
+    res.set('X-Threads-Cache', result.cache);
+    res.set('X-Threads-Cache-Key', result.key || '');
+    res.set('X-Threads-Cache-Age-Ms', String(result.at ? Math.max(0, Date.now() - result.at) : 0));
+    res.set('X-Threads-Count', String(result.data?.length || 0));
+    res.json(Array.isArray(result.data) ? result.data : []);
+  } catch (e) {
+    const payload = publicErrorPayload(e);
+    res.status(payload.status >= 400 && payload.status < 500 ? payload.status : 502).json(payload);
+  }
+});
+
+app.get('/api/reclamations/threads-stream', async (req, res) => {
+  const options = threadsRequestOptions(req);
+  const forceRefresh = parseBoolFlag(req.query.refresh, false);
+  let sentLiveProviderEvents = false;
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
   });
 
-  all.sort((a, b) => Number(b.updatedAt || 0) - Number(a.updatedAt || 0));
-  res.json(all);
+  try {
+    const providers = filteredConfiguredProviders(options.providersFilter, configured()).map(providerPublicInfo);
+    sseSend(res, 'start', {
+      total: providers.length,
+      completed: 0,
+      providers,
+    });
+
+    const result = await getThreadsCached(options, forceRefresh, (payload) => {
+      sentLiveProviderEvents = true;
+      sseSend(res, payload?.ok === false ? 'provider-error' : 'provider', payload);
+    });
+
+    // Si les données viennent du cache ou d'une attente sur un refresh déjà en cours,
+    // aucun événement live n'a été émis. On rejoue les chunks mémorisés pour que le front
+    // continue d'afficher au fur et à mesure, sans rappeler les APIs externes.
+    if (!sentLiveProviderEvents) {
+      const chunks = Array.isArray(result.providerChunks) ? result.providerChunks : [];
+      if (chunks.length) {
+        for (const chunk of chunks) {
+          sseSend(res, chunk?.ok === false ? 'provider-error' : 'provider', {
+            ...chunk,
+            cache: result.cache,
+          });
+        }
+      } else {
+        sseSend(res, 'provider', {
+          provider: { type: 'cache', code: 'cache', label: 'Cache serveur' },
+          rows: Array.isArray(result.data) ? result.data : [],
+          completed: 1,
+          total: 1,
+          ok: true,
+          cache: result.cache,
+        });
+      }
+    }
+
+    sseSend(res, 'done', {
+      total: providers.length,
+      completed: providers.length,
+      count: Array.isArray(result.data) ? result.data.length : 0,
+      cache: result.cache,
+    });
+    res.end();
+  } catch (e) {
+    sseSend(res, 'fatal', publicErrorPayload(e));
+    res.end();
+  }
 });
 
 
 app.get('/api/reclamations/incidents', async (req, res) => {
-  const all = [];
-  incidentIndex.clear();
+  try {
+    const options = incidentsRequestOptions(req);
+    const forceRefresh = parseBoolFlag(req.query.refresh, false);
+    const result = await getIncidentsCached(options, forceRefresh);
 
-  const onlyUnanswered = req.query.all !== '1' && String(req.query.unanswered || '1') !== '0';
-  const maxAgeDays = resolveMaxAgeDays(req, onlyUnanswered);
-  const providers = configured().filter(p => p.type === 'bomp');
-  const concurrency = Number(req.query.concurrency || process.env.PROVIDER_CONCURRENCY || 6);
-
-  await mapLimit(providers, concurrency, async (p) => {
-    try {
-      const fetched = await ADAPTERS[p.type].fetchClaims(p);
-      const providerMaxAgeDays = resolveMaxAgeDays(req, onlyUnanswered, p);
-      for (const rawClaim of fetched) {
-        const claim = onlyUnanswered ? await ensureClaimHasMessages(p, rawClaim) : rawClaim;
-        const ctx = claim._ctx || rawClaim._ctx || {};
-        if (ctx.kind !== 'incident' && !ctx.incidentId) continue;
-        if (onlyUnanswered && !claimNeedsReply(claim)) continue;
-        if (!claimIsRecentEnough(claim, providerMaxAgeDays)) continue;
-
-        // Important : on garde aussi l'objet complet en cache.
-        // L'IHM peut ensuite appeler /threads/:id pour afficher le détail BOMP.
-        // Avant, seul le contexte était stocké, ce qui provoquait
-        // “Réclamation BOMP absente du cache” au clic sur le détail.
-        const cachedClaim = { ...claim, _ctx: ctx };
-        incidentIndex.set(claim.id, { provider: p, ctx, claim: cachedClaim });
-        claimIndex.set(claim.id, { provider: p, ctx, claim: cachedClaim });
-
-        all.push(mapClaimToIncidentRow(cachedClaim));
-      }
-    } catch (e) {
-      console.error(`[incidents/${p.code || ''}] ${e.message}`);
-    }
-  });
-
-  all.sort((a, b) => String(b.openedAt || '').localeCompare(String(a.openedAt || '')));
-  res.json(all);
+    res.set('Cache-Control', `private, max-age=${Math.floor((options.cacheTtlMs || 0) / 1000)}`);
+    res.set('X-Incidents-Cache', result.cache);
+    res.set('X-Incidents-Cache-Key', result.key || '');
+    res.set('X-Incidents-Count', String(result.data?.length || 0));
+    res.json(Array.isArray(result.data) ? result.data : []);
+  } catch (e) {
+    const payload = publicErrorPayload(e);
+    res.status(payload.status >= 400 && payload.status < 500 ? payload.status : 502).json(payload);
+  }
 });
 
 app.post('/api/reclamations/incidents/:id/message', async (req, res) => {

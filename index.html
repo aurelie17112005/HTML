@@ -1015,10 +1015,19 @@ function normalizeNote(n){
 }
 
 const DataAPI = {
- async fetchClaims(){
+ async fetchClaims(options={}){
   if(CONFIG.USE_DEMO_DATA) return structuredClone(DEMO);
 
-  const r = await fetch(`${CONFIG.API_BASE}/threads`, {
+  const params = new URLSearchParams({
+    cacheTtlMs: String(options.cacheTtlMs || 180000),
+    refreshCooldownMs: String(options.refreshCooldownMs || 60000),
+    providerTimeoutMs: String(options.providerTimeoutMs || 12000)
+  });
+  if(options.refresh) params.set('refresh','1');
+  if(options.providers) params.set('providers', options.providers);
+  if(options.enrichDetails) params.set('enrichDetails','1');
+
+  const r = await fetch(`${CONFIG.API_BASE}/threads?${params.toString()}`, {
     headers:{'Accept':'application/json'}
   });
 
@@ -1029,21 +1038,193 @@ const DataAPI = {
 
   return Array.isArray(data) ? data.map(normalizeClaim) : [];
 },
+
+
+ async fetchClaimsCacheOnly(options={}){
+  if(CONFIG.USE_DEMO_DATA) return {data: structuredClone(DEMO).map(normalizeClaim), cache:'DEMO'};
+  const params = new URLSearchParams({
+    cacheTtlMs: String(options.cacheTtlMs || 180000),
+    refreshCooldownMs: String(options.refreshCooldownMs || 60000),
+    providerTimeoutMs: String(options.providerTimeoutMs || 12000),
+    cacheOnly: '1',
+    allowStale: '1'
+  });
+  if(options.providers) params.set('providers', options.providers);
+  if(options.enrichDetails) params.set('enrichDetails','1');
+  if(options.all) params.set('all','1');
+  if(options.days!=null) params.set('days', String(options.days));
+
+  const r = await fetch(`${CONFIG.API_BASE}/threads?${params.toString()}`, {
+    headers:{'Accept':'application/json'}
+  });
+
+  if(r.status===204) return {data:[], cache:'MISS'};
+  if(!r.ok) throw new Error("Erreur API cache "+r.status);
+  const data = await r.json();
+  return {
+    data: Array.isArray(data) ? data.map(normalizeClaim) : [],
+    cache: r.headers.get('X-Threads-Cache') || 'UNKNOWN',
+    ageMs: Number(r.headers.get('X-Threads-Cache-Age-Ms') || 0)
+  };
+},
+
+ async fetchClaimsProgressive(options={}, onProvider=()=>{}){
+  if(CONFIG.USE_DEMO_DATA){
+    const demo = structuredClone(DEMO).map(normalizeClaim);
+    onProvider(demo, {provider:{code:'demo',label:'Démo',type:'demo'}, completed:1, total:1}, demo);
+    return demo;
+  }
+
+  // Cache-first : au chargement normal, on tente d'abord d'afficher les dernières
+  // réclamations gardées côté serveur, sans appeler les marketplaces.
+  // Si le cache est frais (HIT), on s'arrête là. S'il est périmé (STALE),
+  // on l'affiche immédiatement puis le flux ci-dessous déclenchera au maximum
+  // un seul refresh serveur partagé entre tous les utilisateurs.
+  if(!options.refresh){
+    try{
+      const cached = await this.fetchClaimsCacheOnly(options);
+      if(cached && cached.data && cached.data.length){
+        onProvider(cached.data, {
+          provider:{code:'threads-cache',label:'Cache réclamations',type:'cache'},
+          completed:1,total:1,cache:cached.cache,ageMs:cached.ageMs,cachePreview:true
+        }, cached.data.slice());
+        if(String(cached.cache).toUpperCase()==='HIT') return cached.data.slice();
+      }
+    }catch(e){ console.warn('Cache réclamations indisponible, chargement live', e); }
+  }
+
+  // EventSource permet d'afficher les résultats fournisseur par fournisseur.
+  // Si le navigateur/proxy ne supporte pas le streaming, on retombe sur l'appel classique.
+  if(!window.EventSource){
+    const fallback = await this.fetchClaims(options);
+    onProvider(fallback, {provider:{code:'api',label:'API',type:'api'}, completed:1, total:1, fallback:true}, fallback);
+    return fallback;
+  }
+
+  const params = new URLSearchParams({
+    cacheTtlMs: String(options.cacheTtlMs || 180000),
+    refreshCooldownMs: String(options.refreshCooldownMs || 60000),
+    // Plus long en mode progressif : une marketplace lente n'empêche plus les autres de s'afficher.
+    providerTimeoutMs: String(options.providerTimeoutMs || 60000),
+    concurrency: String(options.concurrency || 6)
+  });
+  if(options.refresh) params.set('refresh','1');
+  if(options.providers) params.set('providers', options.providers);
+  if(options.enrichDetails) params.set('enrichDetails','1');
+  if(options.all) params.set('all','1');
+  if(options.days!=null) params.set('days', String(options.days));
+
+  const url = `${CONFIG.API_BASE}/threads-stream?${params.toString()}`;
+  const all = [];
+  const seen = new Set();
+
+  return await new Promise((resolve, reject)=>{
+    let settled = false;
+    let gotAnyEvent = false;
+    const es = new EventSource(url);
+
+    function finish(value){
+      if(settled) return;
+      settled = true;
+      es.close();
+      resolve(value);
+    }
+    function fail(err){
+      if(settled) return;
+      settled = true;
+      es.close();
+      reject(err);
+    }
+    function mergeRows(rows){
+      rows.map(normalizeClaim).forEach(c=>{
+        if(seen.has(c.id)){
+          const i = all.findIndex(x=>x.id===c.id);
+          if(i>=0) all[i]=c;
+        }else{
+          seen.add(c.id);
+          all.push(c);
+        }
+      });
+      all.sort((a,b)=>Number(b.updatedAt||0)-Number(a.updatedAt||0));
+    }
+
+    es.addEventListener('start', ev=>{
+      gotAnyEvent = true;
+      try{ onProvider([], JSON.parse(ev.data||'{}'), all.slice()); }catch(_){ }
+    });
+
+    es.addEventListener('provider', ev=>{
+      gotAnyEvent = true;
+      try{
+        const payload = JSON.parse(ev.data||'{}');
+        const rows = Array.isArray(payload.rows) ? payload.rows : [];
+        mergeRows(rows);
+        onProvider(rows.map(normalizeClaim), payload, all.slice());
+      }catch(e){ console.warn('Chunk progressif ignoré', e); }
+    });
+
+    es.addEventListener('provider-error', ev=>{
+      gotAnyEvent = true;
+      try{
+        const payload = JSON.parse(ev.data||'{}');
+        console.warn('Marketplace ignorée en streaming', payload);
+        onProvider([], payload, all.slice());
+      }catch(_){ }
+    });
+
+    es.addEventListener('fatal', ev=>{
+      try{ fail(new Error((JSON.parse(ev.data||'{}').error)||'Erreur API streaming')); }
+      catch(_){ fail(new Error('Erreur API streaming')); }
+    });
+
+    es.addEventListener('done', ev=>{
+      gotAnyEvent = true;
+      try{ onProvider([], JSON.parse(ev.data||'{}'), all.slice()); }catch(_){ }
+      finish(all.slice());
+    });
+
+    es.onerror = async ()=>{
+      if(settled) return;
+      es.close();
+      // Si le flux ne démarre pas du tout, fallback JSON classique.
+      if(!gotAnyEvent){
+        try{
+          const fallback = await this.fetchClaims(options);
+          onProvider(fallback, {provider:{code:'api',label:'API',type:'api'}, completed:1, total:1, fallback:true}, fallback);
+          finish(fallback);
+        }catch(e){ fail(e); }
+      }else{
+        // Si on a déjà des chunks, on garde ce qui est affiché au lieu de vider l'écran.
+        finish(all.slice());
+      }
+    };
+  });
+},
  async fetchNotes(options={}){
   if(CONFIG.USE_DEMO_DATA) return structuredClone(NOTES);
   const params = new URLSearchParams({
     fast: options.full ? '0' : '1',
     limit: String(options.limit || 150),
-    providerTimeoutMs: String(options.providerTimeoutMs || 9000),
-    cacheTtlMs: String(options.cacheTtlMs || 600000)
+    providerTimeoutMs: String(options.providerTimeoutMs || 25000),
+    cacheTtlMs: String(options.cacheTtlMs || 900000),
+    refreshCooldownMs: String(options.refreshCooldownMs || 60000)
   });
   if(options.refresh) params.set('refresh','1');
-  if(options.includeMirakl) params.set('includeMirakl','1');
+  if(options.providers) params.set('providers', options.providers);
+  if(options.includeMirakl !== undefined) params.set('includeMirakl', options.includeMirakl ? '1' : '0');
   if(options.enrich) params.set('enrich','1');
+  if(options.maxOrders) params.set('maxOrders', String(options.maxOrders));
+  if(options.pages) params.set('pages', String(options.pages));
+  if(options.pageSize) params.set('pageSize', String(options.pageSize));
+  if(options.evalConcurrency) params.set('evalConcurrency', String(options.evalConcurrency));
   const r = await fetch(`${CONFIG.API_BASE}/notes?${params.toString()}`, {
     headers:{'Accept':'application/json'}
   });
-  if(!r.ok) throw new Error("Erreur API notes "+r.status);
+  if(!r.ok){
+    let msg = "Erreur API notes "+r.status;
+    try{ msg = await readApiError(r,msg); }catch(e){}
+    throw new Error(msg);
+  }
   const data = await r.json();
   console.log("Notes reçues depuis l'API :", data, "cache=", r.headers.get('X-Notes-Cache'));
   return Array.isArray(data) ? data.map(normalizeNote).filter(n=>n.rating>0) : [];
@@ -2496,6 +2677,9 @@ function showPage(tabId){
     tab.setAttribute("aria-pressed",String(on));
   });
   try{localStorage.setItem("activePage",tabId);}catch(e){}
+  if(tabId==="tabNotes" && !CONFIG.USE_DEMO_DATA && !notesLoaded && !notesLoading){
+    loadNotesAsync({limit:150, providerTimeoutMs:12000, miraklTimeoutMs:45000, maxOrders:40, pages:3, pageSize:25}).catch(()=>{});
+  }
   window.scrollTo({top:0});
 }
 function setMini(on){
@@ -2516,15 +2700,51 @@ function initTabs(){
 /* Accueil : revient à la page Statistiques (clic sur le logo) */
 function closeAllTabs(){ showPage("tabStats"); }
 
+function mergeNotesLists(...lists){
+  const out=[];
+  const seen=new Set();
+  lists.flat().forEach(n=>{
+    if(!n || !n.rating) return;
+    const key=[n.marketplace,n.orderId,n.ean,n.rating,n.comment,n.at].map(v=>String(v||'').toLowerCase()).join('|');
+    if(seen.has(key)) return;
+    seen.add(key);
+    out.push(n);
+  });
+  return out.sort((a,b)=>(+b.at||0)-(+a.at||0));
+}
+
 async function loadNotesAsync(options={}){
   if(CONFIG.USE_DEMO_DATA) return;
   notesLoading=true;
   notesLoaded=false;
   renderNotes();
   try{
-    const liveNotes = await DataAPI.fetchNotes(options);
-    NOTES.splice(0, NOTES.length, ...liveNotes);
+    // 1re passe rapide : Octopia + Fnac/Darty, pour afficher quelque chose tout de suite.
+    const fastNotes = await DataAPI.fetchNotes({
+      ...options,
+      providers: options.providers || 'octopia,bomp',
+      includeMirakl:false,
+      providerTimeoutMs: options.providerTimeoutMs || 12000,
+      limit: options.limit || 150
+    });
+    NOTES.splice(0, NOTES.length, ...fastNotes);
     notesLoaded=true;
+    renderNotes();
+
+    // 2e passe : Mirakl. Plus lente car OR51 fonctionne commande par commande,
+    // mais elle complète la liste sans bloquer le premier affichage.
+    const miraklNotes = await DataAPI.fetchNotes({
+      ...options,
+      providers:'mirakl',
+      includeMirakl:true,
+      providerTimeoutMs: options.miraklTimeoutMs || 45000,
+      maxOrders: options.maxOrders || 40,
+      pages: options.pages || 3,
+      pageSize: options.pageSize || 25,
+      evalConcurrency: options.evalConcurrency || 4,
+      limit: options.limit || 300
+    });
+    NOTES.splice(0, NOTES.length, ...mergeNotesLists(NOTES, miraklNotes));
   }catch(ne){
     console.warn("Chargement des notes impossible", ne);
     toast("Notes produit indisponibles : "+ne.message, true);
@@ -2534,20 +2754,74 @@ async function loadNotesAsync(options={}){
   }
 }
 
-async function load(){
-  try{ $("#btnRefresh").textContent="↻ Chargement…";
-    claims=await DataAPI.fetchClaims();
-    claims.forEach(c=>{ if(c.status==="encours"||c.status==="attente") c.status="nouveau"; c.slaHours=slaInfo(c).hours; });
-    if(!CONFIG.USE_DEMO_DATA){
-      NOTES.splice(0, NOTES.length);
-      notesLoading=true;
-      notesLoaded=false;
+let currentLoadSeq = 0;
+function prepareClaimsForDisplay(list){
+  list.forEach(c=>{
+    if(c.status==="encours"||c.status==="attente") c.status="nouveau";
+    c.slaHours=slaInfo(c).hours;
+  });
+  return list;
+}
+function renderMainData(){
+  syncEuroRefunds();
+  renderKPIs();
+  renderEvo();
+  renderCharts();
+  renderTable();
+}
+function providerProgressLabel(payload){
+  const done = Number(payload.completed || 0);
+  const total = Number(payload.total || 0);
+  const p = payload.provider || {};
+  const name = p.label || p.code || '';
+  return total ? `↻ Chargement ${done}/${total}${name ? ' — '+name : ''}` : '↻ Chargement…';
+}
+
+async function load(options={}){
+  const seq = ++currentLoadSeq;
+  try{
+    $("#btnRefresh").textContent="↻ Chargement…";
+
+    if(CONFIG.USE_DEMO_DATA){
+      claims=prepareClaimsForDisplay(await DataAPI.fetchClaims(options));
+      renderMainData();
+      return;
     }
-    syncEuroRefunds();
-    renderKPIs(); renderEvo(); renderCharts(); renderTable();
-    if(!CONFIG.USE_DEMO_DATA) loadNotesAsync().catch(()=>{});
-  }catch(e){toast("Chargement impossible : "+e.message,true);}
-  finally{$("#btnRefresh").textContent="↻ Actualiser";}
+
+    // Affichage progressif : on vide puis on affiche chaque marketplace dès qu'elle répond.
+    claims=[];
+    renderMainData();
+
+    const finalClaims = await DataAPI.fetchClaimsProgressive(
+      { providerTimeoutMs: 60000, ...options },
+      (_rows, payload, allRows)=>{
+        if(seq!==currentLoadSeq) return;
+        if(payload && (payload.completed || payload.total || payload.provider)){
+          $("#btnRefresh").textContent=providerProgressLabel(payload);
+        }
+        claims=prepareClaimsForDisplay(allRows || []);
+        renderMainData();
+      }
+    );
+
+    if(seq!==currentLoadSeq) return;
+    claims=prepareClaimsForDisplay(finalClaims || []);
+    renderMainData();
+
+    // Les notes restent disponibles, mais elles ne bloquent plus l'affichage des réclamations.
+    // Elles se chargent aussi au clic sur l'onglet Notes clients.
+    if(!notesLoaded && !notesLoading){
+      NOTES.splice(0, NOTES.length);
+      notesLoading=false;
+      notesLoaded=false;
+      renderNotes();
+    }
+  }catch(e){
+    if(seq===currentLoadSeq) toast("Chargement impossible : "+e.message,true);
+  }
+  finally{
+    if(seq===currentLoadSeq) $("#btnRefresh").textContent="↻ Actualiser";
+  }
 }
 
 /* Citation positive du jour (change chaque jour, stable dans la journée) */
@@ -2718,7 +2992,7 @@ function init(){
   $("#eanExport").onclick=exportEanExcel;
   $("#efReason").addEventListener("input",()=>{prodPage=1;renderProducts(applyFilters());});
   $("#btnReset").onclick=()=>{["q","fMp","fStatut"].forEach(id=>$("#"+id).value="");$("#fTraite").value="todo";reclamPage=1;prodPage=1;renderActiveRecView();};
-  $("#btnRefresh").onclick=load;
+  $("#btnRefresh").onclick=()=>load({refresh:true});
   $("#drawerClose").onclick=closeDrawer; $("#overlay").onclick=closeDrawer; $("#sendBtn").onclick=sendReply;
   $("#cannedBtn").onclick=e=>{const c=claims.find(x=>x.id===selectedId); if(c) openReplyPicker(e.currentTarget,"replyText",c);};
   $("#attachBtn").onclick=()=>$("#fileInput").click();
