@@ -422,30 +422,6 @@ function positiveInt(v, fallback, min = 0, max = Number.MAX_SAFE_INTEGER) {
   return Math.max(min, Math.min(max, Math.round(n)));
 }
 
-const BOMP_ALLOWED_MESSAGE_FROM_TYPES = new Set(['CLIENT', 'CALLCENTER', 'SELLER', 'SYSTEM']);
-function bompMessageFromTypesFromEnv(name, fallback) {
-  const raw = String(process.env[name] || fallback || '');
-  const values = raw
-    .split(',')
-    .map(v => v.trim().toUpperCase())
-    .filter(Boolean);
-  const clean = [];
-  const seen = new Set();
-  for (const value of values) {
-    if (!BOMP_ALLOWED_MESSAGE_FROM_TYPES.has(value)) {
-      if (String(process.env.BOMP_DEBUG || '') === '1') {
-        console.warn(`[bomp] from_type ignoré pour ${name}: ${value} (autorisé: CLIENT, CALLCENTER, SELLER, SYSTEM)`);
-      }
-      continue;
-    }
-    if (!seen.has(value)) {
-      clean.push(value);
-      seen.add(value);
-    }
-  }
-  return clean;
-}
-
 function promiseWithTimeout(promise, timeoutMs, label = 'opération') {
   const ms = Number(timeoutMs || 0);
   if (!ms || ms <= 0) return promise;
@@ -2193,8 +2169,11 @@ ${inner}
       ));
 
       if (useThreadFromTypes) {
-        const fromTypes = bompMessageFromTypesFromEnv('BOMP_THREAD_FROM_TYPES', 'CLIENT,CALLCENTER,SELLER,SYSTEM');
-        for (const fromType of fromTypes) {
+        const fromTypes = String(process.env.BOMP_THREAD_FROM_TYPES || 'CLIENT,CALLCENTER,SELLER,SHOP,MERCHANT,PARTNER')
+          .split(',')
+          .map(v => v.trim().toUpperCase())
+          .filter(Boolean);
+        for (const fromType of [...new Set(fromTypes)]) {
           messageNodes.push(...await collectThreadMessages(
             { order_fnac_id: orderId, message_from_types: [fromType] },
             `messages_query/order_fnac_id:${orderId}/detail-from:${fromType}`
@@ -2359,8 +2338,8 @@ ${inner}
         // afficher les messages envoyés par la boutique / vous.
         if (useMessageFromTypes) {
           const fromTypes = [
-            ...bompMessageFromTypesFromEnv('BOMP_CLIENT_FROM_TYPES', 'CLIENT,CALLCENTER'),
-            ...bompMessageFromTypesFromEnv('BOMP_SELLER_FROM_TYPES', 'SELLER,SYSTEM')
+            ...bompCsvEnv('BOMP_CLIENT_FROM_TYPES', 'CLIENT,CALLCENTER'),
+            ...bompCsvEnv('BOMP_SELLER_FROM_TYPES', 'SELLER,SHOP,MERCHANT,PARTNER')
           ];
           for (const fromType of [...new Set(fromTypes)]) {
             nodes.push(...await collectBompMessages(
