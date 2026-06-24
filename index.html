@@ -529,6 +529,8 @@
   .bubble-attach{display:flex;flex-wrap:wrap;gap:6px;margin-top:7px}
   .bubble-att{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;padding:3px 8px;border-radius:7px;
     background:rgba(0,0,0,.06);font-weight:600}
+  .bubble-att-link{color:inherit;text-decoration:none;cursor:pointer;transition:.12s}
+  .bubble-att-link:hover{filter:brightness(.95);box-shadow:0 0 0 1px var(--navy-700) inset}
   .bubble.seller .bubble-att{background:rgba(255,255,255,.18)}
   .foot-row{display:flex;gap:9px;align-items:center;margin-top:11px}
   .status-select{margin-left:auto}
@@ -988,6 +990,8 @@ function normalizeClaim(c){
     ean: c.ean || "",
     priority: c.priority || "moyenne",
     status: c.status || "nouveau",
+    marketplaceStatus: c.marketplaceStatus || c.statusRaw || c.marketplace_status || c.rawStatus || "",
+    statusRaw: c.statusRaw || c.rawStatus || c.marketplaceStatus || "",
     updatedAt: c.updatedAt || Date.now(),
     dueAt: c.dueAt || Date.now() + 24 * 3600 * 1000,
     messages: Array.isArray(c.messages) ? c.messages : [],
@@ -1443,16 +1447,21 @@ const CANNED="Bonjour,\n\nMerci pour votre message et désolé pour la gêne occ
 const USERS=["Claude","Sandy","Guillaume"];
 let currentUser="Guillaume";   // utilisateur courant (modifiable via le sélecteur)
 
-let claims=[], sort={key:"updatedAt",dir:1}, selectedId=null;  // défaut : du plus ancien au plus récent
+let claims=[], sort={key:"updatedAt",dir:-1}, selectedId=null; // défaut : du plus récent au plus ancien
 let notesLoading=false, notesLoaded=CONFIG.USE_DEMO_DATA;
 const RECLAM_PER_PAGE=25; let reclamPage=1;                    // pagination des réclamations (25/page)
 function answered(c){ const m=c.messages; return !!(m && m.length && m[m.length-1].from==="seller"); }  // dernière réponse = vendeur
 function everReplied(c){ return (c.messages||[]).some(m=>m.from==="seller"); }  // a-t-on déjà répondu au moins une fois ?
 /* Badge de statut : "Nouveau" uniquement si on n'a jamais répondu au client */
 function statusBadge(c){
-  if(c.status==="resolu") return `<span class="st st-resolu">Résolu</span>`;
-  if(everReplied(c)) return `<span class="st st-repondu">Répondu</span>`;
-  return `<span class="st st-nouveau">Nouveau</span>`;
+  const raw=(c.marketplaceStatus||c.statusRaw||"").toString().trim();
+  const st=STATUS[c.status]||STATUS.nouveau;
+  // Quand l'API fournit un statut, on l'affiche tel quel afin de rester aligné avec la marketplace.
+  if(raw && !/^(nouveau|encours|en cours|attente|resolu|résolu)$/i.test(raw)){
+    return `<span class="st ${st.cls}" title="Statut marketplace">${esc(raw)}</span>`;
+  }
+  if(c.status==="resolu") return `<span class="st st-resolu">${esc(raw||"Résolu")}</span>`;
+  return `<span class="st ${st.cls}">${esc(raw||st.label)}</span>`;
 }
 /* Dernier agent ayant répondu (auteur du dernier message vendeur) */
 function lastAgent(c){ const m=c.messages||[]; for(let i=m.length-1;i>=0;i--){ if(m[i].from==="seller") return m[i].author||"Agent"; } return null; }
@@ -1684,7 +1693,7 @@ function renderTreatDetail(c){
   if(!c){ box.innerHTML='<div class="td-empty">Sélectionnez une réclamation à gauche.</div>'; return; }
   const st=STATUS[c.status],pr=PRIO[c.priority],sla=slaInfo(c);
   const conv=c.messages.map(m=>{
-    const att=(m.attachments&&m.attachments.length)?`<div class="bubble-attach">${m.attachments.map(a=>`<span class="bubble-att">📎 ${a.name}</span>`).join("")}</div>`:"";
+    const att=(m.attachments&&m.attachments.length)?`<div class="bubble-attach">${m.attachments.map(a=>renderAttachment(a)).join("")}</div>`:"";
     return `<div class="bubble ${m.from}"><div class="who">${m.from==="client"?c.customer:("2KINGS — "+(m.author||"Agent"))}</div><div>${m.text}</div>${att}<div class="t">il y a ${fmtAgo(m.at)}</div></div>`;}).join("");
   box.innerHTML=`
     <div class="td-head">
@@ -1730,8 +1739,19 @@ async function sendTreatReply(){
   $("#tSend").disabled=true; $("#tSend").textContent="Envoi…";
   try{
     await DataAPI.sendReply(c.id,text,status,files);
-    c.messages.push({from:"seller",author:currentUser,at:Date.now(),text,attachments:files.map(f=>({name:f.name,size:f.size}))});
-    c.status=status; c.updatedAt=Date.now(); treatFiles=[];
+    // Ne pas inventer un statut local : on recharge le fil/statut réel depuis la marketplace.
+    let fresh=null;
+    try{ fresh=await DataAPI.fetchClaimDetail(c.id); }catch(_){ fresh=null; }
+    if(fresh){
+      fresh._detailLoaded=true;
+      const i=claims.findIndex(x=>x.id===c.id);
+      if(i>=0) claims[i]=fresh;
+    }else{
+      c.messages.push({from:"seller",author:currentUser,at:Date.now(),text,attachments:files.map(f=>({name:f.name,size:f.size}))});
+      c.updatedAt=Date.now();
+      c._detailLoaded=true;
+    }
+    treatFiles=[];
     playSendAnimation();
     toast("Réponse envoyée à "+c.customer);
     renderKPIs(); renderEvo(); renderCharts(); renderTreat();
@@ -1812,7 +1832,7 @@ let claudeSelectedId=null, claudeFiles=[];
 
 function updateClaudeCount(){
   const el=$("#claudeCount"); if(!el)return;
-  const n=claims.filter(c=>effNiveau(c)===1 && !answered(c)).length;
+  const n=claims.filter(c=>effNiveau(c)===1 && !answered(c) && c.status!=="resolu").length;
   el.textContent=n; el.classList.toggle("zero",n===0);
 }
 function renderClaude(){
@@ -1836,7 +1856,7 @@ function renderClaudeDetail(c){
   if(!c){ box.innerHTML='<div class="td-empty">Aucune réclamation à afficher.</div>'; return; }
   const st=STATUS[c.status],sla=slaInfo(c),cs=claudeState(c),draft=claudeDraft(c);
   const conv=c.messages.map(m=>{
-    const att=(m.attachments&&m.attachments.length)?`<div class="bubble-attach">${m.attachments.map(a=>`<span class="bubble-att">📎 ${a.name}</span>`).join("")}</div>`:"";
+    const att=(m.attachments&&m.attachments.length)?`<div class="bubble-attach">${m.attachments.map(a=>renderAttachment(a)).join("")}</div>`:"";
     return `<div class="bubble ${m.from}"><div class="who">${m.from==="client"?c.customer:("2KINGS — "+(m.author||"Agent"))}</div><div>${m.text}</div>${att}<div class="t">il y a ${fmtAgo(m.at)}</div></div>`;}).join("");
   box.innerHTML=`
     <div class="td-head">
@@ -1884,8 +1904,19 @@ async function sendClaudeReply(){
   $("#cSend").disabled=true; $("#cSend").textContent="Envoi…";
   try{
     await DataAPI.sendReply(c.id,text,status,files);
-    c.messages.push({from:"seller",author:"Claude",at:Date.now(),text,attachments:files.map(f=>({name:f.name,size:f.size}))});
-    c.status=status; c.updatedAt=Date.now(); claudeFiles=[];
+    // Ne pas inventer un statut local : on recharge le fil/statut réel depuis la marketplace.
+    let fresh=null;
+    try{ fresh=await DataAPI.fetchClaimDetail(c.id); }catch(_){ fresh=null; }
+    if(fresh){
+      fresh._detailLoaded=true;
+      const i=claims.findIndex(x=>x.id===c.id);
+      if(i>=0) claims[i]=fresh;
+    }else{
+      c.messages.push({from:"seller",author:"Claude",at:Date.now(),text,attachments:files.map(f=>({name:f.name,size:f.size}))});
+      c.updatedAt=Date.now();
+      c._detailLoaded=true;
+    }
+    claudeFiles=[];
     playSendAnimation();
     toast("Réponse Claude envoyée à "+c.customer);
     renderKPIs(); renderEvo(); renderCharts(); renderClaude();
@@ -2091,8 +2122,8 @@ function applyFilters(){
   const q=$("#q").value.trim().toLowerCase(),fMp=$("#fMp").value,fSt=$("#fStatut").value,fTr=$("#fTraite").value;
   let list=claims.filter(c=>{
     const traite=answered(c);   // traitée = dernier message = vendeur (un retour client la rouvre)
-    if(fTr==="todo" && traite) return false;           // par défaut : seulement les à traiter
-    if(fTr==="done" && !traite) return false;
+    if(fTr==="todo" && (traite || c.status==="resolu")) return false; // à faire = ouvert + dernier message client
+    if(fTr==="done" && !traite && c.status!=="resolu") return false;
     if(fMp&&c.marketplace!==fMp)return false; if(fSt&&c.status!==fSt)return false;
     if(q&&!(c.customer+" "+c.subject+" "+c.orderId+" "+c.product).toLowerCase().includes(q))return false;
     return true;});
@@ -2113,7 +2144,7 @@ function applyFilters(){
 
 function renderKPIs(){
   const open=claims.filter(c=>c.status!=="resolu");
-  const aTraiter=claims.filter(c=>!answered(c)).length;
+  const aTraiter=claims.filter(c=>!answered(c) && c.status!=="resolu").length;
   const nouveau=claims.filter(c=>c.status==="nouveau").length;
   const resolu=claims.filter(c=>c.status==="resolu").length;
   const pct=claims.length?Math.round(resolu/claims.length*100):0;
@@ -2123,12 +2154,12 @@ function renderKPIs(){
     <div class="kpi"><div class="label">Nouvelles</div><div class="val">${nouveau}</div><div class="sub">non traitées</div></div>
     <div class="kpi good"><div class="label">Taux de résolution</div><div class="val">${pct}%</div><div class="sub">${resolu} résolues</div></div>`;
   updateTreatCount(); updateClaudeCount();
-  { const el=$("#reclamBadge"); if(el){ const n=claims.filter(c=>!answered(c)).length; el.textContent=n; el.classList.toggle("zero",n===0);} }
+  { const el=$("#reclamBadge"); if(el){ const n=claims.filter(c=>!answered(c) && c.status!=="resolu").length; el.textContent=n; el.classList.toggle("zero",n===0);} }
 }
 /* Compteur de réclamations restant à traiter (non répondues, non résolues) */
 function updateTreatCount(){
   const el=$("#treatCount"); if(!el)return;
-  const n=claims.filter(c=>!answered(c) && effNiveau(c)!==1).length;
+  const n=claims.filter(c=>!answered(c) && c.status!=="resolu" && effNiveau(c)!==1).length;
   el.textContent=n; el.classList.toggle("zero",n===0);
 }
 
@@ -2300,7 +2331,7 @@ async function openDrawer(id, skipRemoteDetail=false){
   $("#dTags").innerHTML=`${statusBadge(c)} ${niveauSelector(c)}${euroFields(c)}`;
   bindNiveau($("#dTags")); bindEuroFields($("#dTags"));
   const conv=c.messages.map(m=>{
-    const att=(m.attachments&&m.attachments.length)?`<div class="bubble-attach">${m.attachments.map(a=>`<span class="bubble-att">📎 ${a.name}${a.size?` <span style="opacity:.7">(${fmtSize(a.size)})</span>`:""}</span>`).join("")}</div>`:"";
+    const att=(m.attachments&&m.attachments.length)?`<div class="bubble-attach">${m.attachments.map(a=>renderAttachment(a)).join("")}</div>`:"";
     return `<div class="bubble ${m.from}">
       <div class="who">${m.from==="client"?esc(c.customer || "Client"):("2KINGS — "+esc(m.author||"Agent"))}</div>
       <div>${esc(m.text||"")}</div>${att}<div class="t">il y a ${fmtAgo(m.at)}</div></div>`;}).join("");
@@ -2310,10 +2341,9 @@ async function openDrawer(id, skipRemoteDetail=false){
   pendingFiles=[]; renderAttachList();   // réinitialise les pièces jointes
   $("#overlay").classList.add("show"); $("#drawer").classList.add("show");
 
-  // Chargement du contenu complet uniquement au clic : la liste reste rapide,
-  // puis le détail Mirakl recharge les messages avec with_messages=true.
-  const isBompClaim = ["fnac","darty"].includes(String(c.marketplace||"").toLowerCase());
-  if(!skipRemoteDetail && !c._detailLoaded && ((!c.messages || c.messages.length===0) || isBompClaim)){
+  // Chargement du contenu complet uniquement au clic : la liste reste ciblée sur les réclamations
+  // à traiter, puis le détail recharge tout le fil reçu + envoyé pour chaque marketplace.
+  if(!skipRemoteDetail && !c._detailLoaded){
     const oldBody=$("#dBody").innerHTML;
     $("#dBody").innerHTML=renderTracking(c)+`<div class="meta" style="padding:12px">Chargement de la conversation complète…</div>`;
     try{
@@ -2442,6 +2472,89 @@ function copyOrder(e,el){ copyCode(e,el,"N° de commande"); }
 const ATTACH_MAX=5, ATTACH_MAX_MB=10;   // garde-fou générique (limites réelles selon marketplace)
 let pendingFiles=[];
 function fmtSize(b){ return b<1024?b+" o":b<1048576?(b/1024).toFixed(0)+" Ko":(b/1048576).toFixed(1)+" Mo"; }
+function apiOriginFromBase(){
+  const base=String(CONFIG.API_BASE||"").replace(/\/+$/,"");
+  if(!/^https?:\/\//i.test(base)) return "";
+  const marker="/api/reclamations";
+  const i=base.indexOf(marker);
+  return i>=0 ? base.slice(0,i) : base.replace(/\/api\/reclamations$/i,"");
+}
+function normalizeDownloadHref(href){
+  const h=String(href||"").trim();
+  if(!h) return "";
+  if(/^https?:\/\//i.test(h)) return h;
+  if(h.startsWith("/api/reclamations")){
+    const origin=apiOriginFromBase();
+    return origin ? origin+h : h;
+  }
+  if(h.startsWith("threads/")){
+    return String(CONFIG.API_BASE||"/api/reclamations").replace(/\/+$/,"")+"/"+h;
+  }
+  return h;
+}
+function attachmentHref(a){ return normalizeDownloadHref((a && (a.downloadUrl || a.download_url || a.url || a.href)) || ""); }
+async function downloadAttachmentClick(ev,el){
+  ev.preventDefault();
+  ev.stopPropagation();
+  const url=el.getAttribute("href");
+  const name=el.dataset.filename || "piece-jointe";
+  if(!url){ toast("Pièce jointe non téléchargeable : URL absente",true); return false; }
+  try{
+    el.classList.add("loading");
+    const r=await fetch(url,{headers:{"Accept":"*/*"}});
+    if(!r.ok){
+      let msg="Erreur téléchargement "+r.status;
+      try{
+        const txt=await r.text();
+        if(txt){
+          try{ const j=JSON.parse(txt); msg=j.error || j.message || txt; }
+          catch(_){ msg=txt.slice(0,500); }
+        }
+      }catch(_){}
+      throw new Error(msg);
+    }
+    const blob=await r.blob();
+    if(!blob.size){
+      throw new Error("Le fichier reçu est vide : la pièce jointe est non disponible côté marketplace ou l'ID de fichier est mauvais.");
+    }
+    const ct=String(r.headers.get("content-type")||blob.type||"");
+    if(/application\/json/i.test(ct)){
+      let txt=await blob.text();
+      let looksLikeError=false;
+      try{ const j=JSON.parse(txt); txt=j.error || j.message || (j.errors&&j.errors[0]&&(j.errors[0].message||j.errors[0].code)) || txt; looksLikeError=!!(j.error||j.message||j.errors||j.status); }catch(_){ }
+      const genericJsonName=/^(?:\d+|piece-jointe-?\d*)\.json$/i.test(name);
+      if(looksLikeError || genericJsonName || !/\.json$/i.test(name)){
+        throw new Error(txt || "La marketplace a renvoyé une erreur JSON au lieu du fichier.");
+      }
+    }
+    const objectUrl=URL.createObjectURL(blob);
+    const a=document.createElement("a");
+    a.href=objectUrl;
+    a.download=name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(()=>URL.revokeObjectURL(objectUrl),30000);
+    toast("Pièce jointe téléchargée : "+name);
+  }catch(e){
+    console.error("Téléchargement pièce jointe impossible",e);
+    toast("Téléchargement impossible : "+(e.message||e),true);
+  }finally{
+    el.classList.remove("loading");
+  }
+  return false;
+}
+function renderAttachment(a){
+  const name=esc((a&&a.name) || (a&&a.filename) || "Pièce jointe");
+  const rawName=((a&&a.name) || (a&&a.filename) || "piece-jointe").replace(/[\r\n"]/g,"");
+  const size=a&&a.size?` <span style="opacity:.7">(${fmtSize(Number(a.size)||0)})</span>`:"";
+  const href=attachmentHref(a);
+  const reason=(a&&a.reason)?` — ${esc(a.reason)}`:"";
+  const label=`📎 <span class="att-name">${name}</span>${size}`;
+  return href
+    ? `<a class="bubble-att bubble-att-link" href="${esc(href)}" data-filename="${esc(rawName)}" onclick="return downloadAttachmentClick(event,this)" download title="Télécharger ${name}">${label}</a>`
+    : `<span class="bubble-att" title="Pièce jointe non téléchargeable${reason}">${label}</span>`;
+}
 function renderAttachList(){
   const el=$("#attachList");
   el.innerHTML=pendingFiles.map((f,i)=>`<span class="attach-chip"><span>📎</span>

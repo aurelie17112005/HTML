@@ -91,7 +91,25 @@ function computeDueAt(messages) {
   const lastClient = [...messages].reverse().find(m => m.from === 'client');
   return (lastClient ? lastClient.at : Date.now()) + 24 * H;   // SLA 24 h, à adapter
 }
-function makeClaim(marketplace, o) {
+function makeClaim(marketplace, o = {}) {
+  const rawMarketplaceStatus = scalarFirst(
+    o.marketplaceStatus,
+    o.marketplaceStatusLabel,
+    o.marketplaceStatusCode,
+    o.rawStatus,
+    o.statusRaw,
+    o.ctx?.marketplaceStatus,
+    o.ctx?.rawStatus
+  );
+  const normalizedStatus = rawMarketplaceStatus && isClosedMarketplaceStatus(rawMarketplaceStatus)
+    ? 'resolu'
+    : (o.status || normalizeMarketplaceStatus(rawMarketplaceStatus, 'nouveau'));
+  const ctx = {
+    ...(o.ctx || {}),
+    ...(rawMarketplaceStatus ? { marketplaceStatus: rawMarketplaceStatus, rawStatus: rawMarketplaceStatus } : {}),
+  };
+  if (rawMarketplaceStatus && isClosedMarketplaceStatus(rawMarketplaceStatus)) ctx.closedByMarketplace = true;
+
   return {
     id: `${marketplace}:${o.providerType}:${o.id}`,   // route la réponse vers le bon adaptateur
     marketplace,
@@ -101,11 +119,14 @@ function makeClaim(marketplace, o) {
     orderId: o.orderId || '',
     product: o.product || '',
     priority: o.priority || 'moyenne',
-    status: o.status || 'nouveau',
+    // Statut normalisé pour l'IHM + statut brut marketplace pour l'affichage fidèle.
+    status: normalizedStatus,
+    marketplaceStatus: rawMarketplaceStatus || normalizedStatus,
+    statusRaw: rawMarketplaceStatus || normalizedStatus,
     updatedAt: o.updatedAt || Date.now(),
     dueAt: o.dueAt || computeDueAt(o.messages || []),
     messages: o.messages || [],
-    _ctx: o.ctx || {},                                // données techniques utiles à la réponse
+    _ctx: ctx,                                      // données techniques utiles à la réponse
   };
 }
 
@@ -235,6 +256,174 @@ function cleanText(v) {
     .replace(/&nbsp;/gi, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function asArray(v) {
+  if (!v) return [];
+  return Array.isArray(v) ? v : [v];
+}
+
+function safeHeaderFilename(name) {
+  const s = cleanText(name || 'piece-jointe')
+    .replace(/[\r\n"]/g, '')
+    .slice(0, 180);
+  return s || 'piece-jointe';
+}
+
+function attachmentSourceUrl(a) {
+  if (!a) return '';
+  if (typeof a === 'string') return /^https?:\/\//i.test(a) || a.startsWith('/') ? a : '';
+  return scalarFirst(
+    a.downloadUrl, a.download_url, a.url, a.href, a.uri, a.link,
+    a.file_url, a.fileUrl, a.content_url, a.contentUrl,
+    a.document_url, a.documentUrl, a.public_url, a.publicUrl,
+    a.download?.url, a.download?.href,
+    a.links?.download?.href, a.links?.download?.url,
+    a._links?.download?.href, a._links?.download?.url,
+    a.self, a.location
+  );
+}
+
+function attachmentSourceId(a) {
+  if (!a || typeof a === 'string') return '';
+  return scalarFirst(
+    a.id, a.file_id, a.fileId, a.attachment_id, a.attachmentId,
+    a.document_id, a.documentId, a.uuid, a.resource_id, a.resourceId
+  );
+}
+
+function providerCanDownloadAttachmentById(provider) {
+  // Mirakl M13 permet de télécharger une pièce jointe via son attachment_id.
+  return provider?.type === 'mirakl';
+}
+
+function normalizeAttachmentObject(a, index = 0) {
+  const sourceUrl = attachmentSourceUrl(a);
+  const rawName = typeof a === 'string' ? '' : scalarFirst(
+    a?.name, a?.file_name, a?.filename, a?.fileName, a?.label, a?.title,
+    a?.originalname, a?.document_name, a?.documentName, a?.display_name
+  );
+  const fromUrl = sourceUrl
+    ? decodeURIComponent(String(sourceUrl).split('?')[0].split('/').filter(Boolean).pop() || '')
+    : '';
+  const cleanName = cleanText(rawName || fromUrl);
+  const sizeRaw = typeof a === 'string' ? '' : scalarFirst(a?.size, a?.file_size, a?.fileSize, a?.length, a?.content_length, a?.contentLength);
+  const size = Number(sizeRaw) || null;
+  const type = typeof a === 'string' ? '' : cleanText(scalarFirst(a?.mimeType, a?.mimetype, a?.mime_type, a?.content_type, a?.contentType, a?.type));
+  const id = attachmentSourceId(a);
+  const name = cleanName || (sourceUrl ? `Pièce jointe ${index + 1}` : '');
+  const out = { name, size, type, id, url: sourceUrl };
+  Object.keys(out).forEach(k => { if (out[k] === '' || out[k] == null) delete out[k]; });
+  return out;
+}
+
+function isUsableInboundAttachment(a) {
+  if (!a) return false;
+  // Une simple valeur "0", "1" ou un objet {id: "0"} n'est pas un fichier.
+  // Mirakl M10 renvoie normalement attachments[].id + attachments[].name + attachments[].size.
+  // On exige donc au moins une URL ou un ID accompagné d'un nom/taille/type.
+  if (a.url) return true;
+  if (a.id && (a.name || a.size || a.type)) return true;
+  return false;
+}
+
+function normalizeInboundAttachments(source) {
+  const candidates = [
+    source?.attachments, source?.attachment, source?.files, source?.file,
+    source?.attachment_list, source?.attachmentList, source?.documents, source?.document,
+    source?.pieces_jointes, source?.piece_jointe,
+  ].flatMap(asArray);
+
+  const seen = new Set();
+  return candidates
+    .filter(Boolean)
+    .map((a, i) => normalizeAttachmentObject(a, i))
+    .filter(isUsableInboundAttachment)
+    .filter(a => {
+      const key = [a.id, a.url, a.name, a.size].filter(Boolean).join('|').toLowerCase();
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
+
+function decorateClaimAttachmentsForPublic(provider, claim) {
+  const copy = typeof structuredClone === 'function'
+    ? structuredClone(claim)
+    : JSON.parse(JSON.stringify(claim));
+  delete copy._ctx;
+
+  const claimId = copy.id || claim?.id || '';
+  if (Array.isArray(copy.messages)) {
+    copy.messages = copy.messages.map((m, messageIndex) => {
+      const msg = { ...m };
+      const rawMsg = Array.isArray(claim?.messages) ? claim.messages[messageIndex] : m;
+      const sourceAttachments = Array.isArray(rawMsg?.attachments) ? rawMsg.attachments : normalizeInboundAttachments(rawMsg);
+      msg.attachments = normalizeInboundAttachments({ attachments: sourceAttachments }).map((a, attachmentIndex) => {
+        const hasDownloadSource = Boolean(a.url || (a.id && providerCanDownloadAttachmentById(provider)));
+        const safeName = cleanText(a.name || `Pièce jointe ${attachmentIndex + 1}`);
+        const downloadUrl = hasDownloadSource && claimId
+          ? `/api/reclamations/threads/${encodeURIComponent(claimId)}/attachments/${messageIndex}/${attachmentIndex}`
+          : '';
+        return {
+          name: safeName,
+          ...(a.size ? { size: a.size } : {}),
+          ...(a.type ? { type: a.type } : {}),
+          ...(downloadUrl ? { downloadUrl, downloadable: true } : { downloadable: false, reason: a.id ? 'Identifiant de pièce jointe sans endpoint connu' : 'URL absente' }),
+        };
+      });
+      return msg;
+    });
+  }
+  return copy;
+}
+
+function foldStatusText(v) {
+  return cleanText(v)
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '')
+    .toLowerCase();
+}
+
+function isClosedMarketplaceStatus(raw) {
+  const s = foldStatusText(raw);
+  if (!s) return false;
+  return /(closed|close|cloture|cloturee|resolved|resolu|resolue|termine|terminee|terminated|done|complete|completed|archive|archived|annule|annulee|cancelled|canceled)/.test(s);
+}
+
+function normalizeMarketplaceStatus(raw, fallback = 'nouveau') {
+  const s = foldStatusText(raw);
+  if (!s) return fallback;
+  if (isClosedMarketplaceStatus(s)) return 'resolu';
+  if (/(waiting|pending|attente|a traiter|a repondre|answer required|seller answer|unread|nouveau|new|opened|open|ongoing|in progress|en cours)/.test(s)) return 'nouveau';
+  return fallback;
+}
+
+function isClaimClosedByMarketplace(claim) {
+  const ctx = claim?._ctx || {};
+  return claim?.status === 'resolu'
+    || ctx.closedByMarketplace === true
+    || isClosedMarketplaceStatus(claim?.marketplaceStatus)
+    || isClosedMarketplaceStatus(claim?.statusRaw)
+    || isClosedMarketplaceStatus(ctx.marketplaceStatus)
+    || isClosedMarketplaceStatus(ctx.rawStatus);
+}
+
+function applyMarketplaceStatus(claim, rawStatus) {
+  if (!claim) return claim;
+  const raw = scalarFirst(rawStatus, claim.marketplaceStatus, claim.statusRaw, claim._ctx?.marketplaceStatus, claim._ctx?.rawStatus);
+  if (raw) {
+    claim.marketplaceStatus = raw;
+    claim.statusRaw = raw;
+    claim.status = normalizeMarketplaceStatus(raw, claim.status || 'nouveau');
+    claim._ctx = {
+      ...(claim._ctx || {}),
+      marketplaceStatus: raw,
+      rawStatus: raw,
+      closedByMarketplace: isClosedMarketplaceStatus(raw),
+    };
+  }
+  return claim;
 }
 function isBadSubject(v) {
   const s = cleanText(v);
@@ -658,14 +847,17 @@ const octopia = (() => {
       const senderType = scalarFirst(m.sender?.userType, m.sender?.type, m.senderType, m.userType, m.author?.type);
       const text = cleanText(m.body || m.content || m.text || m.message || m.description || '');
       const at = parseMarketplaceDate(m.createdAt || m.creationDate || m.updatedAt || m.date || m.sentAt, Date.now());
-      const key = `${senderType}|${at}|${text}`;
-      if (!text || seen.has(key)) return null;
+      const attachments = normalizeInboundAttachments(m);
+      const attKey = attachments.map(a => a.id || a.url || a.name).join(',');
+      const key = `${senderType}|${at}|${text}|${attKey}`;
+      if ((!text && !attachments.length) || seen.has(key)) return null;
       seen.add(key);
       return {
         from: /customer|buyer|client/i.test(senderType) ? 'client' : 'seller',
         author: scalarFirst(m.sender?.displayName, m.sender?.name, m.author?.name) || (/customer|buyer|client/i.test(senderType) ? 'Client' : 'Agent'),
         at,
         text,
+        attachments,
       };
     }).filter(Boolean).sort((a, b) => a.at - b.at);
   }
@@ -678,7 +870,8 @@ const octopia = (() => {
     const messages = extractMessages(d);
     const marketplace = provider.channelMap[salesChannel] || (salesChannel || 'octopia').toLowerCase();
     const lastClientText = [...messages].reverse().find(m => m.from === 'client')?.text || '';
-    const isOpen = d.isOpen !== false && !/closed|close|cl[oô]tur/i.test(String(d.status || d.state || ''));
+    const rawStatus = scalarFirst(d.status, d.state, d.statusLabel, d.stateLabel, d.isOpen === false ? 'CLOSED' : 'OPEN');
+    const isOpen = d.isOpen !== false && !isClosedMarketplaceStatus(rawStatus);
     return makeClaim(marketplace, {
       providerType: 'octopia',
       id: discussionId,
@@ -687,10 +880,11 @@ const octopia = (() => {
       orderId: scalarFirst(d.orderSellerId, d.orderReference, d.orderId, d.order?.id, d.order?.orderId),
       product: scalarFirst(d.productId, d.product?.id, d.product?.title, d.offerSellerId, d.sku),
       priority: graduationToPriority(d.graduation || d.level || d.type),
-      status: isOpen ? (/treated|waiting|answered/i.test(String(d.status || d.state || '')) ? 'attente' : 'nouveau') : 'resolu',
+      status: isOpen ? normalizeMarketplaceStatus(rawStatus, 'nouveau') : 'resolu',
+      marketplaceStatus: rawStatus,
       updatedAt: parseMarketplaceDate(d.updatedAt || d.lastUpdateDate || d.lastMessageDate || d.createdAt, Date.now()),
       messages,
-      ctx: { discussionId, salesChannel, customerId, kind: 'discussion' },
+      ctx: { discussionId, salesChannel, customerId, kind: 'discussion', marketplaceStatus: rawStatus, rawStatus, closedByMarketplace: !isOpen },
     });
   }
 
@@ -793,6 +987,23 @@ const octopia = (() => {
         }),
       });
       return { mode: 'octopia_messages' };
+    },
+
+    async downloadAttachment(provider, sourceUrl) {
+      const auth = provider.auth;
+      const token = await getToken(auth);
+      const url = /^https?:\/\//i.test(String(sourceUrl || ''))
+        ? String(sourceUrl)
+        : `${auth.apiBase}${String(sourceUrl || '').startsWith('/') ? '' : '/'}${sourceUrl || ''}`;
+      const res = await fetchWithTimeout(url, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          SellerId: auth.sellerId,
+          Accept: '*/*',
+        },
+      }, Number(process.env.ATTACHMENT_DOWNLOAD_TIMEOUT_MS || 30000));
+      await throwHttpError(`Octopia pièce jointe`, res, { provider: 'octopia', operation: 'downloadAttachment' });
+      return res;
     },
 
     async close(provider, ctxOrId) {
@@ -940,11 +1151,7 @@ const mirakl = {
       at: parseMarketplaceDate(rawDate),
       rawAt: rawDate,
       text: m.body || m.text || m.message || m.content || m.description || '',
-      attachments: (m.attachments || m.files || []).map(a => ({
-        name: a.name || a.file_name || a.filename || 'Pièce jointe',
-        url: a.url || a.href || a.download_url || '',
-        size: a.size || a.file_size || null,
-      })),
+      attachments: normalizeInboundAttachments(m),
     };
   },
 
@@ -954,6 +1161,7 @@ const mirakl = {
     const rawUpdatedAt = thread.date_updated || thread.updated_at || thread.last_message_date || thread.date_created || thread.created_at || null;
     const messages = this.extractMessages(thread).map(m => this.mapMessage(m, customer));
     const lastClientText = [...messages].reverse().find(m => m.from === 'client')?.text || '';
+    const rawStatus = scalarFirst(thread.status, thread.state, thread.thread_status, thread.closed === true ? 'CLOSED' : 'OPEN');
 
     const subject = firstReadableSubject(
       thread.topic?.label,
@@ -974,12 +1182,16 @@ const mirakl = {
       subject: normalizeSubject(subject, lastClientText),
       orderId: scalarFirst(thread.entities?.find?.(e => /order/i.test(e.type || e.entity_type || ''))?.id, thread.order_id, thread.orderId, thread.order?.id, thread.entities?.[0]?.id),
       product: scalarFirst(thread.entities?.find?.(e => /product|offer/i.test(e.type || e.entity_type || ''))?.label, thread.product_title, thread.product, thread.offer?.sku, thread.entities?.[0]?.label),
-      status: thread.status === 'CLOSED' || thread.closed === true ? 'resolu' : 'nouveau',
+      status: normalizeMarketplaceStatus(rawStatus, 'nouveau'),
+      marketplaceStatus: rawStatus,
       updatedAt: parseMarketplaceDate(rawUpdatedAt),
       messages,
       ctx: {
         threadId: id,
         rawUpdatedAt,
+        marketplaceStatus: rawStatus,
+        rawStatus,
+        closedByMarketplace: isClosedMarketplaceStatus(rawStatus),
         miraklRecipients: extractMiraklRecipients(thread),
         customerId: scalarFirst(thread.customer?.id, thread.customer_id, thread.buyer?.id, thread.from?.id),
       },
@@ -1134,6 +1346,52 @@ const mirakl = {
     const data = await this.api(provider, `/inbox/threads/${encodeURIComponent(threadId)}?with_messages=true`);
     const thread = data?.data || data?.thread || data;
     return this.mapThread(provider, thread, { ...ctx, threadId });
+  },
+
+  async downloadAttachment(provider, sourceUrl, attachment = {}) {
+    const base = miraklApiBase(provider.url);
+    const raw = String(sourceUrl || '').trim();
+    const attId = attachmentSourceId(attachment) || (!/^https?:\/\//i.test(raw) && !raw.startsWith('/') && !raw.includes('/') ? raw : '');
+
+    let url = '';
+    let method = 'GET';
+
+    if (raw && (/^https?:\/\//i.test(raw) || raw.startsWith('/') || raw.includes('/'))) {
+      url = /^https?:\/\//i.test(raw)
+        ? raw
+        : raw.startsWith('/api/')
+          ? `${base}${raw}`
+          : `${base}/api/${raw.replace(/^\/+/, '')}`;
+    } else if (attId) {
+      // Mirakl M13 : GET /api/inbox/threads/{attachment_id}/download
+      url = `${base}/api/inbox/threads/${encodeURIComponent(attId)}/download`;
+    }
+
+    if (!url) {
+      throw Object.assign(new Error('Mirakl : URL/ID de pièce jointe absent'), {
+        statusCode: 404, provider: provider.code, operation: 'downloadAttachment'
+      });
+    }
+
+    const shopId = scalarFirst(provider.shopId, process.env[`${String(provider.code || '').toUpperCase()}_SHOP_ID`], process.env.MIRAKL_SHOP_ID);
+    if (shopId && !/[?&]shop_id=/.test(url)) {
+      url += (url.includes('?') ? '&' : '?') + 'shop_id=' + encodeURIComponent(shopId);
+    }
+
+    if (String(process.env.ATTACHMENT_DEBUG || '') === '1') {
+      console.log(`[attachment/mirakl/${provider.code}] ${method} ${url}`);
+      console.log(`[attachment/mirakl/${provider.code}] source=`, JSON.stringify({ raw, attId, attachment }).slice(0, 1500));
+    }
+
+    const res = await fetchWithTimeout(url, {
+      method,
+      headers: {
+        Authorization: provider.key,
+        Accept: '*/*',
+      },
+    }, Number(process.env.ATTACHMENT_DOWNLOAD_TIMEOUT_MS || 30000));
+    await throwHttpError(`Mirakl ${provider.code} pièce jointe`, res, { provider: provider.code, operation: 'downloadAttachment' });
+    return res;
   },
 
   async sendReply(provider, ctx, body, files = []) {
@@ -1660,11 +1918,22 @@ ${inner}
     if ((!base.customer || base.customer === 'Client') && detail.customer && detail.customer !== 'Client') base.customer = detail.customer;
     if (!base.product && detail.product) base.product = detail.product;
     if (isBadSubject(base.subject) && detail.subject && !isBadSubject(detail.subject)) base.subject = detail.subject;
+    // Le statut marketplace le plus précis doit survivre aux fusions message/incident.
+    if (detail.marketplaceStatus || detail.statusRaw || detail._ctx?.marketplaceStatus || detail._ctx?.rawStatus) {
+      applyMarketplaceStatus(base, detail.marketplaceStatus || detail.statusRaw || detail._ctx?.marketplaceStatus || detail._ctx?.rawStatus);
+    } else if (detail.status === 'resolu') {
+      base.status = 'resolu';
+      base._ctx = { ...(base._ctx || {}), closedByMarketplace: true };
+    }
     if ((!base.messages || !base.messages.length) && detail.messages?.length) base.messages = detail.messages;
     else base.messages = dedupeMessages([...(base.messages || []), ...(detail.messages || [])]);
     base.updatedAt = Math.max(Number(base.updatedAt || 0), Number(detail.updatedAt || 0)) || base.updatedAt || detail.updatedAt;
     base.dueAt = computeDueAt(base.messages || []);
     base._ctx = { ...(base._ctx || {}), ...(detail._ctx || {}), orderId: base.orderId || detail.orderId || base._ctx?.orderId };
+    if (isClaimClosedByMarketplace(base)) {
+      base.status = 'resolu';
+      base._ctx.closedByMarketplace = true;
+    }
     return base;
   }
 
@@ -1874,9 +2143,9 @@ ${inner}
       ),
       fallbackText
     );
-    const statusRaw = normLower(firstValue(it['@_status'], it.status, it.incident_status, it.state) || bompDeepText(it, [
-      'status', 'incident_status', 'state', 'state_label'
-    ]));
+    const statusRaw = firstValue(it['@_status'], it.status, it.incident_status, it.state, it.status_label, it.state_label) || bompDeepText(it, [
+      'status', 'incident_status', 'state', 'state_label', 'status_label', 'incident_status_label'
+    ]);
     const waitingForSeller = truthyBomp(firstValue(
       it.waiting_for_seller_answer, it['@_waiting_for_seller_answer'],
       it.waiting_seller_answer, it.seller_answer_required, it.answer_required,
@@ -1908,7 +2177,8 @@ ${inner}
         'product', 'product_name', 'product_label', 'product_title', 'title', 'offer_seller_id', 'offer_fnac_id', 'seller_sku', 'sku', 'ean'
       ]),
       priority: 'haute',
-      status: /closed|close|clos|resolved|resolu|résolu/.test(statusRaw) ? 'resolu' : 'nouveau',
+      status: normalizeMarketplaceStatus(statusRaw, 'nouveau'),
+      marketplaceStatus: statusRaw,
       updatedAt,
       dueAt: computeDueAt(msgs.length ? msgs : [{ from: 'client', at: openedAt }]),
       messages: msgs,
@@ -1923,9 +2193,13 @@ ${inner}
         updatedAt,
         openedBy: parseBompAuthor(openedByRaw),
         waitingForSeller,
+        marketplaceStatus: statusRaw,
+        rawStatus: statusRaw,
+        closedByMarketplace: isClosedMarketplaceStatus(statusRaw),
         // Ne pas considérer "un client a écrit un jour" comme "à répondre".
-        // Pour Fnac/Darty, la source fiable est waiting_for_seller_answer ou le dernier message.
-        needsReply: waitingForSeller,
+        // Pour Fnac/Darty, la source fiable est waiting_for_seller_answer ou le dernier message,
+        // sauf si l'incident est clôturé sur la marketplace.
+        needsReply: waitingForSeller && !isClosedMarketplaceStatus(statusRaw),
       },
     });
   }
@@ -1956,10 +2230,13 @@ ${inner}
         'product', 'product_name', 'product_label', 'product_title', 'offer_seller_id', 'offer_fnac_id', 'seller_sku', 'sku', 'ean'
       ]),
       priority: 'moyenne',
-      status: String(m.message_state || m.state || '').toLowerCase().includes('read') ? 'attente' : 'nouveau',
+      status: normalizeMarketplaceStatus(scalarFirst(m.message_state, m.state), String(m.message_state || m.state || '').toLowerCase().includes('read') ? 'attente' : 'nouveau'),
+      marketplaceStatus: scalarFirst(m.message_state, m.state),
       updatedAt: at,
-      messages: text ? [{ from: author, at, text }] : [],
-      ctx: { kind: 'message', messageId: id, orderId, needsReply: author === 'client' },
+      messages: (text || normalizeInboundAttachments(m).length)
+        ? [{ from: author, at, text, attachments: normalizeInboundAttachments(m) }]
+        : [],
+      ctx: { kind: 'message', messageId: id, orderId, marketplaceStatus: scalarFirst(m.message_state, m.state), rawStatus: scalarFirst(m.message_state, m.state), needsReply: author === 'client' },
     });
   }
 
@@ -1975,7 +2252,8 @@ ${inner}
       bompDeepText(c, ['date', 'created_at', 'createdAt', 'updated_at', 'updatedAt', 'creation_date'])
     );
     const messages = [];
-    if (clientText) messages.push({ from: 'client', at, text: clientText });
+    const attachments = normalizeInboundAttachments(c);
+    if (clientText || attachments.length) messages.push({ from: 'client', at, text: clientText, attachments });
     if (sellerReply) messages.push({ from: 'seller', at, text: sellerReply });
 
     return makeClaim(provider.code, {
@@ -2297,7 +2575,9 @@ ${inner}
       );
       const messagePageSize = positiveInt(process.env.BOMP_MESSAGES_PAGE_SIZE, onlyWaitingReply ? 50 : 100, 1, 500);
       const messageMaxPages = positiveInt(process.env.BOMP_MESSAGES_MAX_PAGES, onlyWaitingReply ? 1 : (broadQuery ? 3 : 1), 1, 50);
-      const orderMessageMaxPages = positiveInt(process.env.BOMP_ORDER_MESSAGES_MAX_PAGES, onlyWaitingReply ? 3 : (broadQuery ? 2 : 1), 1, 20);
+      const orderMessageMaxPages = positiveInt(process.env.BOMP_ORDER_MESSAGES_MAX_PAGES, onlyWaitingReply ? 10 : (broadQuery ? 3 : 1), 1, 50);
+      const incidentPageSize = positiveInt(process.env.BOMP_INCIDENTS_PAGE_SIZE, 100, 1, 500);
+      const incidentMaxPages = positiveInt(process.env.BOMP_INCIDENTS_MAX_PAGES, onlyWaitingReply ? 10 : 5, 1, 50);
 
       async function safeQuery(operation, xml, label = operation) {
         try {
@@ -2324,6 +2604,22 @@ ${inner}
           const pageNodes = response ? extractBompNodes(root, ['message']) : [];
           nodes.push(...pageNodes);
           if (!pageNodes.length || pageNodes.length < messagePageSize) break;
+        }
+        return nodes;
+      }
+
+      async function collectBompIncidents(elements = {}, labelPrefix = 'incidents_query') {
+        const nodes = [];
+        for (let page = 1; page <= incidentMaxPages; page++) {
+          const response = await safeQuery(
+            'incidents_query',
+            bompQueryXml(provider, token, 'incidents_query', { paging: page, ...elements }, incidentPageSize),
+            page === 1 ? labelPrefix : `${labelPrefix}/page:${page}`
+          );
+          const root = response?.incidents_query_response || response?.incidents || response || {};
+          const pageNodes = response ? extractBompNodes(root, ['incident']) : [];
+          nodes.push(...pageNodes);
+          if (!pageNodes.length || pageNodes.length < incidentPageSize) break;
         }
         return nodes;
       }
@@ -2383,25 +2679,16 @@ ${inner}
 
       let incidents = [];
       for (const query of incidentQueries) {
-        const incidentsResponse = await safeQuery(
-          'incidents_query',
-          bompQueryXml(provider, token, 'incidents_query', { paging: 1, ...query }, 100),
+        incidents.push(...await collectBompIncidents(
+          query,
           query.waiting_for_seller_answer ? 'incidents_query/waiting_for_seller_answer:TRUE' : 'incidents_query'
-        );
-        const ir = incidentsResponse?.incidents_query_response || incidentsResponse?.incidents || incidentsResponse || {};
-        incidents.push(...(incidentsResponse ? extractBompNodes(ir, ['incident']) : []));
+        ));
       }
 
       // Fallback désactivé par défaut : utile seulement si ton accès BOMP refuse le filtre
       // waiting_for_seller_answer. Sinon, cela ramènerait de nouveau l'historique ancien.
       if (onlyWaitingReply && !incidents.length && fallbackGeneralIncidents) {
-        const fallbackResponse = await safeQuery(
-          'incidents_query',
-          bompQueryXml(provider, token, 'incidents_query', { paging: 1 }, 100),
-          'incidents_query/fallback-general'
-        );
-        const fr = fallbackResponse?.incidents_query_response || fallbackResponse?.incidents || fallbackResponse || {};
-        incidents.push(...(fallbackResponse ? extractBompNodes(fr, ['incident']) : []));
+        incidents.push(...await collectBompIncidents({}, 'incidents_query/fallback-general'));
       }
 
       incidents = uniqueBompNodes(incidents);
@@ -2807,7 +3094,7 @@ function normalizeMessageTime(m) {
   return Number.isFinite(t) ? t : 0;
 }
 function claimNeedsReply(claim) {
-  if (!claim || claim.status === 'resolu') return false;
+  if (!claim || isClaimClosedByMarketplace(claim)) return false;
   const ctx = claim._ctx || {};
   const isBomp = claim.marketplace && ['fnac', 'darty'].includes(String(claim.marketplace).toLowerCase());
   const messages = Array.isArray(claim.messages) ? claim.messages.filter(m => m && m.from) : [];
@@ -2860,8 +3147,24 @@ function resolveMaxAgeDays(req, onlyUnanswered, provider = null) {
   const days = Number(raw);
   return Number.isFinite(days) ? days : 45;
 }
-async function ensureClaimHasMessages(provider, claim) {
-  if (claim?.messages?.length) return claim;
+function shouldFetchDetailForReplySignal(provider, claim) {
+  if (!provider || !claim) return false;
+  const ctx = claim._ctx || {};
+  const messages = Array.isArray(claim.messages) ? claim.messages.filter(m => m && m.from) : [];
+
+  // La liste doit rester ciblée : si on a déjà un dernier message ou un flag API fiable,
+  // inutile de recharger tout le fil juste pour savoir si la réclamation est à traiter.
+  if (messages.length) return false;
+  if (ctx.waitingForSeller === true || ctx.needsReply === true) return false;
+  if (claim.status === 'resolu') return false;
+
+  // Dernier recours : certains opérateurs renvoient une réclamation sans dernier message.
+  // Là seulement on ouvre le détail pour éviter un faux négatif.
+  return Boolean(ADAPTERS[provider.type]?.fetchThread && claim._ctx);
+}
+
+async function ensureClaimHasMessages(provider, claim, opts = {}) {
+  if (!opts.force && claim?.messages?.length) return claim;
   const adapter = ADAPTERS[provider.type];
   if (!adapter?.fetchThread || !claim?._ctx) return claim;
   try {
@@ -3055,10 +3358,8 @@ function incidentsCacheKey(options) {
     providers: options.providersFilter || '',
   });
 }
-function cloneForPublic(claim) {
-  const copy = { ...claim };
-  delete copy._ctx;
-  return copy;
+function cloneForPublic(claim, provider = null) {
+  return decorateClaimAttachmentsForPublic(provider, claim);
 }
 function restoreClaimIndexFromEntries(entries = [], clear = true) {
   if (clear) claimIndex.clear();
@@ -3104,8 +3405,8 @@ async function collectClaimsForCache(options = {}, onProvider = null) {
       const kept = [];
 
       for (const rawClaim of (Array.isArray(fetched) ? fetched : [])) {
-        const shouldFetchDetail = options.enrichDetails || options.onlyUnanswered;
-        const claim = shouldFetchDetail ? await ensureClaimHasMessages(p, rawClaim) : rawClaim;
+        const shouldFetchDetail = options.enrichDetails || (options.onlyUnanswered && shouldFetchDetailForReplySignal(p, rawClaim));
+        const claim = shouldFetchDetail ? await ensureClaimHasMessages(p, rawClaim, { force: Boolean(options.enrichDetails) }) : rawClaim;
         if (options.onlyUnanswered && !claimNeedsReply(claim)) continue;
         if (!claimIsRecentEnough(claim, providerMaxAgeDays)) continue;
 
@@ -3120,7 +3421,7 @@ async function collectClaimsForCache(options = {}, onProvider = null) {
         if (ctx.kind === 'incident' || ctx.incidentId) {
           incidentEntries.push({ id: claim.id, entry });
         }
-        const publicClaim = cloneForPublic(cachedClaim);
+        const publicClaim = cloneForPublic(cachedClaim, p);
         kept.push(publicClaim);
         all.push(publicClaim);
       }
@@ -3231,7 +3532,8 @@ async function collectIncidentsForCache(options = {}) {
       const providerMaxAgeDays = options.maxAgeDays || 0;
 
       for (const rawClaim of (Array.isArray(fetched) ? fetched : [])) {
-        const claim = options.onlyUnanswered ? await ensureClaimHasMessages(p, rawClaim) : rawClaim;
+        const shouldFetchDetail = options.enrichDetails || (options.onlyUnanswered && shouldFetchDetailForReplySignal(p, rawClaim));
+        const claim = shouldFetchDetail ? await ensureClaimHasMessages(p, rawClaim, { force: Boolean(options.enrichDetails) }) : rawClaim;
         const ctx = claim._ctx || rawClaim._ctx || {};
         if (ctx.kind !== 'incident' && !ctx.incidentId) continue;
         if (options.onlyUnanswered && !claimNeedsReply(claim)) continue;
@@ -3599,13 +3901,7 @@ app.get('/api/reclamations/threads/:id', async (req, res) => {
         claim: fullClaim
       });
 
-      const copy = typeof structuredClone === 'function'
-        ? structuredClone(fullClaim)
-        : JSON.parse(JSON.stringify(fullClaim));
-
-      delete copy._ctx;
-
-      return res.json(copy);
+      return res.json(cloneForPublic(fullClaim, provider));
     }
 
     const adapter = ADAPTERS[provider.type];
@@ -3628,9 +3924,7 @@ app.get('/api/reclamations/threads/:id', async (req, res) => {
       claim: fullClaim
     });
 
-    delete fullClaim._ctx;
-
-    res.json(fullClaim);
+    res.json(cloneForPublic(fullClaim, provider));
 
   } catch (e) {
     const payload = publicErrorPayload(e);
@@ -3643,6 +3937,82 @@ app.get('/api/reclamations/threads/:id', async (req, res) => {
           : 502
       )
       .json(payload);
+  }
+});
+
+app.get('/api/reclamations/threads/:id/attachments/:messageIndex/:attachmentIndex', async (req, res) => {
+  try {
+    const entry = claimIndex.get(req.params.id) || incidentIndex.get(req.params.id);
+    if (!entry?.claim) throw Object.assign(new Error('Réclamation inconnue. Rechargez la conversation puis réessayez.'), { statusCode: 404 });
+
+    const messageIndex = Number(req.params.messageIndex);
+    const attachmentIndex = Number(req.params.attachmentIndex);
+    if (!Number.isInteger(messageIndex) || !Number.isInteger(attachmentIndex) || messageIndex < 0 || attachmentIndex < 0) {
+      throw Object.assign(new Error('Index de pièce jointe invalide'), { statusCode: 400 });
+    }
+
+    const message = Array.isArray(entry.claim.messages) ? entry.claim.messages[messageIndex] : null;
+    const attachments = Array.isArray(message?.attachments) ? message.attachments : normalizeInboundAttachments(message);
+    const attachment = attachments[attachmentIndex];
+    if (!attachment) throw Object.assign(new Error('Pièce jointe introuvable dans cette conversation'), { statusCode: 404 });
+
+    const sourceUrl = attachmentSourceUrl(attachment);
+    const sourceId = attachmentSourceId(attachment);
+    if (!sourceUrl && !(sourceId && providerCanDownloadAttachmentById(entry.provider))) {
+      throw Object.assign(new Error('Cette pièce jointe ne contient ni URL téléchargeable ni identifiant exploitable côté marketplace.'), { statusCode: 404 });
+    }
+
+    const adapter = ADAPTERS[entry.provider.type];
+    let upstream;
+    if (typeof adapter?.downloadAttachment === 'function') {
+      upstream = await adapter.downloadAttachment(entry.provider, sourceUrl || sourceId, attachment, entry.ctx, entry.claim);
+    } else {
+      const raw = String(sourceUrl);
+      if (!/^https?:\/\//i.test(raw)) throw Object.assign(new Error(`Téléchargement non géré pour ${entry.provider.type}`), { statusCode: 400 });
+      upstream = await fetchWithTimeout(raw, { headers: { Accept: '*/*' } }, Number(process.env.ATTACHMENT_DOWNLOAD_TIMEOUT_MS || 30000));
+      await throwHttpError('Pièce jointe', upstream, { provider: entry.provider.code || entry.provider.type, operation: 'downloadAttachment' });
+    }
+
+    const filename = safeHeaderFilename(attachment.name || attachment.filename || `piece-jointe-${attachmentIndex + 1}`);
+    const contentType = upstream.headers.get('content-type') || attachment.type || 'application/octet-stream';
+    const declaredLength = Number(upstream.headers.get('content-length') || 0) || 0;
+    const buf = Buffer.from(await upstream.arrayBuffer());
+
+    if (!buf.length) {
+      throw Object.assign(new Error('La marketplace a répondu 200, mais le fichier reçu est vide. La pièce jointe est probablement expirée ou non disponible côté marketplace.'), { statusCode: 502 });
+    }
+
+    // Certaines instances renvoient un JSON d'erreur avec HTTP 200 au lieu du fichier.
+    // On bloque ce cas pour éviter le téléchargement d'un faux fichier du type 0.json.
+    if (/application\/json/i.test(contentType)) {
+      let detail = '';
+      let looksLikeMarketplaceError = false;
+      try {
+        const j = JSON.parse(buf.toString('utf8'));
+        detail = scalarFirst(j.error, j.message, j.errors?.[0]?.message, j.errors?.[0]?.code);
+        looksLikeMarketplaceError = Boolean(detail || j.errors || j.error || j.message || j.status);
+      } catch (_) {
+        detail = buf.toString('utf8').slice(0, 300);
+      }
+      const genericJsonName = /^(?:\d+|piece-jointe-?\d*)\.json$/i.test(filename);
+      if (looksLikeMarketplaceError || genericJsonName || !/\.json$/i.test(filename)) {
+        throw Object.assign(new Error(detail || 'La marketplace a renvoyé du JSON au lieu du fichier.'), { statusCode: 502 });
+      }
+    }
+
+    if (String(process.env.ATTACHMENT_DEBUG || '') === '1') {
+      console.log(`[attachment/${entry.provider.code || entry.provider.type}] OK ${filename} type=${contentType} bytes=${buf.length} declared=${declaredLength || 'n/a'}`);
+    }
+
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`);
+    res.setHeader('Content-Length', String(buf.length));
+    res.setHeader('Cache-Control', 'private, max-age=300');
+    res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition, Content-Length, Content-Type');
+    res.end(buf);
+  } catch (e) {
+    const payload = publicErrorPayload(e);
+    res.status(payload.status >= 400 && payload.status < 500 ? payload.status : 502).json(payload);
   }
 });
 
