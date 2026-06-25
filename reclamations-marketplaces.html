@@ -426,6 +426,7 @@
   .bubble{max-width:80%;padding:11px 14px;border-radius:14px;margin-bottom:13px;font-size:13px;position:relative;box-shadow:var(--shadow)}
   .bubble .who{font-size:11px;font-weight:700;margin-bottom:4px;opacity:.7}
   .bubble .t{font-size:10.5px;opacity:.55;margin-top:5px;text-align:right}
+  .bubble .msg-text{white-space:pre-wrap;word-break:break-word}
   .bubble.client{background:var(--surface);border:1px solid var(--line);border-bottom-left-radius:4px;margin-right:auto}
   .bubble.seller{background:var(--navy);color:#fff;border-bottom-right-radius:4px;margin-left:auto}
   .bubble.seller .who{color:var(--gold)}
@@ -762,8 +763,11 @@
   <!-- Incidents -->
   <div id="incidentsWrap">
     <div class="block-head" style="margin-top:24px">
-      <p class="section-title" style="margin:0">Incidents <span class="h3-sub">(liste)</span></p>
-      <div class="pager" id="incPager"></div>
+      <p class="section-title" style="margin:0">Incidents <span class="h3-sub" id="incLoadState">(chargement non lancé)</span></p>
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <button class="btn" id="ifRefresh">↻ Actualiser incidents</button>
+        <div class="pager" id="incPager"></div>
+      </div>
     </div>
     <div class="toolbar">
       <div class="search">
@@ -777,7 +781,7 @@
         <option value="resolu">Incident résolu</option>
       </select>
       <select id="ifMp"><option value="">Tous les canaux</option></select>
-      <button class="btn btn-primary" id="ifAdd">➕ Ajouter</button>
+      <button class="btn" id="ifAdd">➕ Ajouter local</button>
     </div>
     <div class="card">
       <table>
@@ -819,6 +823,8 @@
     <select id="fStatut">
       <option value="">Tous statuts</option>
       <option value="nouveau">Nouveau</option>
+      <option value="repondu">Répondu</option>
+      <option value="attente">En attente</option>
       <option value="resolu">Résolu</option>
     </select>
     <button class="btn" id="btnReset">Réinitialiser</button>
@@ -957,7 +963,7 @@ const THEME = { company: "2KINGS", baseline: "La confiance est Reine" };
    =====================================================================*/
 const CONFIG = {
   USE_DEMO_DATA: false,                         // false = vraies API via votre proxy
-  API_BASE: "http://localhost:8787/api/reclamations",
+  API_BASE: "/api/reclamations",
   // type = adaptateur technique (octopia | bomp | mirakl).
   OPERATORS: [
     { code: "cdiscount",     label: "Cdiscount",       type: "octopia" },
@@ -978,111 +984,275 @@ const CONFIG = {
   SLA_LATE: 0, SLA_SOON: 8,
 };
 
+
+function decodeHtmlEntitiesText(v){
+  let s=String(v ?? "");
+  if(!s) return "";
+  const named={amp:"&",lt:"<",gt:">",quot:'"',apos:"'",nbsp:" ",copy:"©",reg:"®",euro:"€"};
+  for(let i=0;i<3;i++){
+    const before=s;
+    s=s.replace(/&(#x[0-9a-f]+|#\d+|[a-z][a-z0-9]+);/gi,(m,code)=>{
+      const c=String(code||"").toLowerCase();
+      if(c[0]==="#"){
+        const n=c[1]==="x" ? parseInt(c.slice(2),16) : parseInt(c.slice(1),10);
+        return Number.isFinite(n) ? String.fromCodePoint(n) : m;
+      }
+      return Object.prototype.hasOwnProperty.call(named,c) ? named[c] : m;
+    });
+    if(s===before) break;
+  }
+  return s;
+}
+function htmlToPlainDisplayText(v,{preserveBreaks=false}={}){
+  let s=decodeHtmlEntitiesText(v);
+  if(!s) return "";
+  s=s.replace(/<\s*(script|style)[^>]*>[\s\S]*?<\/\s*\1\s*>/gi," ");
+  s=s.replace(/<\s*br\s*\/?\s*>/gi,preserveBreaks?"\n":" ");
+  s=s.replace(/<\s*\/(p|div|li|tr|h[1-6])\s*>/gi,preserveBreaks?"\n":" ");
+  s=s.replace(/<\s*(p|div|li|tr|h[1-6])(?:\s[^>]*)?>/gi,preserveBreaks?"\n":" ");
+  s=s.replace(/<[^>]+>/g," ");
+  s=s.replace(/\r/g,"");
+  if(preserveBreaks){
+    return s.replace(/[ \t]+\n/g,"\n").replace(/\n[ \t]+/g,"\n").replace(/\n{3,}/g,"\n\n").replace(/[ \t]{2,}/g," ").trim();
+  }
+  return s.replace(/\s+/g," ").trim();
+}
 function cleanSubjectText(v){
-  return String(v ?? "")
-    .replace(/<[^>]*>/g, " ")
-    .replace(/&nbsp;/gi, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+  return htmlToPlainDisplayText(v,{preserveBreaks:false});
+}
+function cleanDisplayMessageText(v){
+  return htmlToPlainDisplayText(v,{preserveBreaks:true});
+}
+function messageHtml(v){
+  return esc(cleanDisplayMessageText(v)).replace(/\n/g,"<br>");
+}
+function normalizeDisplayMessage(m){
+  const obj=(m && typeof m === "object") ? m : { text:m };
+  const from=["client","seller","system"].includes(String(obj.from||"").toLowerCase()) ? String(obj.from).toLowerCase() : "client";
+  return {
+    ...obj,
+    from,
+    author: cleanSubjectText(obj.author || obj.sender || obj.user || ""),
+    text: cleanDisplayMessageText(obj.text ?? obj.body ?? obj.message ?? obj.content ?? obj.description ?? ""),
+    attachments: Array.isArray(obj.attachments) ? obj.attachments : []
+  };
+}
+
+function looksLikeDisplayAttachmentFilename(v){
+  const s=cleanSubjectText(v);
+  if(!s) return false;
+  if(/^https?:\/\//i.test(s) || /[\\/]/.test(s)) return true;
+  if(/\.(?:pdf|png|jpe?g|gif|webp|heic|bmp|tiff?|docx?|xlsx?|xls|pptx?|zip|rar|7z|txt|csv|json|xml|eml|msg|mp4|mov|avi|mkv|webm|wav|mp3)$/i.test(s)) return true;
+  if(/^(?:img|image|photo|screenshot|capture|scan|piece|pi[eè]ce|pj|attachment|file|document)[-_\s]?\d+/i.test(s)) return true;
+  return false;
+}
+function sanitizeDisplayCustomer(v){
+  const s=cleanSubjectText(v);
+  if(!s) return "";
+  if(looksLikeDisplayAttachmentFilename(s)) return "";
+  if(/^(?:CLIENT|CUSTOMER|SELLER|SHOP|SYSTEM|CALLCENTER|FNAC|DARTY|ORDER|MESSAGE)$/i.test(s)) return "";
+  if(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s)) return "";
+  if(/^\d+(?:\.\w+)?$/.test(s)) return "";
+  return s;
+}
+function looksLikeDisplayMessageSnippet(v){
+  const s=cleanSubjectText(v);
+  if(!s) return false;
+  const folded=s.normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase();
+  if(/^(bonjour|bonsoir|bjr|hello|madame|monsieur|cher|chere)\b/.test(folded)) return true;
+  if(/\b(je vous contacte|je reviens vers vous|suite a|suite a ma commande|j ai commande|j'ai commande|j ai recu|j'ai recu|je n ai|je n'ai|je voudrais|je souhaite|pouvez vous|pourriez vous|merci de|svp|cordialement)\b/.test(folded)) return true;
+  if(s.length>80) return true;
+  if(s.split(/\s+/).length>10 && /[.!?;:]/.test(s)) return true;
+  return false;
 }
 function isBadDisplaySubject(v){
   const s=cleanSubjectText(v);
   if(!s) return true;
+  const compact=s.normalize('NFD').replace(/[̀-ͯ]/g,'').toLowerCase().replace(/[^a-z0-9]+/g,'_').replace(/^_+|_+$/g,'');
   return /^[#_\-\s]*\d+[#_\-\s]*$/.test(s)
     || /^(topic|subject|reason|motif)[_\-\s]*\d+$/i.test(s)
-    || /^(r[ée]clamation|r[ée]clamation client|incident|message client|demande client)$/i.test(s);
+    || /^(order|order_information|orderinformation|client_order|client_order_comment|message|message_order|incident|case|claim|request|thread|discussion|client|customer|seller|shop|system|callcenter)$/i.test(compact)
+    || looksLikeDisplayMessageSnippet(s)
+    || /^(r[ée]clamation|r[ée]clamation client|incident|message client|demande client|customer claim|customer complaint|claim)$/i.test(s);
 }
 function inferDisplaySubject(text){
   const s=cleanSubjectText(text);
   if(!s) return "";
   const t=s.toLowerCase();
-  if(/(colis|commande).*(pas|non|jamais).*(reçu|recu|livré|livre)|livré.*rien reçu|non[ -]?reçu/.test(t)) return "Colis non reçu";
-  if(/endommag|cass[ée]e?|fissur|ab[iî]m/.test(t)) return "Produit endommagé";
-  if(/d[ée]fect|panne|ne fonctionne|fonctionne pas|ne s.allume/.test(t)) return "Produit défectueux";
-  if(/non conforme|mauvais[e]? r[ée]f[ée]rence|erreur de r[ée]f[ée]rence|pas celui command/.test(t)) return "Produit non conforme";
-  if(/retour|renvoi|renvoyer|retractation|rétractation/.test(t)) return "Demande de retour";
-  if(/rembours/.test(t)) return "Remboursement";
+  if(/(colis|commande).*(pas|non|jamais|aucun|rien).*(reçu|recu|livré|livre)|livré.*rien reçu|non[ -]?reçu|colis perdu|suivi.*livr/.test(t)) return "Colis non reçu";
+  if(/endommag|cass[ée]e?|fissur|ab[iî]m|ray[eé]|enfonc|bris[eé]/.test(t)) return "Produit endommagé";
+  if(/d[ée]fect|panne|ne fonctionne|fonctionne pas|ne s.allume|hs|hors service|gr[eé]sille/.test(t)) return "Produit défectueux";
+  if(/non conforme|mauvais[e]? r[ée]f[ée]rence|erreur de r[ée]f[ée]rence|pas celui command|autre mod[eè]le|mauvais produit|coloris.*correspond/.test(t)) return "Produit non conforme";
+  if(/manquant|pi[eè]ce manquante|visserie|accessoire manquant|il manque/.test(t)) return "Pièce manquante";
+  if(/annul|annulation/.test(t)) return "Annulation de commande";
+  if(/rendez[ -]?vous|rdv|cr[eé]neau|reprogramm/.test(t)) return "Livraison / rendez-vous";
+  if(/retour|renvoi|renvoyer|retractation|rétractation|[ée]tiquette retour/.test(t)) return "Demande de retour";
+  if(/rembours|avoir|cr[ée]dit/.test(t)) return "Remboursement";
   if(/facture/.test(t)) return "Facture manquante";
-  if(/garantie|sav/.test(t)) return "Question SAV / garantie";
-  if(/retard|d[ée]lai|livraison.*d[ée]pass/.test(t)) return "Retard de livraison";
-  return s.length>70 ? s.slice(0,67)+"…" : s;
+  if(/garantie|sav|service apr[eè]s vente/.test(t)) return "Question SAV / garantie";
+  if(/retard|d[ée]lai|livraison.*d[ée]pass|livraison.*repouss|toujours rien|pas de nouvelle/.test(t)) return "Retard de livraison";
+  return "";
 }
 function normalizeDisplaySubject(subject,messages){
   const s=cleanSubjectText(subject);
   if(!isBadDisplaySubject(s)) return s;
   const lastClient=[...(Array.isArray(messages)?messages:[])].reverse().find(m=>m.from==="client")?.text || "";
-  return inferDisplaySubject(lastClient) || "Réclamation client";
+  return inferDisplaySubject([lastClient,s].filter(Boolean).join(" ")) || "Réclamation client";
 }
 
-function frontNormKey(k){ return String(k||'').replace(/^@_/,'').replace(/[^a-z0-9]/gi,'').toLowerCase(); }
-function frontScalar(v){
-  if(v===0) return '0';
-  if(v===undefined || v===null) return '';
-  if(typeof v==='string' || typeof v==='number' || typeof v==='boolean') return String(v).trim();
-  if(Array.isArray(v)){ for(const x of v){ const got=frontScalar(x); if(got) return got; } return ''; }
-  if(typeof v==='object'){
-    for(const k of ['value','label','name','title','id','code','reference','order_id','orderId','#text']){
-      const got=frontScalar(v[k]); if(got) return got;
-    }
+function cleanTrackingText(v){
+  return String(v ?? "").replace(/<[^>]*>/g," ").replace(/&nbsp;/gi," ").replace(/\s+/g," ").trim();
+}
+function foldTrackText(v){
+  return cleanTrackingText(v).normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase();
+}
+function looksLikeTrackingNumberUi(v){
+  const s=cleanTrackingText(v).replace(/\s+/g,"");
+  if(!s || s.length<6 || s.length>60) return false;
+  if(/^https?:/i.test(s)) return false;
+  if(!/[0-9]/.test(s)) return false;
+  if(/[@]/.test(s)) return false;
+  return /^[A-Z0-9._\-]+$/i.test(s);
+}
+function inferCarrierFromUrlUi(rawUrl=""){
+  const u=foldTrackText(rawUrl);
+  if(!u) return "";
+  if(/(satisfaction|survey|enquete|questionnaire|feedback|avis|review|evaluation|evaluer|rating|nps|csat|trustpilot|avis[-_ ]?verifies|netreviews|ekomi|bazaarvoice|qualtrics|medallia|forms\.office|docs\.google\.com\/forms|google\.com\/forms)/.test(u)) return "";
+  if(/laposte|la-poste|colissimo|suivre-vos-envois|suivi\.laposte|outils\/suivre/.test(u)) return "colissimo";
+  if(/chronopost|chrono-post|tracking-no-cms|chrono_suivi|listeNumerosLT/i.test(rawUrl)) return "chronopost";
+  if(/\bdpd\b|trace\.dpd|dpdgroup|predict\.dpd/.test(u)) return "dpd";
+  if(/gls-group|glsfr|gls-france|glsfrance|\bgls\b/.test(u)) return "gls";
+  if(/\bups\b|united parcel|ups\.com\/track/.test(u)) return "ups";
+  if(/\bdhl\b|dhlparcel|dhl\.com/.test(u)) return "dhl";
+  if(/fedex|federal express|fedextrack/.test(u)) return "fedex";
+  if(/\btnt\b|tnt\.com|tnt\.fr/.test(u)) return "tnt";
+  if(/mondialrelay|mondial-relay|mondial relay/.test(u)) return "mondialrelay";
+  if(/relaiscolis|relais-colis|relais colis/.test(u)) return "relaiscolis";
+  if(/colisprive|colis-prive|colis prive/.test(u)) return "colisprive";
+  if(/cchezvous|c-chez-vous|c chez vous|chezvous/.test(u)) return "chezvous";
+  if(/geodis|calberson/.test(u)) return "geodis";
+  return "";
+}
+function isLikelyTrackingUrlUi(rawUrl=""){
+  const url=cleanTrackingText(rawUrl);
+  if(!/^https?:\/\//i.test(url)) return false;
+  const u=foldTrackText(url);
+  if(/(satisfaction|survey|enquete|questionnaire|feedback|avis|review|evaluation|evaluer|rating|nps|csat|trustpilot|avis[-_ ]?verifies|netreviews|ekomi|bazaarvoice|qualtrics|medallia|forms\.office|docs\.google\.com\/forms|google\.com\/forms)/.test(u)) return false;
+  return Boolean(inferCarrierFromUrlUi(url) || /(tracking|track|trace|suivi|colis|parcel|shipment|expedition|consignment|skybill|waybill)/.test(u));
+}
+function safeTrackingUrlUi(rawUrl=""){
+  const url=cleanTrackingText(rawUrl);
+  return isLikelyTrackingUrlUi(url)?url:"";
+}
+function normalizeCarrierUi(raw,number="",url=""){
+  const s=foldTrackText(raw);
+  if(/colissimo|la poste|laposte|courrier suivi/.test(s)) return "colissimo";
+  if(/chrono|chronopost/.test(s)) return "chronopost";
+  if(/\bdpd\b|dpd predict/.test(s)) return "dpd";
+  if(/\bgls\b/.test(s)) return "gls";
+  if(/\bups\b/.test(s)) return "ups";
+  if(/\bdhl\b/.test(s)) return "dhl";
+  if(/fedex|federal express/.test(s)) return "fedex";
+  if(/\btnt\b/.test(s)) return "tnt";
+  if(/mondial|relay/.test(s)) return "mondialrelay";
+  if(/relais colis|relaiscolis/.test(s)) return "relaiscolis";
+  if(/colis prive|colispriv/.test(s)) return "colisprive";
+  if(/chezvous|chez vous|cchezvous|c chez vous/.test(s)) return "chezvous";
+  if(/geodis|calberson/.test(s)) return "geodis";
+  const byUrl=inferCarrierFromUrlUi(url);
+  if(byUrl) return byUrl;
+  const n=cleanTrackingText(number).replace(/\s+/g,"").toUpperCase();
+  if(/^1Z[A-Z0-9]{10,}$/.test(n)) return "ups";
+  if(/^(?:6[A-Z0-9]{10,}|8[A-Z0-9]{10,}|7[A-Z0-9]{10,}|[A-Z]{2}\d{9}FR)$/.test(n)) return "colissimo";
+  if(/^(?:XY|XU|XX|XT|XS|XA|XP)[A-Z0-9]{8,}FR$/.test(n)) return "chronopost";
+  if(/^[A-Z]{2}\d{8,}[A-Z]{2}$/.test(n)) return "chronopost";
+  if(/^GEODIS/i.test(n)) return "geodis";
+  return "transporteur";
+}
+function normalizeTrackStatusUi(raw,events=[]){
+  const s=foldTrackText([raw,...(events||[]).map(e=>e&&e.label)].filter(Boolean).join(" "));
+  // Un numéro de suivi seul = suivi disponible, pas forcément en transit.
+  if(!s) return "inconnu";
+  if(/livr|delivered|remis/.test(s)) return "livre";
+  if(/point relais|relais|pickup|a retirer|consigne|disponible/.test(s)) return "pret_retrait";
+  if(/incident|echec|absent|retour|refus|exception|probleme|anomalie|perdu/.test(s)) return "incident";
+  if(/preparation|etiquette|label|enregistr|created|annonce|attente|pending/.test(s)) return "en_attente";
+  if(/expedi|expédie|expedie|shipped|pris en charge|accepted|collected|achemin|transit|hub|tri|route|en cours de livraison|out for delivery|en livraison|depart|arrive/.test(s)) return "en_transit";
+  return "inconnu";
+}
+function parseTrackDate(v){
+  if(v==null || v==="") return null;
+  if(typeof v==="number") return String(Math.abs(v)).length>=13 ? v : v*1000;
+  if(/^\d+$/.test(String(v))) { const n=Number(v); return String(Math.abs(n)).length>=13 ? n : n*1000; }
+  const t=new Date(v).getTime();
+  return Number.isNaN(t)?null:t;
+}
+function normalizeTrackEventUi(e){
+  if(!e) return null;
+  if(typeof e==="string") return {at:Date.now(),label:cleanTrackingText(e)};
+  const label=cleanTrackingText(e.label || e.description || e.status || e.eventLabel || e.event_label || e.message || e.libelle || e.activity || "");
+  const at=parseTrackDate(e.at || e.date || e.eventDate || e.event_date || e.timestamp || e.datetime || e.created_at) || (e.h!=null ? Date.now()-Number(e.h)*H : Date.now());
+  return label ? {at,label} : null;
+}
+function normalizeDisplayTracking(raw){
+  if(!raw) return null;
+  if(typeof raw==="string") return looksLikeTrackingNumberUi(raw) ? {carrier:normalizeCarrierUi("",raw),number:cleanTrackingText(raw),status:"inconnu",etaH:null,events:[]} : null;
+  const number=cleanTrackingText(raw.number || raw.trackingNumber || raw.tracking_number || raw.trackingCode || raw.tracking_code || raw.trackingId || raw.tracking_id || raw.parcelNumber || raw.parcel_number || raw.shipmentNumber || raw.shipment_number || raw.shipping_number || raw.awb || raw.waybill || "");
+  let n=number;
+  const directUrl=safeTrackingUrlUi(raw.url || raw.trackingUrl || raw.tracking_url || "");
+  if(!looksLikeTrackingNumberUi(n) && directUrl){
+    const m=directUrl.match(/[?&](?:code|tracking-id|trackingNumber|tracking_number|tracknum|listeNumerosLT|match|numColis|numeroExpedition|cons)=([^&]+)/i);
+    n=m?decodeURIComponent(m[1]):"";
   }
-  return '';
+  if(!looksLikeTrackingNumberUi(n)) return null;
+  const evSrc=Array.isArray(raw.events)?raw.events:(Array.isArray(raw.history)?raw.history:[]);
+  const events=evSrc.map(normalizeTrackEventUi).filter(Boolean).sort((a,b)=>(b.at||0)-(a.at||0)).slice(0,20);
+  const carrier=normalizeCarrierUi(
+    raw.carrier || raw.carrierCode || raw.carrier_code || raw.carrierName || raw.carrier_name || raw.transporteur || raw.transporter ||
+    raw.shippingCarrier || raw.shipping_carrier || raw.shippingCompany || raw.shipping_company || raw.shippingTypeLabel || raw.shipping_type_label || raw.shippingTypeCode || raw.shipping_type_code || "",
+    n,
+    directUrl
+  );
+  return {carrier,number:n,status:normalizeTrackStatusUi(raw.status || raw.tracking_status || raw.delivery_status || raw.shipment_status, events),etaH:raw.etaH ?? raw.eta ?? null,events,...(directUrl?{url:directUrl}:{})};
 }
-function frontDeepValues(obj,keys,out=[],seen=new Set()){
-  if(!obj || typeof obj!=='object' || seen.has(obj)) return out;
-  seen.add(obj);
-  const wanted=new Set(keys.map(frontNormKey));
-  if(Array.isArray(obj)){ obj.forEach(x=>frontDeepValues(x,keys,out,seen)); return out; }
-  Object.entries(obj).forEach(([k,v])=>{ if(wanted.has(frontNormKey(k))) out.push(v); frontDeepValues(v,keys,out,seen); });
-  return out;
+function trackingExternalUrl(t){
+  if(!t) return "";
+  if(t.url && safeTrackingUrlUi(t.url)) return t.url;
+  const car=carrierOf(t.carrier);
+  return car.url ? car.url.replace("{n}",encodeURIComponent(t.number||"")) : "";
 }
-function frontDeepText(obj,keys){
-  const vals=frontDeepValues(obj,keys);
-  for(const v of vals){ const got=frontScalar(v); if(got) return cleanSubjectText(got); }
-  return '';
+function trackingStatusInfo(t){
+  const key=normalizeTrackStatusUi(t&&t.status,t&&t.events);
+  return TSTATUS[key] || TSTATUS.inconnu;
 }
-function normalizeClaimMessages(messages){
-  return (Array.isArray(messages)?messages:[]).map(m=>({
-    from: m.from || (m.by==='boutique'?'seller':(m.by||'client')),
-    author: m.author || m.repliedBy || '',
-    at: Number(m.at) || Date.parse(m.at || m.date || m.created_at || m.updated_at) || Date.now(),
-    text: cleanSubjectText(m.text || m.body || m.message || m.content || m.description || ''),
-    attachments: Array.isArray(m.attachments)?m.attachments:[]
-  })).filter(m=>m.text || m.attachments.length).sort((a,b)=>a.at-b.at);
-}
+
 function normalizeClaim(c){
   const ctx = c._ctx || c.ctx || {};
-  const messages = normalizeClaimMessages(c.messages);
-  const orderId = c.orderId || c.order_id || c.order_fnac_id || ctx.orderId || ctx.order_id || frontDeepText(c,[
-    'orderId','order_id','order_fnac_id','fnac_order_id','order_reference','order_ref','order_number','order','client_order_id'
-  ]);
-  const product = c.product || c.product_name || ctx.product || frontDeepText(c,[
-    'product','product_name','product_label','product_title','offer_seller_id','offer_fnac_id','seller_sku','sku','ean'
-  ]);
-  const customer = (c.customer && c.customer!=='Client') ? c.customer : (ctx.customer || c.customer_name || c.buyer_name || frontDeepText(c,[
-    'customer','customer_name','buyer','buyer_name','client','client_name','client_id','buyer_id'
-  ]) || 'Client');
-  const subjectSource = c.subject || ctx.subject || c.messageSubject || c.message_subject || frontDeepText(c,[
-    'subject','message_subject','reason','reason_label','motif','type','incident_type','title','label'
-  ]);
+  const messages = Array.isArray(c.messages) ? c.messages.map(normalizeDisplayMessage) : [];
+  const subjectSource = c.subject || ctx.subject || c.messageSubject || c.message_subject || c.reason || c.reason_label || c.motif || c.type || c.incident_type || "";
   return {
     id: c.id || `${c.marketplace || "unknown"}-${Math.random().toString(36).slice(2)}`,
-    marketplace: c.marketplace || c.channel || ctx.marketplace || "unknown",
-    customer,
-    customerId: c.customerId || c.clientId || c.customer_id || ctx.customerId || ctx.clientId || ctx.client_id || frontDeepText(c,[
-      'customerId','customer_id','client_id','buyer_id','customer_number','client_number','client_reference','customer_reference'
-    ]),
+    marketplace: c.marketplace || "unknown",
+    customer: sanitizeDisplayCustomer(c.customer || (c._ctx&&c._ctx.customer) || (c.ctx&&c.ctx.customer)) || "Client",
+    customerId: c.customerId || c.clientId || c.customer_id || "",
     subject: normalizeDisplaySubject(subjectSource, messages),
-    orderId,
-    product,
-    ean: c.ean || c.sku || ctx.ean || ctx.orderDetailId || "",
+    orderId: c.orderId || "",
+    product: c.product || "",
+    ean: c.ean || "",
     priority: c.priority || "moyenne",
     status: c.status || "nouveau",
-    marketplaceStatus: c.marketplaceStatus || c.statusRaw || c.marketplace_status || c.rawStatus || ctx.marketplaceStatus || ctx.rawStatus || "",
-    statusRaw: c.statusRaw || c.rawStatus || c.marketplaceStatus || ctx.rawStatus || ctx.marketplaceStatus || "",
-    updatedAt: Number(c.updatedAt) || Date.parse(c.updatedAt || c.lastAt || c.openedAt) || Date.now(),
-    dueAt: Number(c.dueAt) || Date.parse(c.dueAt) || Date.now() + 24 * 3600 * 1000,
+    marketplaceStatus: c.marketplaceStatus || c.statusRaw || c.marketplace_status || c.rawStatus || "",
+    statusRaw: c.statusRaw || c.rawStatus || c.marketplaceStatus || "",
+    updatedAt: c.updatedAt || Date.now(),
+    dueAt: c.dueAt || Date.now() + 24 * 3600 * 1000,
     messages,
-    tracking: c.tracking || null,
+    tracking: normalizeDisplayTracking(c.tracking || {
+      number: c.trackingNumber || c.tracking_number || c.trackingCode || c.tracking_code || c.parcelNumber || c.parcel_number || c.shipmentNumber || c.shipment_number || c.awb || c.waybill,
+      carrier: c.carrier || c.carrierCode || c.carrier_code || c.carrierName || c.carrier_name || c.transporteur || c.transporter || c.shippingCarrier || c.shipping_carrier,
+      status: c.trackingStatus || c.tracking_status || c.deliveryStatus || c.delivery_status || c.shipmentStatus || c.shipment_status,
+      events: c.trackingEvents || c.tracking_events || c.events,
+      url: c.trackingUrl || c.tracking_url
+    }),
     _detailLoaded: Boolean(c._detailLoaded),
   };
 }
@@ -1091,6 +1261,100 @@ function customerHtml(c){
   const id = c.customerId && !String(c.customer || "").includes(String(c.customerId)) ? String(c.customerId) : "";
   const idLine = id ? `<div class="meta">N° client <span class="ordref" data-lbl="N° client">${esc(id)}</span></div>` : "";
   return `<div class="cust">${esc(c.customer || "Client")}</div>${idLine}`;
+}
+
+function normalizeNote(n){
+  const rawRating = n.rating ?? n.rate ?? n.score ?? n.note ?? n.grade;
+  const rating = Math.max(1, Math.min(5, Math.round(Number(rawRating)||0)));
+  return {
+    id: n.id || `${n.marketplace || "unknown"}:note:${n.orderId || n.ean || Math.random().toString(36).slice(2)}`,
+    marketplace: n.marketplace || "unknown",
+    orderId: n.orderId || "",
+    customer: n.customer || "Client",
+    product: n.product || "",
+    ean: n.ean || "",
+    rating: rating || 0,
+    visible: n.visible !== false,
+    comment: n.comment || n.review || n.message || "",
+    at: n.at || n.createdAt || n.updatedAt || Date.now(),
+    reply: n.reply || "",
+    repliedBy: n.repliedBy || "",
+    source: n.source || "api",
+  };
+}
+
+function normalizeIncident(raw={}){
+  const r = raw || {};
+  const validStates = new Set(["en_cours","resolu","clos"]);
+  const validMotifs = new Set(["non_conforme","defectueux","non_recu","retard","autre"]);
+  const validBy = new Set(["client","boutique"]);
+  const conv = Array.isArray(r.conv) ? r.conv : [];
+  const normConv = conv.map(m=>({
+    at: Number(m.at || m.date || m.createdAt || Date.now()) || Date.now(),
+    by: validBy.has(String(m.by||"").toLowerCase()) ? String(m.by).toLowerCase() : (String(m.from||"").toLowerCase()==="client" ? "client" : "boutique"),
+    text: cleanDisplayMessageText(m.text ?? m.body ?? m.message ?? ""),
+    attachments: Array.isArray(m.attachments) ? m.attachments : []
+  })).filter(m=>m.text || m.attachments.length);
+  const id = String(r.id || r.claimId || `inc-local-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  return {
+    id,
+    claimId: r.claimId || id,
+    remote: r.remote === true,
+    canReply: r.canReply !== false,
+    replyMode: r.replyMode || "",
+    openedAt: r.openedAt || r.createdAt || new Date().toISOString().slice(0,16),
+    openedBy: validBy.has(String(r.openedBy||"").toLowerCase()) ? String(r.openedBy).toLowerCase() : "client",
+    state: validStates.has(String(r.state||"").toLowerCase()) ? String(r.state).toLowerCase() : "en_cours",
+    motif: validMotifs.has(String(r.motif||"").toLowerCase()) ? String(r.motif).toLowerCase() : "autre",
+    orderId: cleanSubjectText(r.orderId || r.order || ""),
+    orderAt: r.orderAt || r.orderDate || r.openedAt || "",
+    channel: String(r.channel || r.marketplace || "").toLowerCase(),
+    product: cleanSubjectText(r.product || ""),
+    sku: cleanSubjectText(r.sku || r.ean || ""),
+    total: r.total === "" || r.total == null ? null : Number(r.total),
+    customer: sanitizeDisplayCustomer(r.customer || "") || "Client",
+    msgs: Number(r.msgs ?? normConv.length) || normConv.length,
+    lastBy: validBy.has(String(r.lastBy||"").toLowerCase()) ? String(r.lastBy).toLowerCase() : (normConv.at(-1)?.by || "client"),
+    lastAt: r.lastAt || (normConv.at(-1)?.at ? new Date(normConv.at(-1).at).toISOString().slice(0,16) : (r.openedAt || new Date().toISOString().slice(0,16))),
+    conv: normConv,
+  };
+}
+
+function incidentFromClaim(c, previous={}){
+  const msgs = Array.isArray(c?.messages) ? c.messages.map(normalizeDisplayMessage).sort((a,b)=>(+a.at||0)-(+b.at||0)) : [];
+  const first = msgs[0];
+  const last = msgs.at(-1);
+  const openedAt = new Date(first?.at || c?.updatedAt || Date.now()).toISOString().slice(0,16);
+  const lastAt = new Date(last?.at || c?.updatedAt || Date.now()).toISOString().slice(0,16);
+  const motif = inferDisplaySubject((c?.subject||"")+" "+msgs.map(m=>m.text).join(" "));
+  const motifMap = {
+    "Produit non conforme":"non_conforme",
+    "Produit endommagé":"non_conforme",
+    "Produit défectueux":"defectueux",
+    "Colis non reçu":"non_recu",
+    "Retard de livraison":"retard"
+  };
+  return normalizeIncident({
+    ...previous,
+    id: c?.id || previous.id,
+    claimId: c?.id || previous.claimId,
+    remote: true,
+    canReply: previous.canReply !== false,
+    openedAt,
+    openedBy: first?.from === "seller" ? "boutique" : "client",
+    state: c?.status === "resolu" ? "resolu" : (previous.state || "en_cours"),
+    motif: previous.motif && previous.motif !== "autre" ? previous.motif : (motifMap[motif] || "autre"),
+    orderId: c?.orderId || previous.orderId || "",
+    orderAt: previous.orderAt || openedAt,
+    channel: c?.marketplace || previous.channel || "",
+    product: c?.product || previous.product || "",
+    sku: c?.ean || previous.sku || "",
+    customer: c?.customer || previous.customer || "Client",
+    msgs: msgs.length,
+    lastBy: last?.from === "client" ? "client" : "boutique",
+    lastAt,
+    conv: msgs.map(m=>({at:m.at, by:m.from === "client" ? "client" : "boutique", text:m.text, attachments:m.attachments||[]}))
+  });
 }
 
 async function readApiError(r, fallback){
@@ -1109,18 +1373,220 @@ async function readApiError(r, fallback){
 }
 
 const DataAPI = {
-  async fetchClaims(options={}){
-    if(CONFIG.USE_DEMO_DATA) return structuredClone(DEMO);
-    const params = new URLSearchParams({
-      cacheTtlMs: String(options.cacheTtlMs || 180000),
-      refreshCooldownMs: String(options.refreshCooldownMs || 60000),
-      providerTimeoutMs: String(options.providerTimeoutMs || 15000)
+ async fetchClaims(options={}){
+  if(CONFIG.USE_DEMO_DATA) return structuredClone(DEMO);
+
+  const params = new URLSearchParams({
+    cacheTtlMs: String(options.cacheTtlMs || 180000),
+    refreshCooldownMs: String(options.refreshCooldownMs || 60000),
+    providerTimeoutMs: String(options.providerTimeoutMs || 12000)
+  });
+  if(options.refresh) params.set('refresh','1');
+  if(options.providers) params.set('providers', options.providers);
+  if(options.enrichDetails) params.set('enrichDetails','1');
+
+  const r = await fetch(`${CONFIG.API_BASE}/threads?${params.toString()}`, {
+    headers:{'Accept':'application/json'}
+  });
+
+  if(!r.ok) throw new Error("Erreur API "+r.status);
+
+  const data = await r.json();
+  console.log("Données reçues depuis l'API :", data);
+
+  return Array.isArray(data) ? data.map(normalizeClaim) : [];
+},
+
+
+ async fetchClaimsCacheOnly(options={}){
+  if(CONFIG.USE_DEMO_DATA) return {data: structuredClone(DEMO).map(normalizeClaim), cache:'DEMO'};
+  const params = new URLSearchParams({
+    cacheTtlMs: String(options.cacheTtlMs || 180000),
+    refreshCooldownMs: String(options.refreshCooldownMs || 60000),
+    providerTimeoutMs: String(options.providerTimeoutMs || 12000),
+    cacheOnly: '1',
+    allowStale: '1'
+  });
+  if(options.providers) params.set('providers', options.providers);
+  if(options.enrichDetails) params.set('enrichDetails','1');
+  if(options.all) params.set('all','1');
+  if(options.days!=null) params.set('days', String(options.days));
+
+  const r = await fetch(`${CONFIG.API_BASE}/threads?${params.toString()}`, {
+    headers:{'Accept':'application/json'}
+  });
+
+  if(r.status===204) return {data:[], cache:'MISS'};
+  if(!r.ok) throw new Error("Erreur API cache "+r.status);
+  const data = await r.json();
+  return {
+    data: Array.isArray(data) ? data.map(normalizeClaim) : [],
+    cache: r.headers.get('X-Threads-Cache') || 'UNKNOWN',
+    ageMs: Number(r.headers.get('X-Threads-Cache-Age-Ms') || 0)
+  };
+},
+
+ async fetchClaimsProgressive(options={}, onProvider=()=>{}){
+  if(CONFIG.USE_DEMO_DATA){
+    const demo = structuredClone(DEMO).map(normalizeClaim);
+    onProvider(demo, {provider:{code:'demo',label:'Démo',type:'demo'}, completed:1, total:1}, demo);
+    return demo;
+  }
+
+  // Cache-first : au chargement normal, on tente d'abord d'afficher les dernières
+  // réclamations gardées côté serveur, sans appeler les marketplaces.
+  // Si le cache est frais (HIT), on s'arrête là. S'il est périmé (STALE),
+  // on l'affiche immédiatement puis le flux ci-dessous déclenchera au maximum
+  // un seul refresh serveur partagé entre tous les utilisateurs.
+  if(!options.refresh){
+    try{
+      const cached = await this.fetchClaimsCacheOnly(options);
+      if(cached && cached.data && cached.data.length){
+        onProvider(cached.data, {
+          provider:{code:'threads-cache',label:'Cache réclamations',type:'cache'},
+          completed:1,total:1,cache:cached.cache,ageMs:cached.ageMs,cachePreview:true
+        }, cached.data.slice());
+        if(String(cached.cache).toUpperCase()==='HIT') return cached.data.slice();
+      }
+    }catch(e){ console.warn('Cache réclamations indisponible, chargement live', e); }
+  }
+
+  // EventSource permet d'afficher les résultats fournisseur par fournisseur.
+  // Si le navigateur/proxy ne supporte pas le streaming, on retombe sur l'appel classique.
+  if(!window.EventSource){
+    const fallback = await this.fetchClaims(options);
+    onProvider(fallback, {provider:{code:'api',label:'API',type:'api'}, completed:1, total:1, fallback:true}, fallback);
+    return fallback;
+  }
+
+  const params = new URLSearchParams({
+    cacheTtlMs: String(options.cacheTtlMs || 180000),
+    refreshCooldownMs: String(options.refreshCooldownMs || 60000),
+    // Plus long en mode progressif : une marketplace lente n'empêche plus les autres de s'afficher.
+    providerTimeoutMs: String(options.providerTimeoutMs || 60000),
+    concurrency: String(options.concurrency || 6)
+  });
+  if(options.refresh) params.set('refresh','1');
+  if(options.providers) params.set('providers', options.providers);
+  if(options.enrichDetails) params.set('enrichDetails','1');
+  if(options.all) params.set('all','1');
+  if(options.days!=null) params.set('days', String(options.days));
+
+  const url = `${CONFIG.API_BASE}/threads-stream?${params.toString()}`;
+  const all = [];
+  const seen = new Set();
+
+  return await new Promise((resolve, reject)=>{
+    let settled = false;
+    let gotAnyEvent = false;
+    const es = new EventSource(url);
+
+    function finish(value){
+      if(settled) return;
+      settled = true;
+      es.close();
+      resolve(value);
+    }
+    function fail(err){
+      if(settled) return;
+      settled = true;
+      es.close();
+      reject(err);
+    }
+    function mergeRows(rows){
+      rows.map(normalizeClaim).forEach(c=>{
+        if(seen.has(c.id)){
+          const i = all.findIndex(x=>x.id===c.id);
+          if(i>=0) all[i]=c;
+        }else{
+          seen.add(c.id);
+          all.push(c);
+        }
+      });
+      all.sort((a,b)=>Number(b.updatedAt||0)-Number(a.updatedAt||0));
+    }
+
+    es.addEventListener('start', ev=>{
+      gotAnyEvent = true;
+      try{ onProvider([], JSON.parse(ev.data||'{}'), all.slice()); }catch(_){ }
     });
-    if(options.refresh) params.set('refresh','1');
-    const r = await fetch(`${CONFIG.API_BASE}/threads?${params.toString()}`, {headers:{'Accept':'application/json'}});
-    if(!r.ok) throw new Error("Erreur API "+r.status);
-    return await r.json();
-  },
+
+    es.addEventListener('provider', ev=>{
+      gotAnyEvent = true;
+      try{
+        const payload = JSON.parse(ev.data||'{}');
+        const rows = Array.isArray(payload.rows) ? payload.rows : [];
+        mergeRows(rows);
+        onProvider(rows.map(normalizeClaim), payload, all.slice());
+      }catch(e){ console.warn('Chunk progressif ignoré', e); }
+    });
+
+    es.addEventListener('provider-error', ev=>{
+      gotAnyEvent = true;
+      try{
+        const payload = JSON.parse(ev.data||'{}');
+        console.warn('Marketplace ignorée en streaming', payload);
+        onProvider([], payload, all.slice());
+      }catch(_){ }
+    });
+
+    es.addEventListener('fatal', ev=>{
+      try{ fail(new Error((JSON.parse(ev.data||'{}').error)||'Erreur API streaming')); }
+      catch(_){ fail(new Error('Erreur API streaming')); }
+    });
+
+    es.addEventListener('done', ev=>{
+      gotAnyEvent = true;
+      try{ onProvider([], JSON.parse(ev.data||'{}'), all.slice()); }catch(_){ }
+      finish(all.slice());
+    });
+
+    es.onerror = async ()=>{
+      if(settled) return;
+      es.close();
+      // Si le flux ne démarre pas du tout, fallback JSON classique.
+      if(!gotAnyEvent){
+        try{
+          const fallback = await this.fetchClaims(options);
+          onProvider(fallback, {provider:{code:'api',label:'API',type:'api'}, completed:1, total:1, fallback:true}, fallback);
+          finish(fallback);
+        }catch(e){ fail(e); }
+      }else{
+        // Si on a déjà des chunks, on garde ce qui est affiché au lieu de vider l'écran.
+        finish(all.slice());
+      }
+    };
+  });
+},
+ async fetchNotes(options={}){
+  if(CONFIG.USE_DEMO_DATA) return structuredClone(NOTES);
+  const params = new URLSearchParams({
+    fast: options.full ? '0' : '1',
+    limit: String(options.limit || 150),
+    providerTimeoutMs: String(options.providerTimeoutMs || 25000),
+    cacheTtlMs: String(options.cacheTtlMs || 900000),
+    refreshCooldownMs: String(options.refreshCooldownMs || 60000)
+  });
+  if(options.refresh) params.set('refresh','1');
+  if(options.providers) params.set('providers', options.providers);
+  if(options.includeMirakl !== undefined) params.set('includeMirakl', options.includeMirakl ? '1' : '0');
+  if(options.enrich) params.set('enrich','1');
+  if(options.maxOrders) params.set('maxOrders', String(options.maxOrders));
+  if(options.pages) params.set('pages', String(options.pages));
+  if(options.pageSize) params.set('pageSize', String(options.pageSize));
+  if(options.evalConcurrency) params.set('evalConcurrency', String(options.evalConcurrency));
+  const r = await fetch(`${CONFIG.API_BASE}/notes?${params.toString()}`, {
+    headers:{'Accept':'application/json'}
+  });
+  if(!r.ok){
+    let msg = "Erreur API notes "+r.status;
+    try{ msg = await readApiError(r,msg); }catch(e){}
+    throw new Error(msg);
+  }
+  const data = await r.json();
+  console.log("Notes reçues depuis l'API :", data, "cache=", r.headers.get('X-Notes-Cache'));
+  return Array.isArray(data) ? data.map(normalizeNote).filter(n=>n.rating>0) : [];
+},
   async fetchClaimDetail(id){
     if(CONFIG.USE_DEMO_DATA){
       await new Promise(r=>setTimeout(r,250));
@@ -1129,7 +1595,7 @@ const DataAPI = {
     const r = await fetch(`${CONFIG.API_BASE}/threads/${encodeURIComponent(id)}`, {
       headers:{'Accept':'application/json'}
     });
-    if(!r.ok) throw new Error(await readApiError(r,"Erreur détail "+r.status));
+    if(!r.ok) throw new Error("Erreur détail "+r.status);
     return normalizeClaim(await r.json());
   },
   async sendReply(id,message,status,files){
@@ -1143,39 +1609,7 @@ const DataAPI = {
       opts={method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({body:message,status})};
     }
     const r = await fetch(`${CONFIG.API_BASE}/threads/${encodeURIComponent(id)}/message`,opts);
-    if(!r.ok) throw new Error(await readApiError(r,"Échec de l'envoi ("+r.status+")"));
-    return await r.json();
-  },
-  async fetchIncidents(){
-    if(CONFIG.USE_DEMO_DATA){ await new Promise(r=>setTimeout(r,150)); return null; }
-    const r = await fetch(`${CONFIG.API_BASE}/incidents`, {headers:{'Accept':'application/json'}});
-    if(!r.ok) throw new Error(await readApiError(r,"Erreur incidents "+r.status));
-    return await r.json();
-  },
-  async sendIncidentReply(id,message){
-    if(CONFIG.USE_DEMO_DATA){ await new Promise(r=>setTimeout(r,350)); return {ok:true,mode:'demo'}; }
-    const r = await fetch(`${CONFIG.API_BASE}/incidents/${encodeURIComponent(id)}/message`,{
-      method:'POST',
-      headers:{'Content-Type':'application/json','Accept':'application/json'},
-      body:JSON.stringify({body:message})
-    });
-    if(!r.ok){
-      throw new Error(await readApiError(r,"Échec de l'envoi incident ("+r.status+")"));
-    }
-    return await r.json();
-  },
-  async updateIncidentState(id,state){
-    if(CONFIG.USE_DEMO_DATA){ await new Promise(r=>setTimeout(r,120)); return {ok:true,persisted:false}; }
-    const r = await fetch(`${CONFIG.API_BASE}/incidents/${encodeURIComponent(id)}`,{
-      method:'PATCH',
-      headers:{'Content-Type':'application/json','Accept':'application/json'},
-      body:JSON.stringify({status:state})
-    });
-    if(!r.ok){
-      let msg="Échec de mise à jour incident ("+r.status+")";
-      try{ const j=await r.json(); if(j.error) msg=j.error; }catch(e){}
-      throw new Error(msg);
-    }
+    if(!r.ok) throw new Error("Échec de l'envoi ("+r.status+")");
     return await r.json();
   },
   /* Récupération automatique du suivi auprès du transporteur (via le proxy).
@@ -1186,6 +1620,69 @@ const DataAPI = {
       {headers:{'Accept':'application/json'}});
     if(!r.ok) throw new Error("Suivi indisponible ("+r.status+")");
     return await r.json();   // { status, etaH|eta, events:[{h|at,label}] }
+  },
+  async fetchIncidents(options={}){
+    if(CONFIG.USE_DEMO_DATA){
+      await new Promise(r=>setTimeout(r,150));
+      return INC_SEED.map((r,i)=>normalizeIncident({id:"demo-inc"+i,remote:false,...r}));
+    }
+    const params = new URLSearchParams({
+      cacheTtlMs: String(options.cacheTtlMs || 180000),
+      refreshCooldownMs: String(options.refreshCooldownMs || 60000),
+      providerTimeoutMs: String(options.providerTimeoutMs || 60000),
+      concurrency: String(options.concurrency || 2),
+      enrichDetails: options.enrichDetails ? '1' : '0'
+    });
+    if(options.refresh) params.set('refresh','1');
+    if(options.providers) params.set('providers', options.providers);
+    // Incidents : par défaut on charge tous les incidents ouverts/récents.
+    // Le mode "unanswered" reste disponible explicitement, mais il ne doit plus
+    // vider l'onglet quand Fnac/Darty ne renseigne pas waiting_for_seller_answer.
+    if(options.unanswered || options.onlyUnanswered) params.set('unanswered','1');
+    else params.set('all','1');
+    if(options.includeThreadFallback === false) params.set('includeThreadFallback','0');
+    if(options.days!=null) params.set('days', String(options.days));
+    const r = await fetch(`${CONFIG.API_BASE}/incidents?${params.toString()}`, {headers:{'Accept':'application/json'}});
+    if(!r.ok){
+      let msg = "Erreur incidents "+r.status;
+      try{ msg = await readApiError(r,msg); }catch(e){}
+      throw new Error(msg);
+    }
+    const data = await r.json();
+    console.log("Incidents reçus depuis l'API :", data, "cache=", r.headers.get('X-Incidents-Cache'));
+    return Array.isArray(data) ? data.map(normalizeIncident) : [];
+  },
+  async sendIncidentMessage(id,message,files=[]){
+    if(CONFIG.USE_DEMO_DATA){ await new Promise(r=>setTimeout(r,250)); return {ok:true}; }
+    let opts;
+    if(files&&files.length){
+      const fd=new FormData(); fd.append("body",message);
+      files.forEach(f=>fd.append("attachments",f,f.name));
+      opts={method:'POST',body:fd};
+    }else{
+      opts={method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({body:message})};
+    }
+    const r = await fetch(`${CONFIG.API_BASE}/incidents/${encodeURIComponent(id)}/message`, opts);
+    if(!r.ok){
+      let msg = "Échec envoi incident ("+r.status+")";
+      try{ msg = await readApiError(r,msg); }catch(e){}
+      throw new Error(msg);
+    }
+    return await r.json();
+  },
+  async updateIncident(id,patch={}){
+    if(CONFIG.USE_DEMO_DATA){ await new Promise(r=>setTimeout(r,120)); return {ok:true,persisted:false}; }
+    const r = await fetch(`${CONFIG.API_BASE}/incidents/${encodeURIComponent(id)}`, {
+      method:'PATCH',
+      headers:{'Content-Type':'application/json','Accept':'application/json'},
+      body:JSON.stringify(patch)
+    });
+    if(!r.ok){
+      let msg = "Échec mise à jour incident ("+r.status+")";
+      try{ msg = await readApiError(r,msg); }catch(e){}
+      throw new Error(msg);
+    }
+    return await r.json();
   }
 };
 
@@ -1201,10 +1698,14 @@ const CARRIERS={
   tnt:{label:"TNT",bg:"#ff6600",fg:"#fff",dom:"tnt.com",url:"https://www.tnt.com/express/fr_fr/site/shipping-tools/tracking.html?searchType=con&cons={n}"},
   mondialrelay:{label:"Mondial Relay",bg:"#7a1f8b",fg:"#fff",dom:"mondialrelay.fr",url:"https://www.mondialrelay.fr/suivi-de-colis?numeroExpedition={n}"},
   colisprive:{label:"Colis Privé",bg:"#e2001a",fg:"#fff",dom:"colisprive.fr",url:"https://www.colisprive.fr/moncolis/pages/detailColis.aspx?numColis={n}"},
-  chezvous:{label:"ChezVous",bg:"#00a05a",fg:"#fff",dom:"chezvous.fr",url:"https://www.chezvous.fr/suivi?n={n}"}
+  relaiscolis:{label:"Relais Colis",bg:"#e84e1b",fg:"#fff",dom:"relaiscolis.com",url:"https://www.relaiscolis.com/suivi-colis?numColis={n}"},
+  geodis:{label:"Geodis",bg:"#003b79",fg:"#fff",dom:"geodis.com",url:"https://espace-client.geodis.com/services/destinataires/#/suivi?reference={n}"},
+  chezvous:{label:"C Chez Vous",bg:"#00a05a",fg:"#fff",dom:"cchezvous.fr",url:"https://www.cchezvous.fr/suivi-colis/{n}"},
+  transporteur:{label:"Transporteur",bg:"#6b7689",fg:"#fff",dom:"",url:""}
 };
 const carrierOf=c=>CARRIERS[c]||{label:c||"Transporteur",bg:"#6b7689",fg:"#fff",dom:"",url:""};
 const TSTATUS={
+  inconnu:{label:"Suivi disponible",cls:"ts-unknown",color:"#97a1b3",step:1},
   en_attente:{label:"En préparation",cls:"ts-wait",color:"#97a1b3",step:1},
   en_transit:{label:"En transit",cls:"ts-transit",color:"#d98a07",step:2},
   pret_retrait:{label:"Prêt en point relais",cls:"ts-relay",color:"#6d54c8",step:2},
@@ -1223,7 +1724,7 @@ window.carFallback=function(img,label,bg,fg){const s=document.createElement('spa
 const STEP_COLOR={1:"#97a1b3",2:"#d98a07",3:"#16a472"};   // gris · orange · vert
 function trackBar(t){
   if(!t) return '<span class="meta">—</span>';
-  const ts=TSTATUS[t.status]||TSTATUS.en_transit;
+  const ts=trackingStatusInfo(t);
   const col=STEP_COLOR[ts.step]||"#97a1b3";
   const segs=[1,2,3].map(i=>`<span class="trk-seg" style="${i<=ts.step?`background:${col}`:''}"></span>`).join("");
   return `<span class="trk-bar" title="${ts.label}">${segs}</span>`;
@@ -1299,6 +1800,7 @@ const NOTES=[
 /* ===== Référentiels (couleurs de marque par marketplace) ===== */
 const MP={
   cdiscount:{label:"Cdiscount",bg:"#007ac2",ic:"Cd",dom:"cdiscount.com"},
+  intermarche:{label:"Intermarché",bg:"#E30613",ic:"Im",dom:"intermarche.com"},
   fnac:{label:"Fnac",bg:"#E9A100",ic:"Fn",dom:"fnac.com"},
   darty:{label:"Darty",bg:"#E2001A",ic:"Da",dom:"darty.com"},
   carrefour:{label:"Carrefour",bg:"#004E9F",ic:"Cf",dom:"carrefour.fr"},
@@ -1313,32 +1815,57 @@ const MP={
   castorama:{label:"Castorama",bg:"#0072CE",ic:"Cs",dom:"castorama.fr"},
   auchan:{label:"Auchan",bg:"#D71920",ic:"Au",dom:"auchan.fr"}
 };
-const mpOf=c=>MP[c]||{label:c,bg:"#6b7689",ic:"?",dom:""};
+const MARKETPLACE_CODE_BY_ID={
+  "3":"fnac",
+  "4":"darty",
+  "6":"intermarche",
+  "5":"conforama",
+  "7":"ubaldi",
+  "9":"leclerc",
+  "8":"rueducommerce",
+  "19":"leroymerlin",
+  "21":"auchan",
+  "20":"castorama",
+  "18":"cultura",
+  "16":"carrefour",
+  "15":"boulanger",
+  "14":"but"
+};
+function mpCode(code){ return MARKETPLACE_CODE_BY_ID[String(code||"").trim()] || String(code||"").trim(); }
+const mpOf=c=>MP[mpCode(c)]||{label:c,bg:"#6b7689",ic:"?",dom:""};
 /* Logo de la marketplace (favicon officiel) avec repli sur l'initiale colorée */
 function mpMark(code){const mp=mpOf(code);
   return mp.dom
     ? `<img class="mp-logo" src="https://www.google.com/s2/favicons?domain=${mp.dom}&sz=64" alt="${mp.label}" onerror="mpFallback(this,'${mp.ic}','${mp.bg}')">`
     : `<span class="mp-ic" style="background:${mp.bg}">${mp.ic}</span>`;}
 function mpBadge(code){return `<span class="mp">${mpMark(code)}${mpOf(code).label}</span>`;}
-/* URL des back-offices vendeur (ouvrir la commande). {n} = n° de commande.
-   ⚠ Modèles à confirmer (URLs réelles derrière connexion vendeur). */
+/* URL des back-offices vendeur (ouvrir la commande).
+   Modèles issus de la table TK marketplace fournie.
+   Placeholders acceptés : {COMMANDE}, {NUM_COMMANDE} et ancien {n}. */
 const BO_URL={
+  // Non fourni dans la table : on conserve l'ancien lien Cdiscount comme repli.
   cdiscount:"https://seller.cdiscount.com/orders?ref={n}",
-  fnac:"https://mp.fnac.com/vendre/pro/orders/{n}",
-  darty:"https://seller.fnacdarty.com/vendre/pro/orders/{n}",
-  carrefour:"https://carrefour.mirakl.net/mmp/shop/order/{n}",
-  leroymerlin:"https://leroymerlin.mirakl.net/mmp/shop/order/{n}",
-  boulanger:"https://boulanger.mirakl.net/mmp/shop/order/{n}",
-  leclerc:"https://leclerc.mirakl.net/mmp/shop/order/{n}",
-  but:"https://but.mirakl.net/mmp/shop/order/{n}",
-  cultura:"https://cultura.mirakl.net/mmp/shop/order/{n}",
-  conforama:"https://conforama.mirakl.net/mmp/shop/order/{n}",
-  ubaldi:"https://ubaldi.mirakl.net/mmp/shop/order/{n}",
-  rueducommerce:"https://rueducommerce.mirakl.net/mmp/shop/order/{n}",
-  castorama:"https://castorama.mirakl.net/mmp/shop/order/{n}",
-  auchan:"https://auchan.mirakl.net/mmp/shop/order/{n}"
+  fnac:"https://mp.fnac.com/compte/vendeur/commande/{COMMANDE}",
+  darty:"https://seller.fnacdarty.com/compte/vendeur/commande/{NUM_COMMANDE}",
+  intermarche:"https://intermarche-prod.mirakl.net/mmp/shop/order/{COMMANDE}/message",
+  conforama:"https://conforama-prod.mirakl.net/mmp/shop/order/{NUM_COMMANDE}",
+  ubaldi:"https://ubaldi-prod.mirakl.net/mmp/shop/order/{NUM_COMMANDE}",
+  leclerc:"https://leclerc-prod.mirakl.net/mmp/shop/order/{NUM_COMMANDE}",
+  rueducommerce:"https://mirakl-web.groupe-rueducommerce.fr/mmp/shop/order/{NUM_COMMANDE}",
+  leroymerlin:"https://adeo-marketplace.mirakl.net/mmp/shop/order/{NUM_COMMANDE}",
+  auchan:"https://bo.mkp.auchan.net/mmp/shop/order/{NUM_COMMANDE}",
+  castorama:"https://marketplace.castorama.fr/mmp/shop/order/{NUM_COMMANDE}",
+  cultura:"https://culturafr-prod.mirakl.net/mmp/shop/order/{NUM_COMMANDE}",
+  carrefour:"https://carrefourfr.mirakl.net/mmp/shop/order/{NUM_COMMANDE}",
+  boulanger:"https://merchant.boulanger.com/mmp/shop/order/{NUM_COMMANDE}",
+  but:"https://but-prod.mirakl.net/mmp/shop/order/{NUM_COMMANDE}"
 };
-function boLink(code,orderId){ const u=BO_URL[code]; return (u&&orderId)?u.replace("{n}",encodeURIComponent(orderId)):""; }
+function boLink(code,orderId){
+  const key=mpCode(code);
+  const u=BO_URL[key];
+  const n=String(orderId||"").trim();
+  return (u&&n)?u.replace(/\{(?:n|COMMANDE|NUM_COMMANDE)\}/g, encodeURIComponent(n)):"";
+}
 /* Badge marketplace cliquable -> ouvre la commande dans le back-office */
 function mpBadgeLink(code,orderId){
   const url=boLink(code,orderId), badge=mpBadge(code);
@@ -1350,7 +1877,7 @@ function mpMarkLink(code,orderId){
   return url?`<a class="mp-link" href="${url}" target="_blank" rel="noopener" title="Ouvrir la commande dans le back-office ${mpOf(code).label}">${mark}</a>`:mark;
 }
 window.mpFallback=function(img,ic,bg){const s=document.createElement('span');s.className='mp-ic';s.textContent=ic;s.style.background=bg;img.replaceWith(s);};
-const STATUS={nouveau:{label:"Nouveau",cls:"st-nouveau",color:"#dc3a40"},encours:{label:"En cours",cls:"st-encours",color:"#d98a07"},
+const STATUS={nouveau:{label:"Nouveau",cls:"st-nouveau",color:"#dc3a40"},repondu:{label:"Répondu",cls:"st-repondu",color:"#0C3C6C"},encours:{label:"En cours",cls:"st-encours",color:"#d98a07"},
   attente:{label:"En attente",cls:"st-attente",color:"#6d54c8"},resolu:{label:"Résolu",cls:"st-resolu",color:"#16a472"}};
 const PRIO={haute:{label:"Haute",cls:"prio-haute"},moyenne:{label:"Moyenne",cls:"prio-moyenne"},basse:{label:"Basse",cls:"prio-basse"}};
 const CANNED="Bonjour,\n\nMerci pour votre message et désolé pour la gêne occasionnée. Nous prenons en charge votre demande et revenons vers vous dans les plus brefs délais.\n\nBien cordialement,\nLe service client 2KINGS";
@@ -1360,19 +1887,41 @@ const USERS=["Claude","Sandy","Guillaume"];
 let currentUser="Guillaume";   // utilisateur courant (modifiable via le sélecteur)
 
 let claims=[], sort={key:"updatedAt",dir:-1}, selectedId=null; // défaut : du plus récent au plus ancien
+let notesLoading=false, notesLoaded=CONFIG.USE_DEMO_DATA;
 const RECLAM_PER_PAGE=25; let reclamPage=1;                    // pagination des réclamations (25/page)
-function answered(c){ const m=c.messages; return !!(m && m.length && m[m.length-1].from==="seller"); }  // dernière réponse = vendeur
-function everReplied(c){ return (c.messages||[]).some(m=>m.from==="seller"); }  // a-t-on déjà répondu au moins une fois ?
-/* Badge de statut : "Nouveau" uniquement si on n'a jamais répondu au client */
+function answered(c){ const m=(c&&c.messages)||[]; return !!(m.length && m[m.length-1].from==="seller"); }  // traitée = dernier message vendeur
+function everReplied(c){ return ((c&&c.messages)||[]).some(m=>m.from==="seller"); }  // a-t-on déjà répondu au moins une fois ?
+function foldUiStatusText(v){ return String(v||"").normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().trim(); }
+function isClosedUiStatus(raw){
+  const s=foldUiStatusText(raw);
+  if(!s) return false;
+  return /\b(closed|close|cloture|cloturee|resolved|resolu|resolue|termine|terminee|terminated|done|complete|completed|archive|archived|annule|annulee|cancelled|canceled)\b/.test(s);
+}
+function isMarketplaceClosed(c){
+  if(!c) return false;
+  if(c.status==="resolu") return true;
+  const ctx=c._ctx||c.ctx||{};
+  return ctx.closedByMarketplace===true || [c.marketplaceStatus,c.statusRaw,ctx.marketplaceStatus,ctx.rawStatus].some(isClosedUiStatus);
+}
+function businessStatus(c){
+  if(isMarketplaceClosed(c)) return "resolu";
+  const m=((c&&c.messages)||[]).filter(x=>x && (x.from==="client" || x.from==="seller"));
+  const last=m[m.length-1];
+  const hasSeller=m.some(x=>x.from==="seller");
+  // Métier 2KINGS : si le client relance après une première réponse, ce n'est plus "Nouveau" mais "Répondu".
+  if(last && last.from==="client") return hasSeller ? "repondu" : "nouveau";
+  // Dernier message vendeur : on attend un retour client / marketplace, donc ce n'est pas à traiter.
+  if(last && last.from==="seller") return "attente";
+  return hasSeller ? "attente" : "nouveau";
+}
+function needsReply(c){ const s=businessStatus(c); return s==="nouveau" || s==="repondu"; }
+/* Badge de statut : la marketplace garde la priorité pour clôturer, OPEN reste un état technique d'ouverture. */
 function statusBadge(c){
-  const raw=(c.marketplaceStatus||c.statusRaw||"").toString().trim();
-  const st=STATUS[c.status]||STATUS.nouveau;
-  // Quand l'API fournit un statut, on l'affiche tel quel afin de rester aligné avec la marketplace.
-  if(raw && !/^(nouveau|encours|en cours|attente|resolu|résolu)$/i.test(raw)){
-    return `<span class="st ${st.cls}" title="Statut marketplace">${esc(raw)}</span>`;
-  }
-  if(c.status==="resolu") return `<span class="st st-resolu">${esc(raw||"Résolu")}</span>`;
-  return `<span class="st ${st.cls}">${esc(raw||st.label)}</span>`;
+  const ui=businessStatus(c);
+  const st=STATUS[ui]||STATUS.nouveau;
+  const raw=(c&&((c.marketplaceStatus||c.statusRaw||"").toString().trim()))||"";
+  const title=raw && foldUiStatusText(raw)!==foldUiStatusText(st.label) ? ` title="Statut marketplace : ${esc(raw)}"` : "";
+  return `<span class="st ${st.cls}"${title}>${st.label}</span>`;
 }
 /* Dernier agent ayant répondu (auteur du dernier message vendeur) */
 function lastAgent(c){ const m=c.messages||[]; for(let i=m.length-1;i>=0;i--){ if(m[i].from==="seller") return m[i].author||"Agent"; } return null; }
@@ -1453,7 +2002,7 @@ function _refreshFlagViews(){
 }
 const $=s=>document.querySelector(s);
 const fmtAgo=ts=>{const d=(now-ts)/H; if(d<1)return Math.max(1,Math.round(d*60))+" min"; if(d<24)return Math.round(d)+" h"; return Math.round(d/24)+" j";};
-function slaInfo(c){ if(c.status==="resolu")return{cls:"sla-ok",txt:"—",hours:9999};
+function slaInfo(c){ if(isMarketplaceClosed(c))return{cls:"sla-ok",txt:"—",hours:9999};
   const h=(c.dueAt-now)/H;
   if(h<=CONFIG.SLA_LATE)return{cls:"sla-late",txt:"Retard "+Math.abs(Math.round(h))+" h",hours:h};
   if(h<=CONFIG.SLA_SOON)return{cls:"sla-soon",txt:"Dans "+Math.round(h)+" h",hours:h};
@@ -1574,11 +2123,11 @@ function renderTreat(){
   // Le filtre « À traiter / Traitées / Toutes » est géré par applyFilters().
   const list=applyFilters().filter(c=>effNiveau(c)!==1);
   $("#treatList").innerHTML = list.length ? list.map(c=>{
-    const st=STATUS[c.status];
+    const st=STATUS[businessStatus(c)];
     return `<div class="tl-item ${c.id===treatSelectedId?'sel':''}" data-id="${c.id}">
       <div class="tl-top">${mpBadge(c.marketplace)}<span style="display:flex;gap:5px;align-items:center"><span class="tl-niv">N${effNiveau(c)}</span>${euroBadge(c)}${cacaBadge(c)}${agentAvatar(lastAgent(c))}</span></div>
-      <div class="tl-sub">${c.subject}</div>
-      <div class="tl-meta">${c.customer} · ${statusBadge(c)} · ${c.orderId}${lastClientAt(c)?` · 📅 ${fmtDate(lastClientAt(c))}`:""}</div>
+      <div class="tl-sub">${esc(c.subject)}</div>
+      <div class="tl-meta">${esc(c.customer)} · ${statusBadge(c)} · ${esc(c.orderId)}${lastClientAt(c)?` · 📅 ${fmtDate(lastClientAt(c))}`:""}</div>
     </div>`;}).join("") : '<div class="empty">Aucune réclamation.</div>';
   $("#treatList").querySelectorAll(".tl-item").forEach(it=>it.onclick=()=>selectTreat(it.dataset.id));
   if(!list.find(c=>c.id===treatSelectedId)) treatSelectedId = list.length?list[0].id:null;
@@ -1589,8 +2138,8 @@ function selectTreat(id){ treatSelectedId=id; treatFiles=[]; renderTreat(); }
 function trackHeader(c){
   const t=c.tracking;
   if(!t) return `<div class="td-track td-track-none">📦 Aucun suivi de livraison rattaché à cette commande.</div>`;
-  const car=carrierOf(t.carrier), ts=TSTATUS[t.status]||{label:t.status,cls:"ts-wait"};
-  const url=car.url?car.url.replace("{n}",encodeURIComponent(t.number)):"";
+  const car=carrierOf(t.carrier), ts=trackingStatusInfo(t);
+  const url=trackingExternalUrl(t);
   return `<div class="td-track">📦
     <span class="carrier-badge" style="background:${car.bg};color:${car.fg}">${car.label}</span>
     <span class="ordref" id="trackNum">${t.number}</span>
@@ -1602,14 +2151,14 @@ function trackHeader(c){
 function renderTreatDetail(c){
   const box=$("#treatDetail");
   if(!c){ box.innerHTML='<div class="td-empty">Sélectionnez une réclamation à gauche.</div>'; return; }
-  const st=STATUS[c.status],pr=PRIO[c.priority],sla=slaInfo(c);
+  const st=STATUS[businessStatus(c)],pr=PRIO[c.priority],sla=slaInfo(c);
   const conv=c.messages.map(m=>{
     const att=(m.attachments&&m.attachments.length)?`<div class="bubble-attach">${m.attachments.map(a=>renderAttachment(a)).join("")}</div>`:"";
-    return `<div class="bubble ${m.from}"><div class="who">${m.from==="client"?c.customer:("2KINGS — "+(m.author||"Agent"))}</div><div>${m.text}</div>${att}<div class="t">il y a ${fmtAgo(m.at)}</div></div>`;}).join("");
+    return `<div class="bubble ${m.from}"><div class="who">${m.from==="client"?esc(c.customer||"Client"):("2KINGS — "+esc(m.author||"Agent"))}</div><div class="msg-text">${messageHtml(m.text)}</div>${att}<div class="t">il y a ${fmtAgo(m.at)}</div></div>`;}).join("");
   box.innerHTML=`
     <div class="td-head">
-      <h3><span class="subj-mp">${mpMarkLink(c.marketplace,c.orderId)}</span> ${c.subject} <span class="subj-ord ordref" data-lbl="N° de commande">${c.orderId}</span> <span class="subj-date" title="Date de commande">📅 ${fmtDate(createdAt(c))}</span></h3>
-      <div class="meta">${c.customer} · ${c.product}${c.ean?` <span class="ordref" data-lbl="Code EAN">${c.ean}</span>`:""}</div>
+      <h3><span class="subj-mp">${mpMarkLink(c.marketplace,c.orderId)}</span> ${esc(c.subject)} <span class="subj-ord ordref" data-lbl="N° de commande">${c.orderId}</span> <span class="subj-date" title="Date de commande">📅 ${fmtDate(createdAt(c))}</span></h3>
+      <div class="meta">${esc(c.customer)} · ${esc(c.product)}${c.ean?` <span class="ordref" data-lbl="Code EAN">${c.ean}</span>`:""}</div>
       <div class="tags">${statusBadge(c)} ${niveauSelector(c)}${euroFields(c)}</div>
       ${trackHeader(c)}
     </div>
@@ -1628,7 +2177,7 @@ function renderTreatDetail(c){
       </div>
     </div>`;
   bindTracking(c); bindNiveau(box); bindEuroFields(box);
-  $("#tStatus").value=c.status;
+  $("#tStatus").value=businessStatus(c)==="resolu"?"resolu":"nouveau";
   box.querySelectorAll(".td-head .ordref").forEach(el=>el.onclick=e=>copyCode(e,el,el.dataset.lbl||"Valeur"));
   box.querySelectorAll(".mp-link").forEach(a=>a.addEventListener("click",e=>e.stopPropagation()));
   $("#tCanned").onclick=e=>openReplyPicker(e.currentTarget,"tReply",c);
@@ -1743,7 +2292,7 @@ let claudeSelectedId=null, claudeFiles=[];
 
 function updateClaudeCount(){
   const el=$("#claudeCount"); if(!el)return;
-  const n=claims.filter(c=>effNiveau(c)===1 && !answered(c) && c.status!=="resolu").length;
+  const n=claims.filter(c=>effNiveau(c)===1 && needsReply(c)).length;
   el.textContent=n; el.classList.toggle("zero",n===0);
 }
 function renderClaude(){
@@ -1754,8 +2303,8 @@ function renderClaude(){
     const cs=claudeState(c);
     return `<div class="tl-item ${c.id===claudeSelectedId?'sel':''} ${cs==='faite'?'done':''}" data-id="${c.id}">
       <div class="tl-top">${mpBadge(c.marketplace)}<span style="display:flex;gap:5px;align-items:center"><span class="tl-niv">N${effNiveau(c)}</span><span class="cstate cs-${cs}">${CSTATE_LABEL[cs]}</span>${euroBadge(c)}${cacaBadge(c)}${agentAvatar(lastAgent(c))}</span></div>
-      <div class="tl-sub">${c.subject}</div>
-      <div class="tl-meta">${c.customer} · ${c.orderId} · ${TYPO_MAP[typologyOf(c)]?TYPO_MAP[typologyOf(c)].label:typologyOf(c)}${lastClientAt(c)?` · 📅 ${fmtDate(lastClientAt(c))}`:""}</div>
+      <div class="tl-sub">${esc(c.subject)}</div>
+      <div class="tl-meta">${esc(c.customer)} · ${esc(c.orderId)} · ${TYPO_MAP[typologyOf(c)]?TYPO_MAP[typologyOf(c)].label:typologyOf(c)}${lastClientAt(c)?` · 📅 ${fmtDate(lastClientAt(c))}`:""}</div>
     </div>`;}).join("") : '<div class="empty">Aucune réclamation Niveau 1.</div>';
   $("#claudeList").querySelectorAll(".tl-item").forEach(it=>it.onclick=()=>selectClaude(it.dataset.id));
   if(!list.find(c=>c.id===claudeSelectedId)) claudeSelectedId = list.length?list[0].id:null;
@@ -1765,14 +2314,14 @@ function selectClaude(id){ claudeSelectedId=id; claudeFiles=[]; renderClaude(); 
 function renderClaudeDetail(c){
   const box=$("#claudeDetail");
   if(!c){ box.innerHTML='<div class="td-empty">Aucune réclamation à afficher.</div>'; return; }
-  const st=STATUS[c.status],sla=slaInfo(c),cs=claudeState(c),draft=claudeDraft(c);
+  const st=STATUS[businessStatus(c)],sla=slaInfo(c),cs=claudeState(c),draft=claudeDraft(c);
   const conv=c.messages.map(m=>{
     const att=(m.attachments&&m.attachments.length)?`<div class="bubble-attach">${m.attachments.map(a=>renderAttachment(a)).join("")}</div>`:"";
-    return `<div class="bubble ${m.from}"><div class="who">${m.from==="client"?c.customer:("2KINGS — "+(m.author||"Agent"))}</div><div>${m.text}</div>${att}<div class="t">il y a ${fmtAgo(m.at)}</div></div>`;}).join("");
+    return `<div class="bubble ${m.from}"><div class="who">${m.from==="client"?esc(c.customer||"Client"):("2KINGS — "+esc(m.author||"Agent"))}</div><div class="msg-text">${messageHtml(m.text)}</div>${att}<div class="t">il y a ${fmtAgo(m.at)}</div></div>`;}).join("");
   box.innerHTML=`
     <div class="td-head">
-      <h3><span class="subj-mp">${mpMarkLink(c.marketplace,c.orderId)}</span> ${c.subject} <span class="subj-ord ordref" data-lbl="N° de commande">${c.orderId}</span> <span class="subj-date" title="Date de commande">📅 ${fmtDate(createdAt(c))}</span></h3>
-      <div class="meta">${c.customer} · ${c.product}${c.ean?` <span class="ordref" data-lbl="Code EAN">${c.ean}</span>`:""}</div>
+      <h3><span class="subj-mp">${mpMarkLink(c.marketplace,c.orderId)}</span> ${esc(c.subject)} <span class="subj-ord ordref" data-lbl="N° de commande">${c.orderId}</span> <span class="subj-date" title="Date de commande">📅 ${fmtDate(createdAt(c))}</span></h3>
+      <div class="meta">${esc(c.customer)} · ${esc(c.product)}${c.ean?` <span class="ordref" data-lbl="Code EAN">${c.ean}</span>`:""}</div>
       <div class="tags">${statusBadge(c)} ${niveauSelector(c)} <span class="cstate cs-${cs}">${CSTATE_LABEL[cs]}</span>${euroFields(c)}</div>
       ${trackHeader(c)}
     </div>
@@ -1909,57 +2458,57 @@ const INC_SEED=[
   {openedAt:"2026-05-31T16:22",openedBy:"client",state:"en_cours",motif:"non_recu",orderId:"F905NL72799-A",orderAt:"2026-05-21T05:00",channel:"fnac",product:"Sans Fil DeathAdder V2 X HyperSpeed",sku:"000000009000699175",total:63.63,customer:"IMAN EL AAFIF",msgs:13,lastBy:"boutique",lastAt:"2026-06-11T12:49"}
 ];
 let INCIDENTS=[];
-let incidentsFromApi=false;
-function initDemoIncidents(){
-  let stored=null; try{stored=JSON.parse(localStorage.getItem("incidents_v2")||"null");}catch(e){stored=null;}
-  INCIDENTS=Array.isArray(stored)?stored:INC_SEED.map((r,i)=>Object.assign({id:"inc"+i},r));
+let INC_LOCAL=[];
+let INC_OVERRIDES={};
+let incidentsLoaded=false;
+let incidentsLoading=false;
+try{ INC_LOCAL=JSON.parse(localStorage.getItem("incidents_local_v19")||"[]")||[]; }catch(e){ INC_LOCAL=[]; }
+try{ INC_OVERRIDES=JSON.parse(localStorage.getItem("incident_status_overrides_v17")||"{}")||{}; }catch(e){ INC_OVERRIDES={}; }
+if(CONFIG.USE_DEMO_DATA){ INCIDENTS=INC_SEED.map((r,i)=>normalizeIncident({id:"demo-inc"+i,remote:false,...r})); }
+function saveIncidents(){ try{localStorage.setItem("incidents_local_v19",JSON.stringify(INC_LOCAL));}catch(e){} }
+function saveIncidentOverrides(){ try{localStorage.setItem("incident_status_overrides_v17",JSON.stringify(INC_OVERRIDES));}catch(e){} }
+function applyIncidentOverride(row){
+  const r=normalizeIncident(row);
+  if(r.remote && INC_OVERRIDES[r.id]) r.state=INC_OVERRIDES[r.id];
+  return r;
 }
-if(CONFIG.USE_DEMO_DATA) initDemoIncidents();
-function saveIncidents(){ if(!CONFIG.USE_DEMO_DATA && incidentsFromApi) return; try{localStorage.setItem("incidents_v2",JSON.stringify(INCIDENTS));}catch(e){} }
-function incOptions(map,sel){ return Object.entries(map).map(([k,v])=>`<option value="${k}"${k===sel?" selected":""}>${v}</option>`).join(""); }
-function normalizeIncidentRow(r){
-  const ctx=r._ctx||r.ctx||{};
-  const conv=Array.isArray(r.conv)?r.conv:normalizeClaimMessages(r.messages).map(m=>({at:m.at,by:m.from==='client'?'client':'boutique',text:m.text}));
-  const orderId=r.orderId||r.order_id||ctx.orderId||frontDeepText(r,['orderId','order_id','order_fnac_id','fnac_order_id','order_reference','order_number','order']);
-  const product=r.product||ctx.product||frontDeepText(r,['product','product_name','product_label','offer_seller_id','offer_fnac_id','sku','ean']);
-  const customer=(r.customer&&r.customer!=='Client')?r.customer:(ctx.customer||frontDeepText(r,['customer','customer_name','buyer','buyer_name','client','client_name'])||'Client');
-  return {
-    id:r.id||r.claimId||"inc"+Math.random().toString(36).slice(2),
-    claimId:r.claimId||r.id||"",
-    remote:!!r.remote,
-    canReply:r.canReply!==false,
-    replyMode:r.replyMode||"",
-    openedAt:r.openedAt||new Date().toISOString().slice(0,16),
-    openedBy:r.openedBy||"client",
-    state:r.state||"en_cours",
-    motif:r.motif||"autre",
-    orderId,
-    orderAt:r.orderAt||r.openedAt||"",
-    channel:r.channel||r.marketplace||ctx.marketplace||"",
-    product,
-    sku:r.sku||r.ean||ctx.ean||ctx.orderDetailId||"",
-    total:r.total??ctx.total??null,
-    customer,
-    msgs:Number(r.msgs ?? conv.length)||0,
-    lastBy:r.lastBy||((conv.length&&conv.at(-1)?.by)||"client"),
-    lastAt:r.lastAt||r.openedAt||"",
-    conv
-  };
+function mergeIncidentRows(remoteRows=[], localRows=INC_LOCAL){
+  const out=[]; const seen=new Set();
+  remoteRows.map(applyIncidentOverride).forEach(r=>{ if(!seen.has(r.id)){seen.add(r.id);out.push(r);} });
+  localRows.map(r=>normalizeIncident({...r,remote:false})).forEach(r=>{ if(!seen.has(r.id)){seen.add(r.id);out.push(r);} });
+  return out.sort((a,b)=>String(b.openedAt||"").localeCompare(String(a.openedAt||"")));
 }
-async function refreshIncidents(){
-  if(CONFIG.USE_DEMO_DATA){ renderIncidents(); updateIncCount(); return; }
-  const badge=$("#incBadge"); if(badge) badge.textContent="…";
+function setIncLoadState(text,isError=false){
+  const el=$("#incLoadState");
+  if(el){ el.textContent=text; el.style.color=isError?"var(--red)":""; }
+}
+async function loadIncidents(options={}){
+  if(CONFIG.USE_DEMO_DATA){ renderIncidents(); updateIncCount(); return INCIDENTS; }
+  if(incidentsLoading && !options.refresh) return INCIDENTS;
+  incidentsLoading=true;
+  const btn=$("#ifRefresh");
+  if(btn){ btn.disabled=true; btn.textContent="↻ Chargement…"; }
+  setIncLoadState("(chargement...)");
   try{
-    const rows=await DataAPI.fetchIncidents();
-    INCIDENTS=(rows||[]).map(normalizeIncidentRow);
-    incidentsFromApi=true; incPage=1;
+    const remote = await DataAPI.fetchIncidents({providerTimeoutMs:60000, providers:"fnac,darty", ...options});
+    INCIDENTS = mergeIncidentRows(remote, INC_LOCAL);
+    incidentsLoaded=true;
+    setIncLoadState(`(${remote.length} depuis marketplace${INC_LOCAL.length?`, ${INC_LOCAL.length} local(aux)`:""})`);
     renderIncidents(); updateIncCount();
+    return INCIDENTS;
   }catch(e){
-    incidentsFromApi=false;
-    toast("Incidents indisponibles : "+e.message,true);
+    console.warn("Chargement incidents impossible", e);
+    INCIDENTS = mergeIncidentRows([], INC_LOCAL);
+    setIncLoadState("(API incidents indisponible)", true);
     renderIncidents(); updateIncCount();
+    toast("Incidents indisponibles : "+e.message, true);
+    return INCIDENTS;
+  }finally{
+    incidentsLoading=false;
+    if(btn){ btn.disabled=false; btn.textContent="↻ Actualiser incidents"; }
   }
 }
+function incOptions(map,sel){ return Object.entries(map).map(([k,v])=>`<option value="${k}"${k===sel?" selected":""}>${v}</option>`).join(""); }
 function incDT(s){ if(!s) return "—"; const d=new Date(s); if(isNaN(d)) return s;
   return d.toLocaleDateString('fr-FR',{day:'numeric',month:'long',year:'numeric'})+' à '+String(d.getHours()).padStart(2,"0")+':'+String(d.getMinutes()).padStart(2,"0"); }
 function updateIncCount(){ const el=$("#incBadge"); if(!el)return; const n=INCIDENTS.filter(x=>x.state==="en_cours").length; el.textContent=n; el.classList.toggle("zero",n===0); }
@@ -1967,49 +2516,55 @@ function renderIncidents(){
   if(!$("#incBody")) return;
   const q=($("#ifSearch").value||"").trim().toLowerCase(), fmo=$("#ifMotif").value, fs=$("#ifState").value, fmp=$("#ifMp").value;
   let list=INCIDENTS.filter(r=>{
-    if(r.state==="clos") return false;   // clôturé sur la marketplace -> retiré du listing
+    if(r.state==="clos") return false;
     if(fmo && r.motif!==fmo) return false;
     if(fs && r.state!==fs) return false;
     if(fmp && r.channel!==fmp) return false;
     if(q && !(((r.customer||"")+" "+(r.orderId||"")+" "+(r.product||"")+" "+(r.sku||"")).toLowerCase().includes(q))) return false;
     return true;});
-  const ord={en_cours:0,clos:1,resolu:2};
+  const ord={en_cours:0,resolu:1,clos:2};
   list.sort((a,b)=>(ord[a.state]-ord[b.state])||((b.openedAt||"").localeCompare(a.openedAt||"")));
   $("#incEmpty").style.display=list.length?"none":"block";
+  $("#incEmpty").textContent = incidentsLoading ? "Chargement des incidents…" : (incidentsLoaded ? "Aucun incident." : "Aucun incident chargé. Cliquez sur Actualiser incidents.");
   const totalPages=Math.max(1,Math.ceil(list.length/INC_PER_PAGE));
   if(incPage>totalPages) incPage=totalPages;
   const page=list.slice((incPage-1)*INC_PER_PAGE, incPage*INC_PER_PAGE);
-  $("#incBody").innerHTML=page.map(r=>`<tr data-id="${r.id}">
-    <td><div class="inc-main">${incDT(r.openedAt)}</div><div class="inc-sub">${INC_BY[r.openedBy]||""}</div></td>
-    <td><select class="rcell inc-state ${INC_STATE_CLS[r.state]||''}" data-id="${r.id}" data-f="state">${incOptions(INC_STATES,r.state)}</select></td>
+  $("#incBody").innerHTML=page.map(r=>`<tr data-id="${esc(r.id)}" class="${r.remote?'inc-remote':'inc-local'}">
+    <td><div class="inc-main">${incDT(r.openedAt)}</div><div class="inc-sub">${INC_BY[r.openedBy]||""}${r.remote?" · marketplace":" · local"}</div></td>
+    <td><select class="rcell inc-state ${INC_STATE_CLS[r.state]||''}" data-id="${esc(r.id)}" data-f="state">${incOptions(INC_STATES,r.state)}</select></td>
     <td>${esc(INC_MOTIFS[r.motif]||r.motif||'—')}</td>
     <td><div class="inc-main"><span class="ordref" data-lbl="N° de commande">${esc(r.orderId||'—')}</span></div><div class="inc-sub">${incDT(r.orderAt)}</div></td>
     <td>${mpBadge(r.channel)}</td>
-    <td><div class="inc-prod"><div class="inc-main">1 x ${esc(r.product||'')}</div><div class="inc-sub">SKU : ${esc(r.sku||'—')}</div></div></td>
-    <td class="td-num">${r.total!=null?Number(r.total).toFixed(2).replace('.',',')+' €':'—'}</td>
+    <td><div class="inc-prod"><div class="inc-main">${esc(r.product||'')}</div><div class="inc-sub">SKU : ${esc(r.sku||'—')}</div></div></td>
+    <td class="td-num">${r.total!=null && Number.isFinite(Number(r.total))?Number(r.total).toFixed(2).replace('.',',')+' €':'—'}</td>
     <td>${esc(r.customer||'')}</td>
     <td class="inc-msg">${r.msgs||0} message${(r.msgs||0)>1?'s':''}</td>
     <td><div class="inc-main">Message</div><div class="inc-sub">${INC_BY[r.lastBy]||""} · ${incDT(r.lastAt)}</div></td>
-    <td><button class="rm-row" data-id="${r.id}" title="Supprimer">🗑</button></td>
+    <td><button class="rm-row" data-id="${esc(r.id)}" title="Supprimer ${r.remote?'le masquage local':'la ligne locale'}">🗑</button></td>
   </tr>`).join("");
   $("#incBody").querySelectorAll("select[data-f]").forEach(el=>el.addEventListener("change",async()=>{
     const r=INCIDENTS.find(x=>x.id===el.dataset.id); if(!r)return;
-    const old=r[el.dataset.f];
-    r[el.dataset.f]=el.value; renderIncidents(); updateIncCount();
-    try{
-      if(r.remote && el.dataset.f==="state") {
-        const res=await DataAPI.updateIncidentState(r.id,el.value);
-        if(res && res.persisted===false) toast("Statut modifié dans l'interface ; clôture marketplace non disponible via l'API actuelle.");
-      } else saveIncidents();
-    }catch(e){
-      r[el.dataset.f]=old; renderIncidents(); updateIncCount(); toast("Statut incident : "+e.message,true);
+    const prev=r.state; const next=el.value;
+    r.state=next;
+    if(r.remote){ INC_OVERRIDES[r.id]=next; saveIncidentOverrides(); }
+    else{ const l=INC_LOCAL.find(x=>x.id===r.id); if(l) l.state=next; saveIncidents(); }
+    renderIncidents(); updateIncCount();
+    if(r.remote){
+      try{
+        const res=await DataAPI.updateIncident(r.id,{status:next,state:next});
+        toast(res && res.persisted ? "Statut incident mis à jour sur la marketplace" : "Statut incident mémorisé localement");
+      }catch(e){
+        r.state=prev; INC_OVERRIDES[r.id]=prev; saveIncidentOverrides(); renderIncidents(); updateIncCount();
+        toast("Statut incident non modifié : "+e.message,true);
+      }
     }
   }));
   $("#incBody").querySelectorAll(".ordref").forEach(el=>el.onclick=e=>copyCode(e,el,el.dataset.lbl||"Valeur"));
   $("#incBody").querySelectorAll(".rm-row").forEach(b=>b.onclick=()=>{
     const r=INCIDENTS.find(x=>x.id===b.dataset.id);
-    if(r?.remote){ toast("Suppression locale désactivée pour un incident marketplace.",true); return; }
-    INCIDENTS=INCIDENTS.filter(x=>x.id!==b.dataset.id);saveIncidents();renderIncidents();updateIncCount();toast("Incident supprimé");
+    if(r?.remote){ INC_OVERRIDES[r.id]="clos"; saveIncidentOverrides(); }
+    else{ INC_LOCAL=INC_LOCAL.filter(x=>x.id!==b.dataset.id); saveIncidents(); }
+    INCIDENTS=INCIDENTS.filter(x=>x.id!==b.dataset.id); renderIncidents(); updateIncCount(); toast(r?.remote?"Incident masqué localement":"Incident local supprimé");
   });
   $("#incBody").querySelectorAll("tr[data-id]").forEach(tr=>tr.addEventListener("click",e=>{
     if(e.target.closest("select,button,.ordref")) return;
@@ -2024,58 +2579,68 @@ function renderIncidents(){
     +`<button data-go="${incPage+1}" ${incPage>=totalPages?"disabled":""}>›</button>`;
   pg.querySelectorAll("button[data-go]").forEach(b=>b.onclick=()=>{const g=+b.dataset.go;if(g>=1&&g<=totalPages&&g!==incPage){incPage=g;renderIncidents();}});
 }
+
 function fillIncFilters(){
   const mo=$("#ifMotif"); if(mo&&mo.options.length<=1){ Object.entries(INC_MOTIFS).forEach(([k,v])=>{const o=document.createElement("option");o.value=k;o.textContent=v;mo.appendChild(o);}); }
   const mp=$("#ifMp"); if(mp&&mp.options.length<=1){ CONFIG.OPERATORS.forEach(o=>{const op=document.createElement("option");op.value=o.code;op.textContent=o.label;mp.appendChild(op);}); }
 }
 function addIncident(){
-  if(!CONFIG.USE_DEMO_DATA && incidentsFromApi){ toast("Création locale désactivée : les incidents viennent de la marketplace.",true); return; }
   const nowS=new Date().toISOString().slice(0,16);
-  INCIDENTS.unshift({id:"inc"+Date.now(),openedAt:nowS,openedBy:"client",state:"en_cours",motif:"non_conforme",orderId:"",orderAt:nowS,channel:"",product:"",sku:"",total:null,customer:"",msgs:0,lastBy:"boutique",lastAt:nowS});
-  saveIncidents(); incPage=1; renderIncidents(); updateIncCount(); toast("Incident ajouté");
+  const row=normalizeIncident({id:"inc-local-"+Date.now(),remote:false,openedAt:nowS,openedBy:"client",state:"en_cours",motif:"non_conforme",orderId:"",orderAt:nowS,channel:"",product:"",sku:"",total:null,customer:"Client",msgs:0,lastBy:"boutique",lastAt:nowS,conv:[]});
+  INC_LOCAL.unshift(row);
+  INCIDENTS=mergeIncidentRows(INCIDENTS.filter(x=>x.remote),INC_LOCAL);
+  saveIncidents(); incPage=1; renderIncidents(); updateIncCount(); toast("Incident local ajouté — complétez la ligne si besoin");
 }
 /* Modal incident : envoyer un message au client de la commande */
 let incSelectedId=null;
 function renderIncConv(inc){
   const conv=inc.conv||[];
   $("#incConv").innerHTML = conv.length
-    ? conv.map(m=>`<div class="inc-msg-row ${m.by}"><div class="inc-bubble">${esc(m.text)}<span class="who">${m.by==="boutique"?"Boutique":"Client"} · ${incDT(new Date(m.at).toISOString())}</span></div></div>`).join("")
-    : `<div class="inc-empty">${inc.msgs?("Historique de "+inc.msgs+" message(s) sur la marketplace. Écrivez ci-dessous pour répondre au client."):"Aucun message. Écrivez le premier message au client."}</div>`;
+    ? conv.map(m=>`<div class="inc-msg-row ${m.by}"><div class="inc-bubble">${messageHtml(m.text)}${m.attachments&&m.attachments.length?`<div class="bubble-attach">${m.attachments.map(a=>renderAttachment(a)).join("")}</div>`:""}<span class="who">${m.by==="boutique"?"Boutique":"Client"} · ${incDT(new Date(m.at).toISOString())}</span></div></div>`).join("")
+    : `<div class="inc-empty">${inc.remote?"Conversation marketplace non chargée ou sans message exploitable.":"Aucun message. Écrivez le premier message au client."}</div>`;
   $("#incConv").scrollTop=$("#incConv").scrollHeight;
 }
-function openIncident(id){
-  const inc=INCIDENTS.find(x=>x.id===id); if(!inc) return;
+async function openIncident(id){
+  let inc=INCIDENTS.find(x=>x.id===id); if(!inc) return;
   incSelectedId=id;
   $("#incmTitle").innerHTML=(mpBadge(inc.channel))+" "+esc(INC_MOTIFS[inc.motif]||inc.motif||"Incident");
-  const replyInfo = inc.remote ? (inc.replyMode==="order_comment" ? " · réponse via commentaire commande" : " · réponse marketplace") : "";
-  $("#incmMeta").innerHTML=esc(inc.customer||"")+" · Commande "+esc(inc.orderId||"—")+" · "+esc(inc.product||"")+esc(replyInfo);
-  $("#incReply").value="";
-  $("#incReply").disabled = inc.canReply===false;
-  $("#incSend").disabled = inc.canReply===false;
-  if(inc.canReply===false) $("#incReply").placeholder="Impossible de répondre : aucun identifiant message/commande exploitable.";
-  else $("#incReply").placeholder="Bonjour, merci pour votre message…";
-  renderIncConv(inc);
+  $("#incmMeta").innerHTML=esc(inc.customer||"")+" · Commande "+esc(inc.orderId||"—")+" · "+esc(inc.product||"");
+  $("#incReply").value=""; renderIncConv(inc);
   $("#incModalBg").classList.add("show"); $("#incModal").classList.add("show");
-  setTimeout(()=>{const t=$("#incReply"); if(t && !t.disabled) t.focus();},50);
+  setTimeout(()=>{const t=$("#incReply"); if(t) t.focus();},50);
+
+  if(inc.remote && !inc._detailLoaded){
+    const oldHtml=$("#incConv").innerHTML;
+    $("#incConv").innerHTML = oldHtml + `<div class="inc-empty">Chargement du fil complet…</div>`;
+    try{
+      const detail=await DataAPI.fetchClaimDetail(inc.id);
+      const enriched=incidentFromClaim(detail, inc);
+      enriched._detailLoaded=true;
+      const i=INCIDENTS.findIndex(x=>x.id===inc.id);
+      if(i>=0) INCIDENTS[i]=enriched;
+      if(incSelectedId===id) renderIncConv(enriched);
+    }catch(e){
+      console.warn("Détail incident indisponible", e);
+      if(incSelectedId===id) $("#incConv").innerHTML = oldHtml + `<div class="inc-empty" style="color:#b91c1c">Détail complet indisponible : ${esc(e.message)}</div>`;
+    }
+  }
 }
 function closeIncident(){ $("#incModalBg").classList.remove("show"); $("#incModal").classList.remove("show"); incSelectedId=null; }
 async function sendIncidentMsg(){
   const inc=INCIDENTS.find(x=>x.id===incSelectedId); if(!inc) return;
   const text=$("#incReply").value.trim(); if(!text){ toast("Saisissez un message.",true); return; }
-  if(inc.canReply===false){ toast("Impossible de répondre à cet incident : identifiant message/commande manquant.",true); return; }
-  const btn=$("#incSend"); btn.disabled=true; btn.textContent="Envoi…";
+  if(inc.remote && inc.canReply===false){ toast("Réponse impossible : contexte marketplace incomplet pour cet incident.",true); return; }
+  const btn=$("#incSend"); if(btn){btn.disabled=true;btn.textContent="Envoi…";}
   try{
-    let result={mode:'local'};
-    if(inc.remote) result=await DataAPI.sendIncidentReply(inc.id,text);
+    if(inc.remote) await DataAPI.sendIncidentMessage(inc.id,text);
     inc.conv=inc.conv||[]; inc.conv.push({at:Date.now(),by:"boutique",text});
     inc.msgs=(inc.msgs||0)+1; inc.lastBy="boutique"; inc.lastAt=new Date().toISOString().slice(0,16);
-    if(!inc.remote) saveIncidents();
+    if(!inc.remote){ const l=INC_LOCAL.find(x=>x.id===inc.id); if(l) Object.assign(l,inc); saveIncidents(); }
     renderIncConv(inc); renderIncidents(); updateIncCount();
-    $("#incReply").value=""; playSendAnimation();
-    const suffix=result.mode==="client_order_comments_update"?" (commentaire commande)":"";
-    toast("Message envoyé à "+(inc.customer||"client")+suffix);
-  }catch(e){ toast("Erreur incident : "+e.message,true); }
-  finally{ btn.disabled=false; btn.textContent="Envoyer le message"; }
+    $("#incReply").value=""; playSendAnimation(); toast("Message incident envoyé à "+(inc.customer||"client"));
+  }catch(e){
+    toast("Erreur incident : "+e.message,true);
+  }finally{ if(btn){btn.disabled=false;btn.textContent="Envoyer le message";} }
 }
 
 /* ===== Réponses types (bibliothèque, mémorisée) ===== */
@@ -2110,32 +2675,32 @@ function addReply(){ REPLIES.unshift({id:"rep"+Date.now(),category:"",body:""});
 function applyFilters(){
   const q=$("#q").value.trim().toLowerCase(),fMp=$("#fMp").value,fSt=$("#fStatut").value,fTr=$("#fTraite").value;
   let list=claims.filter(c=>{
-    const traite=answered(c);   // traitée = dernier message = vendeur (un retour client la rouvre)
-    if(fTr==="todo" && (traite || c.status==="resolu")) return false; // à faire = ouvert + dernier message client
-    if(fTr==="done" && !traite && c.status!=="resolu") return false;
-    if(fMp&&c.marketplace!==fMp)return false; if(fSt&&c.status!==fSt)return false;
+    const mustReply=needsReply(c);   // à traiter = Nouveau ou Répondu, sauf si la marketplace a clôturé
+    if(fTr==="todo" && !mustReply) return false;
+    if(fTr==="done" && mustReply) return false;
+    if(fMp&&c.marketplace!==fMp)return false; if(fSt&&businessStatus(c)!==fSt)return false;
     if(q&&!(c.customer+" "+c.subject+" "+c.orderId+" "+c.product).toLowerCase().includes(q))return false;
     return true;});
   list.sort((a,b)=>{
-    // Résolues toujours tout en bas, puis les réclamations déjà répondues
-    const ar=a.status==="resolu"?1:0, br=b.status==="resolu"?1:0;
+    // Résolues toujours tout en bas, puis les réclamations déjà traitées
+    const ar=businessStatus(a)==="resolu"?1:0, br=businessStatus(b)==="resolu"?1:0;
     if(ar!==br) return ar-br;
-    const aa=answered(a)?1:0, ba=answered(b)?1:0;   // répondu -> en dernier
+    const aa=needsReply(a)?0:1, ba=needsReply(b)?0:1;   // à traiter en premier
     if(aa!==ba) return aa-ba;
     let av=a[sort.key],bv=b[sort.key];
     if(sort.key==="priority"){const o={haute:3,moyenne:2,basse:1};av=o[av];bv=o[bv];}
     if(sort.key==="slaHours"){av=slaInfo(a).hours;bv=slaInfo(b).hours;}
     if(sort.key==="carrier"){av=a.tracking?carrierOf(a.tracking.carrier).label:"";bv=b.tracking?carrierOf(b.tracking.carrier).label:"";}
-    if(sort.key==="trackstep"){av=a.tracking?(TSTATUS[a.tracking.status]||{}).step||0:-1;bv=b.tracking?(TSTATUS[b.tracking.status]||{}).step||0:-1;}
+    if(sort.key==="trackstep"){av=a.tracking?trackingStatusInfo(a.tracking).step||0:-1;bv=b.tracking?trackingStatusInfo(b.tracking).step||0:-1;}
     if(av<bv)return -sort.dir; if(av>bv)return sort.dir; return 0;});
   return list;
 }
 
 function renderKPIs(){
-  const open=claims.filter(c=>c.status!=="resolu");
-  const aTraiter=claims.filter(c=>!answered(c) && c.status!=="resolu").length;
-  const nouveau=claims.filter(c=>c.status==="nouveau").length;
-  const resolu=claims.filter(c=>c.status==="resolu").length;
+  const open=claims.filter(c=>businessStatus(c)!=="resolu");
+  const aTraiter=claims.filter(needsReply).length;
+  const nouveau=claims.filter(c=>businessStatus(c)==="nouveau").length;
+  const resolu=claims.filter(c=>businessStatus(c)==="resolu").length;
   const pct=claims.length?Math.round(resolu/claims.length*100):0;
   $("#kpis").innerHTML=`
     <div class="kpi"><div class="label">Ouvertes</div><div class="val">${open.length}</div><div class="sub">${claims.length} au total</div></div>
@@ -2143,12 +2708,12 @@ function renderKPIs(){
     <div class="kpi"><div class="label">Nouvelles</div><div class="val">${nouveau}</div><div class="sub">non traitées</div></div>
     <div class="kpi good"><div class="label">Taux de résolution</div><div class="val">${pct}%</div><div class="sub">${resolu} résolues</div></div>`;
   updateTreatCount(); updateClaudeCount();
-  { const el=$("#reclamBadge"); if(el){ const n=claims.filter(c=>!answered(c) && c.status!=="resolu").length; el.textContent=n; el.classList.toggle("zero",n===0);} }
+  { const el=$("#reclamBadge"); if(el){ const n=claims.filter(needsReply).length; el.textContent=n; el.classList.toggle("zero",n===0);} }
 }
 /* Compteur de réclamations restant à traiter (non répondues, non résolues) */
 function updateTreatCount(){
   const el=$("#treatCount"); if(!el)return;
-  const n=claims.filter(c=>!answered(c) && c.status!=="resolu" && effNiveau(c)!==1).length;
+  const n=claims.filter(c=>needsReply(c) && effNiveau(c)!==1).length;
   el.textContent=n; el.classList.toggle("zero",n===0);
 }
 
@@ -2224,7 +2789,7 @@ function periodStart(){
 
 function renderCharts(){
   const start=periodStart();
-  const open=claims.filter(c=>c.status!=="resolu" && createdAt(c)>=start);
+  const open=claims.filter(c=>businessStatus(c)!=="resolu" && createdAt(c)>=start);
   const total=open.length||1;
   let entries;   // [{label, n, color, mark}]
   if(chartMode==="typo"){
@@ -2273,7 +2838,7 @@ function renderTable(){
   const startIdx=(reclamPage-1)*RECLAM_PER_PAGE;
   const pageList=list.slice(startIdx, startIdx+RECLAM_PER_PAGE);
   $("#tbody").innerHTML=pageList.map((c,i)=>{
-    const mp=mpOf(c.marketplace),st=STATUS[c.status],pr=PRIO[c.priority],sla=slaInfo(c);
+    const mp=mpOf(c.marketplace),st=STATUS[businessStatus(c)],pr=PRIO[c.priority],sla=slaInfo(c);
     return `<tr data-id="${c.id}" class="${c.id===selectedId?'sel':''}">
       <td class="th-num meta">${startIdx+i+1}</td>
       <td>${mpBadgeLink(c.marketplace,c.orderId)}</td>
@@ -2281,7 +2846,7 @@ function renderTable(){
       <td class="col-c">${c.tracking?carrierMark(c.tracking.carrier):'<span class="meta">—</span>'}</td>
       <td class="col-c">${trackBar(c.tracking)}</td>
       <td>${customerHtml(c)}<div class="meta">${esc(c.product||"")}${c.ean?` <span class="ordref" data-lbl="Code EAN">${esc(c.ean)}</span>`:""}</div></td>
-      <td>${c.subject}</td>
+      <td>${esc(c.subject)}</td>
       <td>${statusBadge(c)}</td>
       <td><span class="meta">${fmtAgo(c.updatedAt)}</span></td></tr>`;}).join("");
   $("#tbody").querySelectorAll("tr").forEach(tr=>{
@@ -2310,7 +2875,7 @@ function renderTable(){
 async function openDrawer(id, skipRemoteDetail=false){
   let c=claims.find(x=>x.id===id); if(!c)return;
   selectedId=id; renderTable();
-  const mp=mpOf(c.marketplace),st=STATUS[c.status],pr=PRIO[c.priority],sla=slaInfo(c);
+  const mp=mpOf(c.marketplace),st=STATUS[businessStatus(c)],pr=PRIO[c.priority],sla=slaInfo(c);
   $("#dSubject").innerHTML='<span class="subj-mp">'+mpMarkLink(c.marketplace,c.orderId)+'</span> '+esc(c.subject)+' <span class="subj-ord ordref" data-lbl="N° de commande">'+esc(c.orderId)+'</span> <span class="subj-date" title="Date de commande">📅 '+fmtDate(createdAt(c))+'</span>';
   $("#dSubject").querySelectorAll(".ordref").forEach(el=>el.onclick=e=>copyCode(e,el,el.dataset.lbl||"Valeur"));
   const customerIdMeta = c.customerId && !String(c.customer || "").includes(String(c.customerId))
@@ -2323,10 +2888,10 @@ async function openDrawer(id, skipRemoteDetail=false){
     const att=(m.attachments&&m.attachments.length)?`<div class="bubble-attach">${m.attachments.map(a=>renderAttachment(a)).join("")}</div>`:"";
     return `<div class="bubble ${m.from}">
       <div class="who">${m.from==="client"?esc(c.customer || "Client"):("2KINGS — "+esc(m.author||"Agent"))}</div>
-      <div>${esc(m.text||"")}</div>${att}<div class="t">il y a ${fmtAgo(m.at)}</div></div>`;}).join("");
+      <div class="msg-text">${messageHtml(m.text)}</div>${att}<div class="t">il y a ${fmtAgo(m.at)}</div></div>`;}).join("");
   $("#dBody").innerHTML=renderTracking(c)+conv;
   bindTracking(c);
-  $("#dStatus").value=c.status; $("#replyText").value="";
+  $("#dStatus").value=businessStatus(c)==="resolu"?"resolu":"nouveau"; $("#replyText").value="";
   pendingFiles=[]; renderAttachList();   // réinitialise les pièces jointes
   $("#overlay").classList.add("show"); $("#drawer").classList.add("show");
 
@@ -2357,22 +2922,22 @@ function fmtDate(ts){const d=new Date(ts),p=n=>String(n).padStart(2,"0");
 function renderTracking(c){
   const t=c.tracking;
   if(!t) return `<div class="track track-empty">📦 Aucun suivi de livraison rattaché à cette réclamation.</div>`;
-  const car=carrierOf(t.carrier), ts=TSTATUS[t.status]||{label:t.status,cls:"ts-wait"};
-  const url=car.url?car.url.replace("{n}",encodeURIComponent(t.number)):"";
-  const eta = t.status==="livre" ? "Livré" : (t.etaH!=null? "Livraison estimée : "+fmtDate(now+t.etaH*H) : "—");
-  const evs=(t.events||[]).slice().sort((a,b)=>a.h-b.h).map(e=>
-    `<div class="tev"><span class="tev-dot"></span><div class="tev-c"><b>${e.label}</b><span>${fmtDate(now-e.h*H)}</span></div></div>`).join("");
+  const car=carrierOf(t.carrier), ts=trackingStatusInfo(t);
+  const url=trackingExternalUrl(t);
+  const eta = t.status==="livre" ? "Livré" : (t.etaH!=null? "Livraison estimée : "+fmtDate(Date.now()+Number(t.etaH)*H) : "—");
+  const evs=(t.events||[]).map(normalizeTrackEventUi).filter(Boolean).sort((a,b)=>(b.at||0)-(a.at||0)).map(e=>
+    `<div class="tev"><span class="tev-dot"></span><div class="tev-c"><b>${esc(e.label)}</b><span>${fmtDate(e.at)}</span></div></div>`).join("");
   return `<div class="track">
     <div class="track-head"><span>📦 Suivi de livraison</span>
       <button class="track-refresh" id="trackRefresh" title="Récupérer le suivi auprès du transporteur">↻ Rafraîchir</button></div>
     <div class="track-row">
-      <span class="carrier-badge">${car.label}</span>
-      <span class="ordref" id="trackNum">${t.number}</span>
-      <span class="tstatus ${ts.cls}">${ts.label}</span>
+      <span class="carrier-badge" style="background:${car.bg};color:${car.fg}">${esc(car.label)}</span>
+      <span class="ordref" id="trackNum">${esc(t.number)}</span>
+      <span class="tstatus ${ts.cls}">${esc(ts.label)}</span>
     </div>
-    <div class="track-eta">${eta}</div>
+    <div class="track-eta">${esc(eta)}</div>
     <div class="track-timeline">${evs||'<div class="meta">Aucun événement.</div>'}</div>
-    ${url?`<a class="track-link" href="${url}" target="_blank" rel="noopener">Suivre sur le site ${car.label} ↗</a>`:""}
+    ${url?`<a class="track-link" href="${url}" target="_blank" rel="noopener">Suivre sur le site ${esc(car.label)} ↗</a>`:""}
   </div>`;
 }
 function bindTracking(c){
@@ -2384,8 +2949,11 @@ function bindTracking(c){
     btn.disabled=true; btn.textContent="↻ …";
     try{
       const upd=await DataAPI.fetchTracking(c.tracking.carrier,c.tracking.number);
-      if(upd){ c.tracking.status=upd.status||c.tracking.status; if(upd.etaH!=null)c.tracking.etaH=upd.etaH;
-        if(upd.events)c.tracking.events=upd.events; toast("Suivi mis à jour"); }
+      if(upd){
+        const merged=normalizeDisplayTracking({...(c.tracking||{}),...(upd||{})});
+        if(merged) c.tracking=merged;
+        toast("Suivi mis à jour");
+      }
       else toast("Mode démo : suivi simulé (branchez le proxy pour le réel)");
       openDrawer(c.id,true);
     }catch(e){toast("Suivi : "+e.message,true);}
@@ -2704,6 +3272,15 @@ function renderNotes(){
     if(fret==="no" && req) return false;
     return true;
   }).slice();
+  const emptyEl = $("#notesEmpty");
+  if(notesLoading && !NOTES.length){
+    emptyEl.textContent = "Chargement des notes produit… Les réclamations restent utilisables pendant ce temps.";
+    emptyEl.style.display = "block";
+    $("#notesBody").innerHTML = "";
+    $("#notesPager").innerHTML = "";
+    return;
+  }
+  emptyEl.textContent = notesLoaded ? "Aucune note client." : "Notes produit non chargées.";
   list.sort((a,b)=>{
     switch(sortv){
       case "rating-desc": return b.rating-a.rating||b.at-a.at;
@@ -2782,6 +3359,12 @@ function showPage(tabId){
     tab.setAttribute("aria-pressed",String(on));
   });
   try{localStorage.setItem("activePage",tabId);}catch(e){}
+  if(tabId==="tabNotes" && !CONFIG.USE_DEMO_DATA && !notesLoaded && !notesLoading){
+    loadNotesAsync({limit:150, providerTimeoutMs:12000, miraklTimeoutMs:45000, maxOrders:40, pages:3, pageSize:25}).catch(()=>{});
+  }
+  if(tabId==="tabIncidents" && !CONFIG.USE_DEMO_DATA && !incidentsLoaded && !incidentsLoading){
+    loadIncidents({enrichDetails:false}).catch(()=>{});
+  }
   window.scrollTo({top:0});
 }
 function setMini(on){
@@ -2802,15 +3385,128 @@ function initTabs(){
 /* Accueil : revient à la page Statistiques (clic sur le logo) */
 function closeAllTabs(){ showPage("tabStats"); }
 
-async function load(){
-  try{ $("#btnRefresh").textContent="↻ Chargement…";
-    claims=(await DataAPI.fetchClaims()).map(normalizeClaim);
-    claims.forEach(c=>{ if(c.status==="encours"||c.status==="attente") c.status="nouveau"; c.slaHours=slaInfo(c).hours; });
-    syncEuroRefunds();
-    renderKPIs(); renderEvo(); renderCharts(); renderTable();
-    refreshIncidents().catch(e=>toast("Incidents : "+e.message,true));
-  }catch(e){toast("Chargement impossible : "+e.message,true);}
-  finally{$("#btnRefresh").textContent="↻ Actualiser";}
+function mergeNotesLists(...lists){
+  const out=[];
+  const seen=new Set();
+  lists.flat().forEach(n=>{
+    if(!n || !n.rating) return;
+    const key=[n.marketplace,n.orderId,n.ean,n.rating,n.comment,n.at].map(v=>String(v||'').toLowerCase()).join('|');
+    if(seen.has(key)) return;
+    seen.add(key);
+    out.push(n);
+  });
+  return out.sort((a,b)=>(+b.at||0)-(+a.at||0));
+}
+
+async function loadNotesAsync(options={}){
+  if(CONFIG.USE_DEMO_DATA) return;
+  notesLoading=true;
+  notesLoaded=false;
+  renderNotes();
+  try{
+    // 1re passe rapide : Octopia + Fnac/Darty, pour afficher quelque chose tout de suite.
+    const fastNotes = await DataAPI.fetchNotes({
+      ...options,
+      providers: options.providers || 'octopia,bomp',
+      includeMirakl:false,
+      providerTimeoutMs: options.providerTimeoutMs || 12000,
+      limit: options.limit || 150
+    });
+    NOTES.splice(0, NOTES.length, ...fastNotes);
+    notesLoaded=true;
+    renderNotes();
+
+    // 2e passe : Mirakl. Plus lente car OR51 fonctionne commande par commande,
+    // mais elle complète la liste sans bloquer le premier affichage.
+    const miraklNotes = await DataAPI.fetchNotes({
+      ...options,
+      providers:'mirakl',
+      includeMirakl:true,
+      providerTimeoutMs: options.miraklTimeoutMs || 45000,
+      maxOrders: options.maxOrders || 40,
+      pages: options.pages || 3,
+      pageSize: options.pageSize || 25,
+      evalConcurrency: options.evalConcurrency || 4,
+      limit: options.limit || 300
+    });
+    NOTES.splice(0, NOTES.length, ...mergeNotesLists(NOTES, miraklNotes));
+  }catch(ne){
+    console.warn("Chargement des notes impossible", ne);
+    toast("Notes produit indisponibles : "+ne.message, true);
+  }finally{
+    notesLoading=false;
+    renderNotes();
+  }
+}
+
+let currentLoadSeq = 0;
+function prepareClaimsForDisplay(list){
+  list.forEach(c=>{
+    c.uiStatus=businessStatus(c);
+    c.slaHours=slaInfo(c).hours;
+  });
+  return list;
+}
+function renderMainData(){
+  syncEuroRefunds();
+  renderKPIs();
+  renderEvo();
+  renderCharts();
+  renderTable();
+}
+function providerProgressLabel(payload){
+  const done = Number(payload.completed || 0);
+  const total = Number(payload.total || 0);
+  const p = payload.provider || {};
+  const name = p.label || p.code || '';
+  return total ? `↻ Chargement ${done}/${total}${name ? ' — '+name : ''}` : '↻ Chargement…';
+}
+
+async function load(options={}){
+  const seq = ++currentLoadSeq;
+  try{
+    $("#btnRefresh").textContent="↻ Chargement…";
+
+    if(CONFIG.USE_DEMO_DATA){
+      claims=prepareClaimsForDisplay(await DataAPI.fetchClaims(options));
+      renderMainData();
+      return;
+    }
+
+    // Affichage progressif : on vide puis on affiche chaque marketplace dès qu'elle répond.
+    claims=[];
+    renderMainData();
+
+    const finalClaims = await DataAPI.fetchClaimsProgressive(
+      { providerTimeoutMs: 60000, ...options },
+      (_rows, payload, allRows)=>{
+        if(seq!==currentLoadSeq) return;
+        if(payload && (payload.completed || payload.total || payload.provider)){
+          $("#btnRefresh").textContent=providerProgressLabel(payload);
+        }
+        claims=prepareClaimsForDisplay(allRows || []);
+        renderMainData();
+      }
+    );
+
+    if(seq!==currentLoadSeq) return;
+    claims=prepareClaimsForDisplay(finalClaims || []);
+    renderMainData();
+
+    // Les notes restent disponibles, mais elles ne bloquent plus l'affichage des réclamations.
+    // Elles se chargent aussi au clic sur l'onglet Notes clients.
+    if(!notesLoaded && !notesLoading){
+      NOTES.splice(0, NOTES.length);
+      notesLoading=false;
+      notesLoaded=false;
+      renderNotes();
+    }
+  }catch(e){
+    if(seq===currentLoadSeq) toast("Chargement impossible : "+e.message,true);
+  }
+  finally{
+    if(seq===currentLoadSeq) $("#btnRefresh").textContent="↻ Actualiser";
+  }
 }
 
 /* Citation positive du jour (change chaque jour, stable dans la journée) */
@@ -2981,7 +3677,7 @@ function init(){
   $("#eanExport").onclick=exportEanExcel;
   $("#efReason").addEventListener("input",()=>{prodPage=1;renderProducts(applyFilters());});
   $("#btnReset").onclick=()=>{["q","fMp","fStatut"].forEach(id=>$("#"+id).value="");$("#fTraite").value="todo";reclamPage=1;prodPage=1;renderActiveRecView();};
-  $("#btnRefresh").onclick=load;
+  $("#btnRefresh").onclick=()=>load({refresh:true});
   $("#drawerClose").onclick=closeDrawer; $("#overlay").onclick=closeDrawer; $("#sendBtn").onclick=sendReply;
   $("#cannedBtn").onclick=e=>{const c=claims.find(x=>x.id===selectedId); if(c) openReplyPicker(e.currentTarget,"replyText",c);};
   $("#attachBtn").onclick=()=>$("#fileInput").click();
@@ -3001,10 +3697,12 @@ function init(){
   $("#ifState").addEventListener("change",()=>{incPage=1;renderIncidents();});
   $("#ifMp").addEventListener("change",()=>{incPage=1;renderIncidents();});
   $("#ifAdd").onclick=addIncident;
+  const incRefreshBtn=$("#ifRefresh"); if(incRefreshBtn) incRefreshBtn.onclick=()=>loadIncidents({refresh:true,enrichDetails:false});
   $("#incModalClose").onclick=closeIncident; $("#incModalBg").onclick=closeIncident;
   $("#incSend").onclick=sendIncidentMsg;
   $("#incCanned").onclick=e=>{ const inc=INCIDENTS.find(x=>x.id===incSelectedId); if(inc) openReplyPicker(e.currentTarget,"incReply",{id:inc.id,subject:(INC_MOTIFS[inc.motif]||inc.motif||""),product:inc.product,marketplace:inc.channel}); };
   renderIncidents(); updateIncCount();
+  if(!CONFIG.USE_DEMO_DATA){ loadIncidents({enrichDetails:false}).catch(()=>{}); }
   const lg=$("#homeLogo"); if(lg) lg.onclick=closeAllTabs;
   showDailyQuote();
   initUser();

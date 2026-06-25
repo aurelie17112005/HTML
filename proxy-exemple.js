@@ -92,6 +92,7 @@ function computeDueAt(messages) {
   return (lastClient ? lastClient.at : Date.now()) + 24 * H;   // SLA 24 h, à adapter
 }
 function makeClaim(marketplace, o = {}) {
+  const messages = normalizeClaimMessages(o.messages || []);
   const rawMarketplaceStatus = scalarFirst(
     o.marketplaceStatus,
     o.marketplaceStatusLabel,
@@ -113,7 +114,7 @@ function makeClaim(marketplace, o = {}) {
   return {
     id: `${marketplace}:${o.providerType}:${o.id}`,   // route la réponse vers le bon adaptateur
     marketplace,
-    customer: o.customer || 'Client',
+    customer: sanitizeCustomerName(o.customer) || 'Client',
     customerId: o.customerId || '',
     subject: o.subject || 'Réclamation',
     orderId: o.orderId || '',
@@ -124,10 +125,288 @@ function makeClaim(marketplace, o = {}) {
     marketplaceStatus: rawMarketplaceStatus || normalizedStatus,
     statusRaw: rawMarketplaceStatus || normalizedStatus,
     updatedAt: o.updatedAt || Date.now(),
-    dueAt: o.dueAt || computeDueAt(o.messages || []),
-    messages: o.messages || [],
+    dueAt: o.dueAt || computeDueAt(messages),
+    messages,
+    tracking: normalizeTracking(o.tracking, o),
     _ctx: ctx,                                      // données techniques utiles à la réponse
   };
+}
+
+function inferCarrierFromTrackingUrl(rawUrl = '') {
+  const u = foldStatusText(rawUrl);
+  if (!u) return '';
+  // URLs parasites fréquentes dans les messages Fnac/Darty : enquêtes de satisfaction, avis, NPS, formulaires.
+  // Elles contiennent parfois un identifiant qui ressemble à un suivi : on les refuse toujours.
+  if (/(satisfaction|survey|enquete|questionnaire|feedback|avis|review|evaluation|evaluer|rating|nps|csat|trustpilot|avis[-_ ]?verifies|netreviews|ekomi|bazaarvoice|qualtrics|medallia|forms\.office|docs\.google\.com\/forms|google\.com\/forms)/.test(u)) return '';
+  if (/laposte|la-poste|colissimo|suivre-vos-envois|suivi\.laposte|outils\/suivre/.test(u)) return 'colissimo';
+  if (/chronopost|chrono-post|tracking-no-cms|chrono_suivi|listeNumerosLT/i.test(rawUrl)) return 'chronopost';
+  if (/\bdpd\b|trace\.dpd|dpdgroup|predict\.dpd/.test(u)) return 'dpd';
+  if (/gls-group|glsfr|gls-france|glsfrance|\bgls\b/.test(u)) return 'gls';
+  if (/\bups\b|united parcel|ups\.com\/track/.test(u)) return 'ups';
+  if (/\bdhl\b|dhlparcel|dhl\.com/.test(u)) return 'dhl';
+  if (/fedex|federal express|fedextrack/.test(u)) return 'fedex';
+  if (/\btnt\b|tnt\.com|tnt\.fr/.test(u)) return 'tnt';
+  if (/mondialrelay|mondial-relay|mondial relay/.test(u)) return 'mondialrelay';
+  if (/relaiscolis|relais-colis|relais colis/.test(u)) return 'relaiscolis';
+  if (/colisprive|colis-prive|colis prive/.test(u)) return 'colisprive';
+  if (/cchezvous|c-chez-vous|c chez vous|chezvous/.test(u)) return 'chezvous';
+  if (/geodis|calberson/.test(u)) return 'geodis';
+  return '';
+}
+
+function isLikelyTrackingUrl(rawUrl = '') {
+  const url = cleanText(rawUrl);
+  if (!/^https?:\/\//i.test(url)) return false;
+  const u = foldStatusText(url);
+  if (/(satisfaction|survey|enquete|questionnaire|feedback|avis|review|evaluation|evaluer|rating|nps|csat|trustpilot|avis[-_ ]?verifies|netreviews|ekomi|bazaarvoice|qualtrics|medallia|forms\.office|docs\.google\.com\/forms|google\.com\/forms)/.test(u)) return false;
+  // On accepte les URLs des transporteurs connus, ou une vraie URL dont le chemin annonce clairement du suivi.
+  return Boolean(inferCarrierFromTrackingUrl(url) || /(tracking|track|trace|suivi|colis|parcel|shipment|expedition|consignment|skybill|waybill)/.test(u));
+}
+
+function safeTrackingUrl(rawUrl = '') {
+  const url = cleanText(rawUrl);
+  return isLikelyTrackingUrl(url) ? url : '';
+}
+
+function normalizeCarrierCode(raw, number = '', url = '') {
+  const s = foldStatusText(raw);
+  if (/colissimo|la poste|laposte|courrier suivi/.test(s)) return 'colissimo';
+  if (/chrono|chronopost/.test(s)) return 'chronopost';
+  if (/\bdpd\b|dpd predict/.test(s)) return 'dpd';
+  if (/\bgls\b/.test(s)) return 'gls';
+  if (/\bups\b/.test(s)) return 'ups';
+  if (/\bdhl\b/.test(s)) return 'dhl';
+  if (/fedex|federal express/.test(s)) return 'fedex';
+  if (/\btnt\b/.test(s)) return 'tnt';
+  if (/mondial|relay/.test(s)) return 'mondialrelay';
+  if (/relais colis|relaiscolis/.test(s)) return 'relaiscolis';
+  if (/colis prive|colispriv/.test(s)) return 'colisprive';
+  if (/chezvous|chez vous|cchezvous|c chez vous/.test(s)) return 'chezvous';
+  if (/geodis|calberson/.test(s)) return 'geodis';
+
+  const fromUrl = inferCarrierFromTrackingUrl(url);
+  if (fromUrl) return fromUrl;
+
+  const n = String(number || '').replace(/\s+/g, '').toUpperCase();
+  if (/^1Z[A-Z0-9]{10,}$/.test(n)) return 'ups';
+  if (/^(?:6[A-Z0-9]{10,}|8[A-Z0-9]{10,}|7[A-Z0-9]{10,}|[A-Z]{2}\d{9}FR)$/.test(n)) return 'colissimo';
+  if (/^(?:XY|XU|XX|XT|XS|XA|XP)[A-Z0-9]{8,}FR$/.test(n)) return 'chronopost';
+  if (/^[A-Z]{2}\d{8,}[A-Z]{2}$/.test(n)) return 'chronopost';
+  if (/^GEODIS/i.test(n)) return 'geodis';
+
+  // Important : ne jamais transformer un ID, une URL ou un libellé inconnu en nom de transporteur.
+  // Si ce n'est pas reconnu, l'IHM affichera simplement "Transporteur".
+  return '';
+}
+
+function normalizeTrackingStatus(raw, events = []) {
+  const all = [raw, ...(events || []).map(e => e?.label)].filter(Boolean).join(' ');
+  const s = foldStatusText(all);
+  // Important : un simple numéro de suivi ne veut PAS dire que le colis est en transit.
+  // On ne classe en transit que si la marketplace/le transporteur donne un vrai statut ou événement exploitable.
+  if (!s) return 'inconnu';
+  if (/livr|delivered|remis/.test(s)) return 'livre';
+  if (/point relais|relais|pickup|a retirer|consigne|disponible/.test(s)) return 'pret_retrait';
+  if (/incident|echec|absent|retour|refus|exception|probleme|anomalie|perdu/.test(s)) return 'incident';
+  if (/preparation|etiquette|label|enregistr|created|annonce|attente|pending/.test(s)) return 'en_attente';
+  if (/expedi|expedie|shipped|pris en charge|accepted|collected|achemin|transit|hub|tri|route|en cours de livraison|out for delivery|en livraison|depart|arrive/.test(s)) return 'en_transit';
+  return 'inconnu';
+}
+
+function trackingStatusRank(status) {
+  const s = String(status || '').toLowerCase();
+  if (['livre', 'incident', 'pret_retrait'].includes(s)) return 4;
+  if (s === 'en_attente') return 3;
+  if (s === 'en_transit') return 2;
+  if (s === 'inconnu') return 1;
+  return 0;
+}
+function chooseTrackingStatus(...statuses) {
+  return statuses.filter(Boolean).sort((a, b) => trackingStatusRank(b) - trackingStatusRank(a))[0] || 'inconnu';
+}
+
+function looksLikeTrackingNumber(v) {
+  const s = cleanText(v).replace(/\s+/g, '');
+  if (!s || s.length < 6 || s.length > 60) return false;
+  if (/^https?:/i.test(s)) return false;
+  if (!/[0-9]/.test(s)) return false;
+  if (/[@]/.test(s)) return false;
+  return /^[A-Z0-9._\-]+$/i.test(s);
+}
+
+function firstDeepValue(obj, keyRegex, maxDepth = 5) {
+  const seen = new Set();
+  function walk(v, depth) {
+    if (v == null || depth > maxDepth) return '';
+    if (typeof v !== 'object') return '';
+    if (seen.has(v)) return '';
+    seen.add(v);
+    if (Array.isArray(v)) {
+      for (const item of v) {
+        const got = walk(item, depth + 1);
+        if (got) return got;
+      }
+      return '';
+    }
+    for (const [k, val] of Object.entries(v)) {
+      if (keyRegex.test(k)) {
+        const got = scalarValue(val);
+        if (got) return got;
+      }
+    }
+    for (const val of Object.values(v)) {
+      const got = walk(val, depth + 1);
+      if (got) return got;
+    }
+    return '';
+  }
+  return walk(obj, 0);
+}
+
+function collectDeepArrays(obj, keyRegex, maxDepth = 5) {
+  const out = [];
+  const seen = new Set();
+  function walk(v, depth, key = '') {
+    if (v == null || depth > maxDepth || typeof v !== 'object') return;
+    if (seen.has(v)) return;
+    seen.add(v);
+    if (Array.isArray(v)) {
+      if (keyRegex.test(key)) out.push(v);
+      v.forEach(item => walk(item, depth + 1));
+      return;
+    }
+    for (const [k, val] of Object.entries(v)) walk(val, depth + 1, k);
+  }
+  walk(obj, 0);
+  return out;
+}
+
+function normalizeTrackingEvent(e) {
+  if (!e) return null;
+  if (typeof e === 'string') return { at: Date.now(), label: cleanText(e) };
+  const label = cleanText(scalarFirst(e.label, e.description, e.status, e.eventLabel, e.event_label, e.message, e.libelle, e.libellé, e.activity));
+  const atRaw = scalarFirst(e.at, e.date, e.eventDate, e.event_date, e.timestamp, e.time, e.datetime, e.created_at);
+  const at = atRaw ? parseMarketplaceDate(atRaw, Date.now()) : (e.h != null ? Date.now() - Number(e.h) * H : Date.now());
+  if (!label) return null;
+  return { at, label };
+}
+
+function normalizeTracking(raw, source = {}) {
+  const root = raw || source || {};
+  if (!root) return null;
+  if (typeof root === 'string') {
+    return looksLikeTrackingNumber(root) ? { carrier: normalizeCarrierCode('', root) || 'transporteur', number: cleanText(root), status: 'inconnu', etaH: null, events: [] } : null;
+  }
+
+  const number = scalarFirst(
+    root.number, root.trackingNumber, root.tracking_number, root.trackingCode, root.tracking_code, root.trackingId, root.tracking_id,
+    root.parcelNumber, root.parcel_number, root.shipmentNumber, root.shipment_number, root.shipping_number, root.awb, root.waybill,
+    firstDeepValue(root, /^(tracking_?number|tracking_?code|tracking_?id|parcel_?number|shipment_?number|shipping_?number|awb|waybill|tracking)$/i)
+  );
+
+  let trackingNumber = cleanText(number);
+  if (!looksLikeTrackingNumber(trackingNumber)) {
+    const url = safeTrackingUrl(scalarFirst(root.url, root.trackingUrl, root.tracking_url, firstDeepValue(root, /(tracking|shipment|parcel).*url|url.*tracking/i)));
+    const m = String(url || '').match(/[?&](?:code|tracking-id|trackingNumber|tracking_number|tracknum|listeNumerosLT|match|numColis|numeroExpedition|cons)=([^&]+)/i);
+    trackingNumber = m ? decodeURIComponent(m[1]) : '';
+  }
+  if (!looksLikeTrackingNumber(trackingNumber)) return null;
+
+  const url = safeTrackingUrl(scalarFirst(
+    root.url, root.trackingUrl, root.tracking_url, root.shippingTrackingUrl, root.shipping_tracking_url,
+    firstDeepValue(root, /(tracking|shipment|parcel|shipping).*url|url.*tracking/i)
+  ));
+  const carrierRaw = scalarFirst(
+    root.carrier, root.carrierCode, root.carrier_code, root.carrierName, root.carrier_name, root.transporteur, root.transporter,
+    root.shippingCarrier, root.shipping_carrier, root.shippingCompany, root.shipping_company, root.delivery_carrier,
+    root.shippingTypeLabel, root.shipping_type_label, root.shippingTypeCode, root.shipping_type_code,
+    firstDeepValue(root, /^(carrier|carrier_?code|carrier_?name|transporteur|transporter|shipping_?carrier|shipping_?company|delivery_?carrier|shipping_?type_?(label|code))$/i)
+  );
+  let events = [];
+  for (const arr of collectDeepArrays(root, /(event|history|tracking|shipment).*s?$/i, 4)) {
+    events.push(...arr.map(normalizeTrackingEvent).filter(Boolean));
+  }
+  events = dedupeTrackingEvents(events).slice(0, 20);
+  const statusRaw = scalarFirst(root.status, root.tracking_status, root.delivery_status, root.shipment_status, firstDeepValue(root, /(tracking|delivery|shipment).*status|^status$/i));
+
+  return {
+    carrier: normalizeCarrierCode(carrierRaw, trackingNumber, url) || 'transporteur',
+    number: trackingNumber,
+    status: normalizeTrackingStatus(statusRaw, events),
+    etaH: root.etaH ?? root.eta ?? null,
+    events,
+    ...(url ? { url: cleanText(url) } : {}),
+  };
+}
+
+function mergeTrackingInfo(current, extra) {
+  const a = normalizeTracking(current);
+  const b = normalizeTracking(extra);
+  if (!a) return b;
+  if (!b) return a;
+  const events = dedupeTrackingEvents([...(a.events || []), ...(b.events || [])]).slice(0, 20);
+  return {
+    carrier: (a.carrier && a.carrier !== 'transporteur') ? a.carrier : b.carrier,
+    number: a.number || b.number,
+    status: chooseTrackingStatus(normalizeTrackingStatus('', events), a.status, b.status),
+    etaH: a.etaH ?? b.etaH ?? null,
+    events,
+    ...(a.url || b.url ? { url: a.url || b.url } : {}),
+  };
+}
+
+function normalizeOrderTracking(order = {}) {
+  const candidates = [];
+  const addCandidate = (src = {}, fallback = {}) => {
+    if (!src || typeof src !== 'object') return;
+    const t = normalizeTracking({
+      number: scalarFirst(
+        src.shipping_tracking, src.shippingTracking, src.shipping_tracking_number, src.shippingTrackingNumber,
+        src.tracking_number, src.trackingNumber, src.tracking_code, src.trackingCode, src.tracking_id, src.trackingId,
+        src.parcel_number, src.parcelNumber, src.package_number, src.packageNumber, src.shipment_number, src.shipmentNumber,
+        src.awb, src.waybill, typeof src.tracking === 'string' ? src.tracking : '', fallback.number
+      ),
+      url: scalarFirst(src.shipping_tracking_url, src.shippingTrackingUrl, src.tracking_url, src.trackingUrl, src.url, fallback.url),
+      carrier: scalarFirst(
+        src.shipping_carrier, src.shippingCarrier, src.shipping_carrier_code, src.shippingCarrierCode,
+        src.carrier, src.carrier_code, src.carrierCode, src.carrier_name, src.carrierName,
+        src.transporteur, src.transporter, src.shipping_type_label, src.shippingTypeLabel,
+        src.shipping_type_code, src.shippingTypeCode, src.delivery_carrier, fallback.carrier
+      ),
+      status: scalarFirst(src.shipping_status, src.delivery_status, src.shipment_status, src.tracking_status, src.status, fallback.status),
+      events: src.events || src.history || src.tracking_events || fallback.events,
+    }, src);
+    if (t) candidates.push(t);
+  };
+
+  addCandidate(order);
+  for (const key of ['shipping', 'shipment', 'delivery', 'tracking', 'logistic', 'logistics', 'parcel', 'package']) {
+    if (order[key] && typeof order[key] === 'object') addCandidate(order[key], order);
+  }
+  for (const key of ['shipments', 'parcels', 'packages', 'order_lines', 'orderLines', 'lines', 'items', 'fulfillments', 'consignments']) {
+    const arr = Array.isArray(order[key]) ? order[key] : (order[key] ? [order[key]] : []);
+    for (const item of arr) {
+      addCandidate(item, order);
+      for (const nested of ['shipping', 'shipment', 'delivery', 'tracking', 'parcel', 'package']) {
+        if (item && item[nested] && typeof item[nested] === 'object') addCandidate(item[nested], item);
+      }
+    }
+  }
+  for (const arr of collectDeepArrays(order, /(shipment|parcel|package|tracking|delivery|logistic|carrier)s?$/i, 6)) {
+    for (const item of arr) addCandidate(item, order);
+  }
+
+  return candidates.find(t => t.carrier && t.carrier !== 'transporteur') || candidates[0] || null;
+}
+
+function dedupeTrackingEvents(events) {
+  const seen = new Set();
+  return (events || []).filter(e => {
+    const key = `${e.at}|${e.label}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }).sort((a, b) => Number(b.at || 0) - Number(a.at || 0));
 }
 
 function normalizeRatingValue(raw) {
@@ -250,12 +529,68 @@ function parseMarketplaceDate(raw, fallback = Date.now()) {
   return t;
 }
 
+function decodeHtmlEntities(v) {
+  let s = String(v ?? '');
+  if (!s) return '';
+  const named = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ', copy: '©', reg: '®', euro: '€' };
+  for (let i = 0; i < 3; i++) {
+    const before = s;
+    s = s.replace(/&(#x[0-9a-f]+|#\d+|[a-z][a-z0-9]+);/gi, (m, code) => {
+      const c = String(code || '').toLowerCase();
+      if (c[0] === '#') {
+        const n = c[1] === 'x' ? parseInt(c.slice(2), 16) : parseInt(c.slice(1), 10);
+        return Number.isFinite(n) ? String.fromCodePoint(n) : m;
+      }
+      return Object.prototype.hasOwnProperty.call(named, c) ? named[c] : m;
+    });
+    if (s === before) break;
+  }
+  return s;
+}
+
+function htmlToPlainText(v, { preserveBreaks = false } = {}) {
+  let s = decodeHtmlEntities(v);
+  if (!s) return '';
+  s = s.replace(/<\s*(script|style)[^>]*>[\s\S]*?<\/\s*\1\s*>/gi, ' ');
+  s = s.replace(/<\s*br\s*\/?\s*>/gi, preserveBreaks ? '\n' : ' ');
+  s = s.replace(/<\s*\/(p|div|li|tr|h[1-6])\s*>/gi, preserveBreaks ? '\n' : ' ');
+  s = s.replace(/<\s*(p|div|li|tr|h[1-6])(?:\s[^>]*)?>/gi, preserveBreaks ? '\n' : ' ');
+  s = s.replace(/<[^>]+>/g, ' ');
+  s = s.replace(/\r/g, '');
+  if (preserveBreaks) {
+    return s
+      .replace(/[ \t]+\n/g, '\n')
+      .replace(/\n[ \t]+/g, '\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .replace(/[ \t]{2,}/g, ' ')
+      .trim();
+  }
+  return s.replace(/\s+/g, ' ').trim();
+}
+
 function cleanText(v) {
-  return String(v ?? '')
-    .replace(/<[^>]*>/g, ' ')
-    .replace(/&nbsp;/gi, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+  return htmlToPlainText(v, { preserveBreaks: false });
+}
+
+function cleanMessageText(v) {
+  return htmlToPlainText(v, { preserveBreaks: true });
+}
+
+function normalizeClaimMessage(m) {
+  const obj = (m && typeof m === 'object') ? m : { text: m };
+  const fromRaw = cleanText(obj.from || obj.sender_type || obj.author_type || 'client').toLowerCase();
+  const from = ['client', 'seller', 'system'].includes(fromRaw) ? fromRaw : fromRaw.includes('sell') || fromRaw.includes('shop') ? 'seller' : fromRaw.includes('system') ? 'system' : 'client';
+  return {
+    ...obj,
+    from,
+    author: cleanText(obj.author || obj.sender || obj.user || ''),
+    text: cleanMessageText(obj.text ?? obj.body ?? obj.message ?? obj.content ?? obj.description ?? ''),
+    attachments: Array.isArray(obj.attachments) ? obj.attachments : [],
+  };
+}
+
+function normalizeClaimMessages(messages) {
+  return asArray(messages).map(normalizeClaimMessage).filter(m => m.text || (m.attachments && m.attachments.length));
 }
 
 function asArray(v) {
@@ -270,11 +605,98 @@ function safeHeaderFilename(name) {
   return s || 'piece-jointe';
 }
 
+
+function attachmentKeyNorm(k) {
+  return String(k || '').replace(/^@_/, '').replace(/[^a-z0-9]/gi, '').toLowerCase();
+}
+
+function looksLikeAttachmentFilename(v) {
+  const s = cleanText(v);
+  if (!s) return false;
+  if (/^https?:\/\//i.test(s) || /[\\/]/.test(s)) return true;
+  if (/\.(?:pdf|png|jpe?g|gif|webp|heic|bmp|tiff?|docx?|xlsx?|xls|pptx?|zip|rar|7z|txt|csv|json|xml|eml|msg|mp4|mov|avi|mkv|webm|wav|mp3)$/i.test(s)) return true;
+  if (/^(?:img|image|photo|screenshot|capture|scan|piece|pi[eè]ce|pj|attachment|file|document)[-_\s]?\d+/i.test(s)) return true;
+  return false;
+}
+
+function isBadCustomerName(v) {
+  const s = cleanText(v);
+  if (!s) return true;
+  if (looksLikeAttachmentFilename(s)) return true;
+  if (/^(?:CLIENT|CUSTOMER|SELLER|SHOP|SYSTEM|CALLCENTER|FNAC|DARTY|ORDER|MESSAGE)$/i.test(s)) return true;
+  if (/^https?:\/\//i.test(s) || /[\\/]/.test(s)) return true;
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s)) return true;
+  if (/^\d+(?:\.\w+)?$/.test(s)) return true;
+  return false;
+}
+
+function sanitizeCustomerName(v) {
+  const s = cleanText(v);
+  return isBadCustomerName(s) ? '' : s;
+}
+
+const ATTACHMENT_CONTAINER_KEYS = new Set([
+  'attachment', 'attachments', 'attachmentlist', 'attachmentfile', 'attachmentfiles',
+  'file', 'files', 'filelist', 'document', 'documents', 'documentlist',
+  'piecejointe', 'piecesjointes', 'pj', 'pjs'
+]);
+
+function collectAttachmentCandidates(source, out = [], seen = new Set(), hint = false) {
+  if (!source) return out;
+  if (typeof source === 'string') {
+    if (hint && (/^https?:\/\//i.test(source) || source.startsWith('/'))) out.push(source);
+    return out;
+  }
+  if (typeof source !== 'object' || seen.has(source)) return out;
+  seen.add(source);
+
+  if (Array.isArray(source)) {
+    source.forEach(v => collectAttachmentCandidates(v, out, seen, hint));
+    return out;
+  }
+
+  const rawName = scalarFirst(
+    source.name, source.file_name, source.filename, source.fileName, source.label, source.title,
+    source.originalname, source.document_name, source.documentName, source.display_name,
+    source['#text'], source['@_name'], source['@_filename'], source['@_file_name']
+  );
+  const sourceUrl = attachmentSourceUrl(source);
+  const sourceId = attachmentSourceId(source);
+  const sizeRaw = scalarFirst(source.size, source.file_size, source.fileSize, source.length, source.content_length, source.contentLength, source['@_size']);
+  const typeRaw = scalarFirst(source.mimeType, source.mimetype, source.mime_type, source.content_type, source.contentType, source.type, source['@_mime_type'], source['@_content_type']);
+  const nameLooksFile = looksLikeAttachmentFilename(rawName);
+  const hasFileSignal = Boolean(sourceUrl || sizeRaw || typeRaw || nameLooksFile);
+
+  if ((hint || nameLooksFile || sourceUrl || typeRaw || sizeRaw) && hasFileSignal && (rawName || sourceUrl || sourceId)) {
+    out.push(source);
+  }
+
+  for (const [k, v] of Object.entries(source)) {
+    const nk = attachmentKeyNorm(k);
+    const childHint = hint
+      || ATTACHMENT_CONTAINER_KEYS.has(nk)
+      || nk.includes('attachment')
+      || nk.includes('piecejointe')
+      || nk === 'file'
+      || nk === 'files'
+      || nk === 'document'
+      || nk === 'documents'
+      || nk.endsWith('file')
+      || nk.endsWith('filename')
+      || nk.endsWith('document');
+    if (childHint || (v && typeof v === 'object')) {
+      collectAttachmentCandidates(v, out, seen, childHint);
+    }
+  }
+  return out;
+}
+
 function attachmentSourceUrl(a) {
   if (!a) return '';
   if (typeof a === 'string') return /^https?:\/\//i.test(a) || a.startsWith('/') ? a : '';
   return scalarFirst(
     a.downloadUrl, a.download_url, a.url, a.href, a.uri, a.link,
+    a['@_href'], a['@_url'], a['@_download_url'], a['@_downloadUrl'],
     a.file_url, a.fileUrl, a.content_url, a.contentUrl,
     a.document_url, a.documentUrl, a.public_url, a.publicUrl,
     a.download?.url, a.download?.href,
@@ -287,7 +709,8 @@ function attachmentSourceUrl(a) {
 function attachmentSourceId(a) {
   if (!a || typeof a === 'string') return '';
   return scalarFirst(
-    a.id, a.file_id, a.fileId, a.attachment_id, a.attachmentId,
+    a.id, a['@_id'], a.file_id, a.fileId, a.attachment_id, a.attachmentId,
+    a['@_attachment_id'], a['@_attachmentId'],
     a.document_id, a.documentId, a.uuid, a.resource_id, a.resourceId
   );
 }
@@ -301,15 +724,16 @@ function normalizeAttachmentObject(a, index = 0) {
   const sourceUrl = attachmentSourceUrl(a);
   const rawName = typeof a === 'string' ? '' : scalarFirst(
     a?.name, a?.file_name, a?.filename, a?.fileName, a?.label, a?.title,
-    a?.originalname, a?.document_name, a?.documentName, a?.display_name
+    a?.originalname, a?.document_name, a?.documentName, a?.display_name,
+    a?.['#text'], a?.['@_name'], a?.['@_filename'], a?.['@_file_name']
   );
   const fromUrl = sourceUrl
     ? decodeURIComponent(String(sourceUrl).split('?')[0].split('/').filter(Boolean).pop() || '')
     : '';
   const cleanName = cleanText(rawName || fromUrl);
-  const sizeRaw = typeof a === 'string' ? '' : scalarFirst(a?.size, a?.file_size, a?.fileSize, a?.length, a?.content_length, a?.contentLength);
+  const sizeRaw = typeof a === 'string' ? '' : scalarFirst(a?.size, a?.file_size, a?.fileSize, a?.length, a?.content_length, a?.contentLength, a?.['@_size']);
   const size = Number(sizeRaw) || null;
-  const type = typeof a === 'string' ? '' : cleanText(scalarFirst(a?.mimeType, a?.mimetype, a?.mime_type, a?.content_type, a?.contentType, a?.type));
+  const type = typeof a === 'string' ? '' : cleanText(scalarFirst(a?.mimeType, a?.mimetype, a?.mime_type, a?.content_type, a?.contentType, a?.type, a?.['@_mime_type'], a?.['@_content_type']));
   const id = attachmentSourceId(a);
   const name = cleanName || (sourceUrl ? `Pièce jointe ${index + 1}` : '');
   const out = { name, size, type, id, url: sourceUrl };
@@ -319,20 +743,16 @@ function normalizeAttachmentObject(a, index = 0) {
 
 function isUsableInboundAttachment(a) {
   if (!a) return false;
-  // Une simple valeur "0", "1" ou un objet {id: "0"} n'est pas un fichier.
-  // Mirakl M10 renvoie normalement attachments[].id + attachments[].name + attachments[].size.
-  // On exige donc au moins une URL ou un ID accompagné d'un nom/taille/type.
+  // Une simple valeur "0", "1" ou un objet {id:"0", name:"Client"} n'est pas un fichier.
+  // Pour éviter le bug Darty, un nom seul ne suffit pas : il faut une URL, ou un ID + vrai signal de fichier.
   if (a.url) return true;
-  if (a.id && (a.name || a.size || a.type)) return true;
+  if (a.id && (a.size || a.type || looksLikeAttachmentFilename(a.name))) return true;
+  if (looksLikeAttachmentFilename(a.name) && (a.size || a.type)) return true;
   return false;
 }
 
 function normalizeInboundAttachments(source) {
-  const candidates = [
-    source?.attachments, source?.attachment, source?.files, source?.file,
-    source?.attachment_list, source?.attachmentList, source?.documents, source?.document,
-    source?.pieces_jointes, source?.piece_jointe,
-  ].flatMap(asArray);
+  const candidates = collectAttachmentCandidates(source);
 
   const seen = new Set();
   return candidates
@@ -425,6 +845,23 @@ function applyMarketplaceStatus(claim, rawStatus) {
   }
   return claim;
 }
+function looksLikeMessageSubjectSnippet(v) {
+  const s = cleanText(v);
+  if (!s) return false;
+  const folded = s
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase();
+
+  // Quand Fnac/Darty ne fournit pas de vrai motif, certains champs contiennent
+  // le début du message client. Ce n'est pas un sujet lisible pour le tableau.
+  if (/^(bonjour|bonsoir|bjr|hello|madame|monsieur|cher|chere)\b/.test(folded)) return true;
+  if (/\b(je vous contacte|je reviens vers vous|suite a|suite a ma commande|j ai commande|j'ai commande|j ai recu|j'ai recu|je n ai|je n'ai|je voudrais|je souhaite|pouvez vous|pourriez vous|merci de|svp|cordialement)\b/.test(folded)) return true;
+  if (s.length > 80) return true;
+  if (s.split(/\s+/).length > 10 && /[.!?;:]/.test(s)) return true;
+  return false;
+}
+
 function isBadSubject(v) {
   const s = cleanText(v);
   if (!s) return true;
@@ -432,6 +869,21 @@ function isBadSubject(v) {
   // Ce code/libellé ne doit jamais être affiché comme sujet client.
   if (/^[#_\-\s]*\d+[#_\-\s]*$/.test(s)) return true;
   if (/^(topic|subject|reason|motif)[_\-\s]*\d+$/i.test(s)) return true;
+
+  const compact = s
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+
+  // Fnac/Darty/BOMP renvoie souvent des codes techniques dans <type>, par ex. ORDER.
+  // Ces valeurs servent à router la conversation, mais ne sont pas des sujets client.
+  if (/^(order|order_information|orderinformation|client_order|client_order_comment|message|message_order|incident|case|claim|request|thread|discussion|client|customer|seller|shop|system|callcenter)$/i.test(compact)) return true;
+
+  // Sécurité v5 : ne jamais afficher une phrase client comme sujet.
+  if (looksLikeMessageSubjectSnippet(s)) return true;
+
   if (/^(r[ée]clamation|r[ée]clamation client|incident|message client|demande client|customer claim|customer complaint|claim|echanger avec le vendeur partenaire|échanger avec le vendeur partenaire)$/i.test(s)) return true;
   return false;
 }
@@ -451,19 +903,30 @@ function inferSubjectFromText(text) {
   const s = cleanText(text);
   if (!s) return '';
   const t = s.toLowerCase();
-  if (/(colis|commande).*(pas|non|jamais).*(reçu|recu|livré|livre)|livré.*rien reçu|non[ -]?reçu/.test(t)) return 'Colis non reçu';
-  if (/endommag|cass[ée]e?|fissur|ab[iî]m/.test(t)) return 'Produit endommagé';
-  if (/d[ée]fect|panne|ne fonctionne|fonctionne pas|ne s.allume/.test(t)) return 'Produit défectueux';
-  if (/non conforme|mauvais[e]? r[ée]f[ée]rence|erreur de r[ée]f[ée]rence|pas celui command/.test(t)) return 'Produit non conforme';
-  if (/retour|renvoi|renvoyer|retractation|rétractation/.test(t)) return 'Demande de retour';
-  if (/rembours/.test(t)) return 'Remboursement';
+  if (/(colis|commande).*(pas|non|jamais|aucun|rien).*(reçu|recu|livré|livre)|livré.*rien reçu|non[ -]?reçu|colis perdu|suivi.*livr/.test(t)) return 'Colis non reçu';
+  if (/endommag|cass[ée]e?|fissur|ab[iî]m|ray[eé]|enfonc|bris[eé]/.test(t)) return 'Produit endommagé';
+  if (/d[ée]fect|panne|ne fonctionne|fonctionne pas|ne s.allume|hs|hors service|gr[eé]sille/.test(t)) return 'Produit défectueux';
+  if (/non conforme|mauvais[e]? r[ée]f[ée]rence|erreur de r[ée]f[ée]rence|pas celui command|autre mod[eè]le|mauvais produit|coloris.*correspond/.test(t)) return 'Produit non conforme';
+  if (/manquant|pi[eè]ce manquante|visserie|accessoire manquant|il manque/.test(t)) return 'Pièce manquante';
+  if (/annul|annulation/.test(t)) return 'Annulation de commande';
+  if (/rendez[ -]?vous|rdv|cr[eé]neau|reprogramm/.test(t)) return 'Livraison / rendez-vous';
+  if (/retour|renvoi|renvoyer|retractation|rétractation|[ée]tiquette retour/.test(t)) return 'Demande de retour';
+  if (/rembours|avoir|cr[ée]dit/.test(t)) return 'Remboursement';
   if (/facture/.test(t)) return 'Facture manquante';
-  if (/garantie|sav/.test(t)) return 'Question SAV / garantie';
-  if (/retard|d[ée]lai|livraison.*d[ée]pass/.test(t)) return 'Retard de livraison';
-  return s.length > 70 ? `${s.slice(0, 67)}…` : s;
+  if (/garantie|sav|service apr[eè]s vente/.test(t)) return 'Question SAV / garantie';
+  if (/retard|d[ée]lai|livraison.*d[ée]pass|livraison.*repouss|toujours rien|pas de nouvelle/.test(t)) return 'Retard de livraison';
+
+  // Avant, on recopiait ici le début du message client. En v5, on ne le fait plus :
+  // si aucun motif fiable n'est reconnu, le sujet reste générique et le message complet
+  // reste consultable uniquement dans la conversation.
+  return '';
 }
 function normalizeSubject(subject, fallbackText = '') {
-  return firstReadableSubject(subject) || inferSubjectFromText(fallbackText) || 'Réclamation client';
+  const direct = firstReadableSubject(subject);
+  if (direct) return direct;
+  const rejectedSubject = cleanText(subject);
+  const textForInference = [fallbackText, rejectedSubject].filter(Boolean).join(' ');
+  return inferSubjectFromText(textForInference) || 'Réclamation client';
 }
 async function fetchWithTimeout(url, options = {}, timeoutMs = Number(process.env.PROVIDER_TIMEOUT_MS || 15000)) {
   const ctrl = new AbortController();
@@ -884,6 +1347,7 @@ const octopia = (() => {
       marketplaceStatus: rawStatus,
       updatedAt: parseMarketplaceDate(d.updatedAt || d.lastUpdateDate || d.lastMessageDate || d.createdAt, Date.now()),
       messages,
+      tracking: normalizeTracking(d.tracking || d.shipment || d.shipping || d.delivery, d),
       ctx: { discussionId, salesChannel, customerId, kind: 'discussion', marketplaceStatus: rawStatus, rawStatus, closedByMarketplace: !isOpen },
     });
   }
@@ -1186,6 +1650,7 @@ const mirakl = {
       marketplaceStatus: rawStatus,
       updatedAt: parseMarketplaceDate(rawUpdatedAt),
       messages,
+      tracking: normalizeTracking(thread.tracking || thread.shipment || thread.shipping || thread.delivery, thread),
       ctx: {
         threadId: id,
         rawUpdatedAt,
@@ -1332,9 +1797,68 @@ const mirakl = {
     return dedupeProductNotes(notes);
   },
 
+  async fetchOrdersByIds(provider, orderIds) {
+    const ids = [...new Set((orderIds || []).map(String).map(s => s.trim()).filter(Boolean))]
+      .slice(0, positiveInt(process.env.MIRAKL_TRACKING_MAX_ORDERS, 120, 1, 500));
+    const out = [];
+    const chunkSize = positiveInt(process.env.MIRAKL_ORDER_TRACKING_BATCH, 20, 1, 50);
+
+    for (let i = 0; i < ids.length; i += chunkSize) {
+      const chunk = ids.slice(i, i + chunkSize);
+      const qs = new URLSearchParams();
+      qs.set('order_ids', chunk.join(','));
+      try {
+        const data = await this.api(provider, `/orders?${qs.toString()}`);
+        out.push(...this.extractOrders(data));
+        continue;
+      } catch (e) {
+        console.warn(`[mirakl/${provider.code}] suivi commandes: batch /orders?order_ids impossible (${e.message})`);
+      }
+
+      // Repli : certaines instances acceptent le détail unitaire.
+      for (const id of chunk) {
+        try {
+          const data = await this.api(provider, `/orders/${encodeURIComponent(id)}`);
+          const order = data?.order || data?.data || data;
+          if (order && typeof order === 'object') out.push(order);
+        } catch (e) {
+          console.warn(`[mirakl/${provider.code}] suivi commande ${id} ignoré: ${e.message}`);
+        }
+      }
+    }
+    return out;
+  },
+
+  async enrichClaimsWithOrderTracking(provider, claims) {
+    if (String(process.env.MIRAKL_FETCH_ORDER_TRACKING || 'true') === 'false') return claims;
+    const targets = (claims || []).filter(c => c?.orderId && (!c.tracking || !c.tracking.carrier || c.tracking.carrier === 'transporteur'));
+    if (!targets.length) return claims;
+
+    try {
+      const orders = await this.fetchOrdersByIds(provider, targets.map(c => c.orderId));
+      const byId = new Map();
+      for (const order of orders || []) {
+        const ids = [
+          order.order_id, order.id, order.orderId, order.commercial_id, order.commercialId,
+          order.order_reference, order.orderReference, order.marketplace_order_id, order.marketplaceOrderId
+        ].map(v => scalarValue(v)).filter(Boolean);
+        for (const id of ids) byId.set(id, order);
+      }
+      for (const claim of targets) {
+        const order = byId.get(String(claim.orderId));
+        const t = order ? normalizeOrderTracking(order) : null;
+        if (t) claim.tracking = mergeTrackingInfo(claim.tracking, t);
+      }
+    } catch (e) {
+      console.warn(`[mirakl/${provider.code}] enrichissement suivi ignoré: ${e.message}`);
+    }
+    return claims;
+  },
+
   async fetchClaims(provider) {
     const threads = await this.fetchAllThreads(provider);
-    return threads.map(t => this.mapThread(provider, t));
+    const claims = threads.map(t => this.mapThread(provider, t));
+    return await this.enrichClaimsWithOrderTracking(provider, claims);
   },
 
   async fetchThread(provider, ctx) {
@@ -1345,7 +1869,9 @@ const mirakl = {
     // On demande les messages uniquement au clic, pour garder le chargement initial rapide.
     const data = await this.api(provider, `/inbox/threads/${encodeURIComponent(threadId)}?with_messages=true`);
     const thread = data?.data || data?.thread || data;
-    return this.mapThread(provider, thread, { ...ctx, threadId });
+    const claim = this.mapThread(provider, thread, { ...ctx, threadId });
+    await this.enrichClaimsWithOrderTracking(provider, [claim]);
+    return claim;
   },
 
   async downloadAttachment(provider, sourceUrl, attachment = {}) {
@@ -1746,6 +2272,230 @@ ${inner}
     return '';
   }
 
+
+  function bompTrackingUrlIsSafe(rawUrl = '') {
+    return isLikelyTrackingUrl(rawUrl) && Boolean(inferCarrierFromTrackingUrl(rawUrl));
+  }
+
+  function bompTrackingNumberFromUrl(rawUrl = '') {
+    const url = safeTrackingUrl(rawUrl);
+    if (!url || !bompTrackingUrlIsSafe(url)) return '';
+    const decoded = (() => {
+      try { return decodeURIComponent(url); } catch { return url; }
+    })();
+    const queryMatch = decoded.match(/[?&](?:code|tracking-id|trackingNumber|tracking_number|tracking|tracknum|listeNumerosLT|match|numColis|numeroColis|numeroExpedition|numExpedition|cons|skybillNumber|parcel|parcelno|parcelNumber|shipment|shipmentNumber|awb|waybill|trknbr|reference)=([^&#\s]+)/i);
+    if (queryMatch && looksLikeTrackingNumber(queryMatch[1])) return cleanText(queryMatch[1]);
+
+    const pathBits = decoded
+      .split(/[/?#&=]+/)
+      .map(x => cleanText(x).replace(/[<>'"),.;]+$/g, '').replace(/^[<>'"(]+/g, ''))
+      .filter(Boolean)
+      .reverse();
+    for (const bit of pathBits) {
+      if (looksLikeTrackingNumber(bit) && !/^(html?|fr|en|tracking|track|trace|suivi|colis|parcel|shipment|expedition)$/i.test(bit)) return bit;
+    }
+    return '';
+  }
+
+  function bompExtractUrlsFromText(text = '') {
+    const raw = String(text || '');
+    return (raw.match(/https?:\/\/[^\s<>'"]+/gi) || [])
+      .map(u => cleanText(u).replace(/[),.;]+$/g, ''))
+      .filter(u => bompTrackingUrlIsSafe(u));
+  }
+
+  function bompTrackingCandidateIsSafe(value, ctx = {}) {
+    const s = cleanText(value).replace(/\s+/g, '').replace(/^[#:/-]+|[.,;:)/-]+$/g, '');
+    if (!looksLikeTrackingNumber(s)) return false;
+    const orderId = cleanText(ctx.orderId || '').replace(/\s+/g, '');
+    const detailId = cleanText(ctx.orderDetailId || '').replace(/\s+/g, '');
+    const messageId = cleanText(ctx.messageId || '').replace(/\s+/g, '');
+    if (orderId && s.toUpperCase() === orderId.toUpperCase()) return false;
+    if (detailId && s.toUpperCase() === detailId.toUpperCase()) return false;
+    if (messageId && s.toUpperCase() === messageId.toUpperCase()) return false;
+    if (/^\d{4}-\d{2}-\d{2}/.test(s)) return false;
+    if (/^\d{1,2}[/.]\d{1,2}[/.]\d{2,4}$/.test(s)) return false;
+    // Évite de prendre les IDs techniques Fnac/Darty comme suivis quand aucun indice transporteur n'est présent.
+    if (!ctx.carrierHint && looksLikeBompOrderId(s)) return false;
+    return true;
+  }
+
+  function bompCarrierFromText(text = '') {
+    const s = foldStatusText(text);
+    return normalizeCarrierCode(s) || inferCarrierFromTrackingUrl(s) || '';
+  }
+
+  function bompTrackingFromText(text = '', ctx = {}) {
+    const blob = cleanText(text);
+    if (!blob) return null;
+
+    const urls = bompExtractUrlsFromText(blob);
+    for (const url of urls) {
+      const carrier = inferCarrierFromTrackingUrl(url) || bompCarrierFromText(url);
+      const num = bompTrackingNumberFromUrl(url);
+      if (num && bompTrackingCandidateIsSafe(num, { ...ctx, carrierHint: carrier })) {
+        return normalizeTracking({ number: num, url, carrier }, {});
+      }
+    }
+
+    const carrierHint = bompCarrierFromText(blob);
+    const nearKeyword = [
+      /(?:n(?:um[ée]ro)?\s*(?:de\s*)?(?:suivi|tracking|colis|exp[ée]dition|transport)|tracking\s*(?:number|id)?|suivi\s*(?:colis)?|colis\s*(?:n[°o])?|awb|waybill)\s*[:#n°\-–]*\s*([A-Z0-9][A-Z0-9._\-]{5,59})/ig,
+      /(?:lien|url)\s*(?:de\s*)?(?:suivi|tracking)\s*[:#n°\-–]*\s*([A-Z0-9][A-Z0-9._\-]{5,59})/ig,
+    ];
+    for (const re of nearKeyword) {
+      let m;
+      while ((m = re.exec(blob))) {
+        const n = cleanText(m[1]).replace(/^[#:/-]+|[.,;:)/-]+$/g, '');
+        if (bompTrackingCandidateIsSafe(n, { ...ctx, carrierHint })) {
+          return normalizeTracking({ number: n, carrier: carrierHint }, {});
+        }
+      }
+    }
+
+    const carrierSpecific = [];
+    if (/ups|united parcel/i.test(blob)) carrierSpecific.push(/\b1Z[A-Z0-9]{10,}\b/ig);
+    if (/colissimo|la poste|laposte|courrier suivi/i.test(blob)) carrierSpecific.push(/\b(?:[68][A-Z][A-Z0-9]{9,13}|[A-Z]{2}\d{9}FR|\d[A-Z]\d{11})\b/ig);
+    if (/chrono|chronopost/i.test(blob)) carrierSpecific.push(/\b(?:[A-Z]{2}\d{8,12}(?:FR)?|\d{13})\b/ig);
+    if (/\bdpd\b|dpd predict/i.test(blob)) carrierSpecific.push(/\b(?:\d{10,16}|[A-Z0-9]{12,18})\b/ig);
+    if (/\bgls\b/i.test(blob)) carrierSpecific.push(/\b(?:[A-Z0-9]{8,20})\b/ig);
+    if (/dhl/i.test(blob)) carrierSpecific.push(/\b[A-Z0-9]{10,20}\b/ig);
+    if (/fedex|federal express/i.test(blob)) carrierSpecific.push(/\b\d{10,22}\b/ig);
+    if (/tnt/i.test(blob)) carrierSpecific.push(/\b[A-Z0-9]{8,20}\b/ig);
+    if (/mondial|relay/i.test(blob)) carrierSpecific.push(/\b[A-Z0-9]{8,20}\b/ig);
+    if (/relais colis|relaiscolis/i.test(blob)) carrierSpecific.push(/\b[A-Z0-9]{8,20}\b/ig);
+    if (/colis prive|colispriv/i.test(blob)) carrierSpecific.push(/\b[A-Z0-9]{8,20}\b/ig);
+    if (/cchezvous|c chez vous|chezvous/i.test(blob)) carrierSpecific.push(/\b[A-Z0-9]{10,24}\b/ig);
+    if (/geodis|calberson/i.test(blob)) carrierSpecific.push(/\b[A-Z0-9]{8,24}\b/ig);
+
+    for (const re of carrierSpecific) {
+      let m;
+      while ((m = re.exec(blob))) {
+        const n = cleanText(m[0]);
+        if (bompTrackingCandidateIsSafe(n, { ...ctx, carrierHint })) {
+          return normalizeTracking({ number: n, carrier: carrierHint }, {});
+        }
+      }
+    }
+
+    return null;
+  }
+
+  function bompDeepTextByRegex(obj, keyRegex, validate = null, maxDepth = 7) {
+    const seen = new Set();
+    function walk(v, depth) {
+      if (!v || typeof v !== 'object' || depth > maxDepth || seen.has(v)) return '';
+      seen.add(v);
+      if (Array.isArray(v)) {
+        for (const item of v) {
+          const got = walk(item, depth + 1);
+          if (got) return got;
+        }
+        return '';
+      }
+      for (const [k, val] of Object.entries(v)) {
+        if (keyRegex.test(bompNormKey(k))) {
+          const got = bompScalarText(val);
+          if (got && (!validate || validate(got, k))) return got;
+        }
+      }
+      for (const val of Object.values(v)) {
+        const got = walk(val, depth + 1);
+        if (got) return got;
+      }
+      return '';
+    }
+    return walk(obj, 0);
+  }
+
+  function extractBompTracking(obj, ctx = {}) {
+    if (!obj || typeof obj !== 'object') return null;
+
+    const orderId = ctx.orderId || extractBompOrderId(obj);
+    const orderDetailId = ctx.orderDetailId || extractBompOrderDetailId(obj);
+    const messageId = ctx.messageId || extractBompMessageId(obj);
+    const safeCtx = { orderId, orderDetailId, messageId };
+
+    // Important : carrierRaw doit être calculé avant directNumber, car le validateur
+    // des numéros utilise l'indice carrierHint. Sinon Node déclenche une TDZ :
+    // "Cannot access 'carrierRaw' before initialization".
+    const carrierRaw = bompText(
+      obj.carrier, obj.carrier_code, obj.carrierCode, obj.carrier_name, obj.carrierName,
+      obj.transporteur, obj.transporter, obj.shipping_carrier, obj.shippingCarrier,
+      obj.shipping_company, obj.shippingCompany, obj.shipping_method, obj.shippingMethod,
+      obj.delivery_carrier, obj.deliveryCarrier, obj.delivery_company, obj.deliveryCompany,
+      obj.shipping_type_label, obj.shippingTypeLabel, obj.shipping_type_code, obj.shippingTypeCode
+    ) || bompDeepText(obj, [
+      'carrier', 'carrier_code', 'carrierCode', 'carrier_name', 'carrierName',
+      'transporteur', 'transporter', 'shipping_carrier', 'shippingCarrier',
+      'shipping_company', 'shippingCompany', 'shipping_method', 'shippingMethod',
+      'delivery_carrier', 'deliveryCarrier', 'delivery_company', 'deliveryCompany',
+      'shipping_type_label', 'shippingTypeLabel', 'shipping_type_code', 'shippingTypeCode',
+      'logistician', 'shipper', 'courier', 'courier_name', 'courierName'
+    ]) || bompDeepTextByRegex(obj, /(carrier|transporteur|transporter|courier|shipper|shippingmethod|deliverycarrier|logistician)/i,
+      v => Boolean(normalizeCarrierCode(v))
+    );
+
+    const directNumber = bompText(
+      obj.tracking_number, obj.trackingNumber, obj.tracking_code, obj.trackingCode, obj.tracking_id, obj.trackingId,
+      obj.parcel_number, obj.parcelNumber, obj.package_number, obj.packageNumber, obj.shipment_number, obj.shipmentNumber,
+      obj.shipping_number, obj.shippingNumber, obj.shipping_tracking, obj.shippingTracking, obj.shipping_tracking_number, obj.shippingTrackingNumber,
+      obj.awb, obj.waybill, obj.colis, obj.no_colis, obj.numero_colis, obj.numero_suivi, obj.numero_expedition
+    ) || bompDeepText(obj, [
+      'tracking_number', 'trackingNumber', 'tracking_code', 'trackingCode', 'tracking_id', 'trackingId',
+      'parcel_number', 'parcelNumber', 'package_number', 'packageNumber', 'shipment_number', 'shipmentNumber',
+      'shipping_number', 'shippingNumber', 'shipping_tracking', 'shippingTracking', 'shipping_tracking_number', 'shippingTrackingNumber',
+      'awb', 'waybill', 'colis', 'no_colis', 'numero_colis', 'numero_suivi', 'numero_expedition',
+      'tracking_ref', 'trackingReference', 'tracking_reference', 'parcel_ref', 'parcelReference', 'shipping_ref'
+    ]) || bompDeepTextByRegex(obj, /(tracking|suivi|colis|parcel|shipment|shipping|expedition|waybill|awb).*(number|num|code|id|ref|reference)$/i,
+      v => bompTrackingCandidateIsSafe(v, { ...safeCtx, carrierHint: Boolean(carrierRaw) })
+    );
+
+    const directUrl = safeTrackingUrl(bompText(
+      obj.tracking_url, obj.trackingUrl, obj.shipping_tracking_url, obj.shippingTrackingUrl, obj.url_tracking, obj.tracking_link, obj.trackingLink,
+      obj.parcel_url, obj.shipment_url, obj.delivery_url
+    ) || bompDeepText(obj, [
+      'tracking_url', 'trackingUrl', 'shipping_tracking_url', 'shippingTrackingUrl', 'url_tracking', 'tracking_link', 'trackingLink',
+      'parcel_url', 'parcelUrl', 'shipment_url', 'shipmentUrl', 'delivery_url', 'deliveryUrl'
+    ]) || bompDeepTextByRegex(obj, /(tracking|suivi|colis|parcel|shipment|shipping|expedition|delivery).*(url|link)$|^(urltracking|trackinglink)$/i,
+      v => bompTrackingUrlIsSafe(v)
+    ));
+
+    const statusRaw = bompText(
+      obj.tracking_status, obj.delivery_status, obj.shipment_status, obj.shipping_status, obj.status, obj.state
+    ) || bompDeepText(obj, ['tracking_status', 'delivery_status', 'shipment_status', 'shipping_status', 'status', 'state']);
+
+    const urlNumber = bompTrackingNumberFromUrl(directUrl);
+    const carrierFromUrl = inferCarrierFromTrackingUrl(directUrl);
+    const carrier = normalizeCarrierCode(carrierRaw, directNumber || urlNumber, directUrl) || carrierFromUrl;
+    const number = cleanText(directNumber || urlNumber);
+
+    let structured = null;
+    if (number && bompTrackingCandidateIsSafe(number, { ...safeCtx, carrierHint: carrier || directNumber || urlNumber })) {
+      structured = normalizeTracking({ number, carrier: carrier || carrierRaw, url: directUrl, status: statusRaw }, {});
+    }
+
+    // Les infos Fnac/Darty sont parfois uniquement dans le texte envoyé au client.
+    const textBlob = [
+      extractBompClientText(obj), extractBompSellerText(obj),
+      bompDeepText(obj, ['message', 'message_description', 'description', 'body', 'content', 'comment', 'seller_comment', 'seller_answer']),
+      directUrl
+    ].filter(Boolean).join(' ');
+    const fromText = bompTrackingFromText(textBlob, { ...safeCtx, carrierHint: carrier });
+
+    const fromGeneric = normalizeOrderTracking(obj) || normalizeTracking(obj.tracking || obj.shipment || obj.shipping || obj.delivery, obj);
+    let finalTracking = mergeTrackingInfo(mergeTrackingInfo(fromGeneric, structured), fromText);
+
+    // Si on a récupéré un vrai transporteur dans un champ séparé mais que le tracking normalisé n'a gardé que "transporteur".
+    const forcedCarrier = normalizeCarrierCode(carrierRaw, finalTracking?.number || number, finalTracking?.url || directUrl) || carrierFromUrl;
+    if (finalTracking && forcedCarrier && finalTracking.carrier === 'transporteur') finalTracking.carrier = forcedCarrier;
+
+    if (String(process.env.BOMP_TRACKING_DEBUG || '') === '1' && orderId) {
+      console.log(`[bomp/${ctx.providerCode || 'bomp'}] tracking order=${orderId} carrierRaw=${carrierRaw || '-'} url=${directUrl || '-'} number=${number || finalTracking?.number || '-'} -> ${finalTracking ? `${finalTracking.carrier}/${finalTracking.number}/${finalTracking.status}` : 'none'}`);
+    }
+    return finalTracking;
+  }
+
   function looksLikeBompUuid(v) {
     const s = cleanText(v);
     return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
@@ -1917,6 +2667,7 @@ ${inner}
     if (!base.orderId && detail.orderId) base.orderId = detail.orderId;
     if ((!base.customer || base.customer === 'Client') && detail.customer && detail.customer !== 'Client') base.customer = detail.customer;
     if (!base.product && detail.product) base.product = detail.product;
+    if (detail.tracking) base.tracking = mergeTrackingInfo(base.tracking, detail.tracking);
     if (isBadSubject(base.subject) && detail.subject && !isBadSubject(detail.subject)) base.subject = detail.subject;
     // Le statut marketplace le plus précis doit survivre aux fusions message/incident.
     if (detail.marketplaceStatus || detail.statusRaw || detail._ctx?.marketplaceStatus || detail._ctx?.rawStatus) {
@@ -1959,7 +2710,7 @@ ${inner}
   function extractBompCustomerInfo(obj) {
     const first = bompDeepText(obj, ['client_firstname', 'buyer_firstname', 'customer_firstname', 'firstname', 'first_name']);
     const last = bompDeepText(obj, ['client_lastname', 'buyer_lastname', 'customer_lastname', 'lastname', 'last_name']);
-    const name = cleanText([first, last].filter(Boolean).join(' '));
+    const name = sanitizeCustomerName([first, last].filter(Boolean).join(' '));
 
     const customerId = cleanText(
       bompText(
@@ -1976,13 +2727,21 @@ ${inner}
     );
 
     const email = cleanText(bompDeepText(obj, ['client_email', 'customer_email', 'buyer_email', 'email', 'mail']));
+    // IMPORTANT Darty : ne jamais chercher le champ générique "name".
+    // Il apparaît aussi dans <attachment><name>photo.jpg</name></attachment> et finissait en nom client.
+    const labelCandidate = bompDeepText(obj, ['customer_name', 'buyer_name', 'client_name'])
+      || bompFuzzyText(obj,
+        ['customername', 'buyername', 'clientname'],
+        ['attachment', 'file', 'document', 'piecejointe', 'filename'],
+        v => !isBadCustomerName(v)
+      );
     const label = name
-      || bompDeepText(obj, ['customer_name', 'buyer_name', 'client_name', 'name'])
-      || customerId
-      || email;
+      || sanitizeCustomerName(labelCandidate)
+      || sanitizeCustomerName(customerId)
+      || sanitizeCustomerName(email);
 
     return {
-      customer: cleanText(label),
+      customer: sanitizeCustomerName(label),
       customerId,
       email,
     };
@@ -2000,7 +2759,8 @@ ${inner}
       customer: cleanText(customerInfo.customer),
       customerId: cleanText(customerInfo.customerId),
       product: cleanText(product),
-      ean: cleanText(ean)
+      ean: cleanText(ean),
+      tracking: extractBompTracking(o, { providerCode: 'bomp-order', orderId })
     };
   }
 
@@ -2010,6 +2770,7 @@ ${inner}
     if ((!claim.customer || claim.customer === 'Client') && info.customer) claim.customer = info.customer;
     if (!claim.customerId && info.customerId) claim.customerId = info.customerId;
     if (!claim.product && info.product) claim.product = info.product;
+    if (info.tracking) claim.tracking = mergeTrackingInfo(claim.tracking, info.tracking);
     claim._ctx = { ...(claim._ctx || {}), orderId: claim.orderId };
     return claim;
   }
@@ -2061,27 +2822,35 @@ ${inner}
   }
 
   function mapEmbeddedBompMessage(m, defaultAuthor = 'client') {
+    const attachments = normalizeInboundAttachments(m);
     return {
       from: parseBompAuthor(extractBompMessageFromType(m) || defaultAuthor),
       at: parseBompDate(
         m['@_date'], m.date, m.created_at, m.createdAt, m.updated_at, m.updatedAt,
         m.sent_at, m.creation_date, m.modification_date
       ),
-      text: extractBompClientText(m)
+      text: extractBompClientText(m),
+      ...(attachments.length ? { attachments } : {})
     };
   }
 
   function dedupeMessages(messages) {
     const seen = new Set();
     return (messages || [])
-      .filter(m => m && (m.text || m.body || m.message))
-      .map(m => ({
-        from: m.from || parseBompAuthor(m.author || m.message_from || m.from_type || m['@_from']),
-        at: Number(m.at) || parseBompDate(m.rawAt || m.date || m.created_at || m.updated_at),
-        text: cleanText(m.text || m.body || m.message || m.description || m.content || ''),
-      }))
+      .map(m => {
+        const attachments = Array.isArray(m?.attachments) ? m.attachments : normalizeInboundAttachments(m);
+        const text = cleanText(m?.text || m?.body || m?.message || m?.description || m?.content || '');
+        return {
+          from: m?.from || parseBompAuthor(m?.author || m?.message_from || m?.from_type || m?.['@_from']),
+          at: Number(m?.at) || parseBompDate(m?.rawAt || m?.date || m?.created_at || m?.updated_at),
+          text,
+          ...(attachments.length ? { attachments } : {})
+        };
+      })
+      .filter(m => m && (m.text || (m.attachments && m.attachments.length)))
       .filter(m => {
-        const key = `${m.from}|${m.at}|${m.text}`;
+        const attKey = (m.attachments || []).map(a => [a.id, a.url, a.name, a.size].filter(Boolean).join(':')).join(',');
+        const key = `${m.from}|${m.at}|${m.text}|${attKey}`;
         if (seen.has(key)) return false;
         seen.add(key);
         return true;
@@ -2167,9 +2936,10 @@ ${inner}
     return makeClaim(provider.code, {
       providerType: 'bomp',
       id: incidentId || orderId || Math.random().toString(36).slice(2),
-      customer: extractBompCustomerInfo(it).customer || bompText(it['@_customer'], it.customer, it.buyer, it.client, it.client_id) || bompDeepText(it, [
-        'customer', 'customer_name', 'buyer', 'buyer_name', 'client', 'client_name', 'client_id', 'buyer_id'
-      ]) || 'Client',
+      customer: extractBompCustomerInfo(it).customer
+        || sanitizeCustomerName(bompText(it['@_customer'], it.customer, it.buyer, it.client, it.client_id))
+        || sanitizeCustomerName(bompDeepText(it, ['customer_name', 'buyer_name', 'client_name', 'client_id', 'buyer_id']))
+        || 'Client',
       customerId: extractBompCustomerInfo(it).customerId,
       subject,
       orderId,
@@ -2182,6 +2952,7 @@ ${inner}
       updatedAt,
       dueAt: computeDueAt(msgs.length ? msgs : [{ from: 'client', at: openedAt }]),
       messages: msgs,
+      tracking: extractBompTracking(it, { providerCode: provider.code, orderId, orderDetailId, messageId: extractBompMessageId(it) }),
       ctx: {
         kind: 'incident',
         incidentId,
@@ -2217,9 +2988,11 @@ ${inner}
     return makeClaim(provider.code, {
       providerType: 'bomp',
       id: id || orderId || Math.random().toString(36).slice(2),
-      customer: extractBompCustomerInfo(m).customer || bompText(m.client_id, m.customer, m.buyer) || bompDeepText(m, [
-        'customer', 'customer_name', 'buyer', 'buyer_name', 'client', 'client_name', 'client_id', 'buyer_id'
-      ]) || (author === 'client' && fromLabel && !/^(CLIENT|CALLCENTER|FNAC|DARTY)$/i.test(fromLabel) ? fromLabel : 'Client'),
+      customer: extractBompCustomerInfo(m).customer
+        || sanitizeCustomerName(bompText(m.client_id, m.customer, m.buyer))
+        || sanitizeCustomerName(bompDeepText(m, ['customer_name', 'buyer_name', 'client_name', 'client_id', 'buyer_id']))
+        || (author === 'client' && fromLabel && !/^(CLIENT|CALLCENTER|FNAC|DARTY)$/i.test(fromLabel) ? sanitizeCustomerName(fromLabel) : '')
+        || 'Client',
       customerId: extractBompCustomerInfo(m).customerId,
       subject: normalizeSubject(firstReadableSubject(
         m.subject, m.message_subject, m.type,
@@ -2236,6 +3009,7 @@ ${inner}
       messages: (text || normalizeInboundAttachments(m).length)
         ? [{ from: author, at, text, attachments: normalizeInboundAttachments(m) }]
         : [],
+      tracking: extractBompTracking(m, { providerCode: provider.code, orderId, messageId: id }),
       ctx: { kind: 'message', messageId: id, orderId, marketplaceStatus: scalarFirst(m.message_state, m.state), rawStatus: scalarFirst(m.message_state, m.state), needsReply: author === 'client' },
     });
   }
@@ -2259,9 +3033,10 @@ ${inner}
     return makeClaim(provider.code, {
       providerType: 'bomp',
       id: commentId || orderId || Math.random().toString(36).slice(2),
-      customer: extractBompCustomerInfo(c).customer || bompText(c.client_id, c.customer, c.buyer) || bompDeepText(c, [
-        'customer', 'customer_name', 'buyer', 'buyer_name', 'client', 'client_name', 'client_id', 'buyer_id'
-      ]) || 'Client',
+      customer: extractBompCustomerInfo(c).customer
+        || sanitizeCustomerName(bompText(c.client_id, c.customer, c.buyer))
+        || sanitizeCustomerName(bompDeepText(c, ['customer_name', 'buyer_name', 'client_name', 'client_id', 'buyer_id']))
+        || 'Client',
       customerId: extractBompCustomerInfo(c).customerId,
       subject: normalizeSubject(firstReadableSubject(
         c.subject, c.type, bompDeepText(c, ['subject', 'message_subject', 'reason', 'reason_label', 'motif', 'type'])
@@ -2274,6 +3049,7 @@ ${inner}
       status: sellerReply ? 'attente' : 'nouveau',
       updatedAt: at,
       messages,
+      tracking: extractBompTracking(c, { providerCode: provider.code, orderId, messageId: commentId }),
       ctx: {
         kind: 'order_comment',
         commentId,
@@ -2308,9 +3084,10 @@ ${inner}
       providerType: 'bomp',
       id: commentId || orderId,
       orderId,
-      customer: extractBompCustomerInfo(c).customer || bompText(c.client_id, c.customer, c.buyer) || bompDeepText(c, [
-        'customer', 'customer_name', 'buyer', 'buyer_name', 'client', 'client_name', 'client_id', 'buyer_id'
-      ]) || 'Client',
+      customer: extractBompCustomerInfo(c).customer
+        || sanitizeCustomerName(bompText(c.client_id, c.customer, c.buyer))
+        || sanitizeCustomerName(bompDeepText(c, ['customer_name', 'buyer_name', 'client_name', 'client_id', 'buyer_id']))
+        || 'Client',
       product,
       ean,
       rating,
@@ -2913,9 +3690,10 @@ function mapStatus(text) {
   const t = (text || '').toLowerCase();
   if (/livr|delivered|remis/.test(t)) return 'livre';
   if (/point relais|relais|pickup|disposal|à retirer|consigne/.test(t)) return 'pret_retrait';
-  if (/incident|échec|echec|absent|retour|refus|exception|problème/.test(t)) return 'incident';
-  if (/préparation|preparation|étiquette|label|enregistr|created|annonce/.test(t)) return 'en_attente';
-  return 'en_transit';
+  if (/incident|échec|echec|absent|retour|refus|exception|problème|anomalie|perdu/.test(t)) return 'incident';
+  if (/préparation|preparation|étiquette|label|enregistr|created|annonce|attente|pending/.test(t)) return 'en_attente';
+  if (/expédi|expedie|shipped|pris en charge|accepted|collected|achemin|transit|hub|tri|route|en cours de livraison|out for delivery|en livraison|départ|depart|arriv/.test(t)) return 'en_transit';
+  return 'inconnu';
 }
 
 // Cache de token OAuth (UPS, FedEx)
@@ -2940,7 +3718,7 @@ const CARRIERS = {
       if (!r.ok) throw new Error(`Colissimo ${r.status}`);
       const sh = (await r.json()).shipment || {};
       const events = (sh.event || []).map(e => ({ at: e.date, label: e.label }));
-      return { status: events[0] ? mapStatus(events[0].label) : 'en_transit', etaH: null, events };
+      return { status: events[0] ? mapStatus(events[0].label) : 'inconnu', etaH: null, events };
     },
   },
 
@@ -2954,7 +3732,7 @@ const CARRIERS = {
       if (!r.ok) throw new Error(`Chronopost ${r.status}`);
       const j = await r.json();
       const evs = (j.listEventInfoComp || j.events || []).map(e => ({ at: e.eventDate || e.date, label: e.eventLabel || e.label })); // TODO
-      return { status: evs[0] ? mapStatus(evs[0].label) : 'en_transit', etaH: null, events: evs };
+      return { status: evs[0] ? mapStatus(evs[0].label) : 'inconnu', etaH: null, events: evs };
     },
   },
 
@@ -2968,7 +3746,7 @@ const CARRIERS = {
       if (!r.ok) throw new Error(`DPD ${r.status}`);
       const j = await r.json();
       const evs = (j.scanInfo || j.events || []).map(e => ({ at: e.date, label: e.status || e.label })); // TODO
-      return { status: evs[0] ? mapStatus(evs[0].label) : 'en_transit', etaH: null, events: evs };
+      return { status: evs[0] ? mapStatus(evs[0].label) : 'inconnu', etaH: null, events: evs };
     },
   },
 
@@ -2983,7 +3761,7 @@ const CARRIERS = {
       const j = await r.json();
       const p = (j.parcels && j.parcels[0]) || {};
       const evs = (p.events || []).map(e => ({ at: e.timestamp, label: e.description })); // TODO
-      return { status: evs[0] ? mapStatus(evs[0].label) : 'en_transit', etaH: null, events: evs };
+      return { status: evs[0] ? mapStatus(evs[0].label) : 'inconnu', etaH: null, events: evs };
     },
   },
 
@@ -3000,7 +3778,7 @@ const CARRIERS = {
       const j = await r.json();
       const pkg = j.trackResponse?.shipment?.[0]?.package?.[0] || {};
       const evs = (pkg.activity || []).map(a => ({ at: `${a.date} ${a.time}`, label: a.status?.description })); // TODO
-      return { status: evs[0] ? mapStatus(evs[0].label) : 'en_transit', etaH: null, events: evs };
+      return { status: evs[0] ? mapStatus(evs[0].label) : 'inconnu', etaH: null, events: evs };
     },
   },
 
@@ -3014,7 +3792,7 @@ const CARRIERS = {
       const s = (await r.json()).shipments?.[0] || {};
       const evs = (s.events || []).map(e => ({ at: e.timestamp, label: e.description || e.status }));
       return {
-        status: s.status?.statusCode === 'delivered' ? 'livre' : (evs[0] ? mapStatus(evs[0].label) : 'en_transit'),
+        status: s.status?.statusCode === 'delivered' ? 'livre' : (evs[0] ? mapStatus(evs[0].label) : 'inconnu'),
         etaH: null, events: evs
       };
     },
@@ -3036,7 +3814,7 @@ const CARRIERS = {
       const j = await r.json();
       const tr = j.output?.completeTrackResults?.[0]?.trackResults?.[0] || {};
       const evs = (tr.scanEvents || []).map(e => ({ at: e.date, label: e.eventDescription }));
-      return { status: evs[0] ? mapStatus(evs[0].label) : 'en_transit', etaH: null, events: evs };
+      return { status: evs[0] ? mapStatus(evs[0].label) : 'inconnu', etaH: null, events: evs };
     },
   },
   tnt: { async track(n) { return CARRIERS.fedex.track(n); } },  // TNT suivi via le réseau FedEx
@@ -3051,7 +3829,7 @@ const CARRIERS = {
       if (!r.ok) throw new Error(`ChezVous ${r.status}`);
       const j = await r.json();
       const evs = (j.events || []).map(e => ({ at: e.date, label: e.label || e.status })); // TODO
-      return { status: evs[0] ? mapStatus(evs[0].label) : 'en_transit', etaH: null, events: evs };
+      return { status: evs[0] ? mapStatus(evs[0].label) : 'inconnu', etaH: null, events: evs };
     },
   },
 };
@@ -3224,6 +4002,24 @@ function inferIncidentMotif(subject, messages = []) {
   return 'autre';
 }
 
+function claimLooksLikeIncidentFallback(claim) {
+  // Fallback v19 : si Fnac/Darty ne renvoie aucun vrai nœud incidents_query,
+  // on peut tout de même alimenter l'onglet Incidents avec les fils BOMP qui
+  // ressemblent à un dossier SAV/litige. On garde cette logique prudente et
+  // désactivable avec INCIDENTS_INCLUDE_THREAD_FALLBACK=0.
+  if (!claim || isClaimClosedByMarketplace(claim)) return false;
+  const messages = Array.isArray(claim.messages) ? claim.messages : [];
+  if (!claim.orderId && !messages.length) return false;
+  const text = foldStatusText([
+    claim.subject,
+    claim.marketplaceStatus,
+    claim.statusRaw,
+    ...(messages || []).map(m => m?.text || '')
+  ].join(' '));
+  if (/(incident|litige|reclamation|reclamations|sav|garantie|panne|defectueux|defectueuse|casse|cas[se]e|endommage|non recu|pas recu|jamais recu|colis perdu|retard|non conforme|rembours|retour|piece manquante|article manquant)/.test(text)) return true;
+  return claimNeedsReply(claim);
+}
+
 
 
 
@@ -3337,8 +4133,18 @@ function threadsCacheDiagnostics() {
 }
 
 function incidentsRequestOptions(req) {
-  const onlyUnanswered = req.query.all !== '1' && String(req.query.unanswered || '1') !== '0';
-  const maxAgeDays = resolveMaxAgeDays(req, onlyUnanswered);
+  // Incidents ≠ réclamations à répondre.
+  // Avant la v19, l'endpoint incidents était filtré par défaut comme les réclamations
+  // (`waiting_for_seller_answer=TRUE`). Sur Fnac/Darty, ce flag n'est pas toujours
+  // renseigné sur incidents_query, ce qui donnait 0 incident alors que des dossiers existent.
+  const onlyUnanswered = req.query.all !== '1' && /^(1|true|yes|on)$/i.test(String(req.query.unanswered || req.query.onlyUnanswered || '0'));
+  const explicitDays = req.query.days || req.query.maxAgeDays;
+  const maxAgeDays = positiveInt(
+    explicitDays || process.env.INCIDENTS_MAX_AGE_DAYS || process.env.BOMP_INCIDENTS_MAX_AGE_DAYS || (onlyUnanswered ? 45 : 90),
+    onlyUnanswered ? 45 : 90,
+    0,
+    3650
+  );
   return {
     onlyUnanswered,
     maxAgeDays,
@@ -3348,6 +4154,8 @@ function incidentsRequestOptions(req) {
     cacheTtlMs: positiveInt(req.query.cacheTtlMs || process.env.INCIDENTS_CACHE_TTL_MS, 180000, 0, 24 * 60 * 60 * 1000),
     staleWhileRefresh: String(req.query.stale ?? process.env.INCIDENTS_STALE_WHILE_REFRESH ?? '1') !== '0',
     refreshCooldownMs: positiveInt(req.query.refreshCooldownMs || process.env.INCIDENTS_REFRESH_COOLDOWN_MS || process.env.THREADS_REFRESH_COOLDOWN_MS, 60000, 0, 24 * 60 * 60 * 1000),
+    enrichDetails: parseBoolFlag(req.query.enrichDetails ?? process.env.INCIDENTS_ENRICH_DETAILS, false),
+    includeThreadFallback: parseBoolFlag(req.query.includeThreadFallback ?? process.env.INCIDENTS_INCLUDE_THREAD_FALLBACK, true),
   };
 }
 function incidentsCacheKey(options) {
@@ -3356,6 +4164,8 @@ function incidentsCacheKey(options) {
     onlyUnanswered: options.onlyUnanswered ? 1 : 0,
     maxAgeDays: options.maxAgeDays || 0,
     providers: options.providersFilter || '',
+    enrichDetails: options.enrichDetails ? 1 : 0,
+    includeThreadFallback: options.includeThreadFallback ? 1 : 0,
   });
 }
 function cloneForPublic(claim, provider = null) {
@@ -3531,19 +4341,53 @@ async function collectIncidentsForCache(options = {}) {
       );
       const providerMaxAgeDays = options.maxAgeDays || 0;
 
+      const nativeRows = [];
+      const nativeEntries = [];
+      const fallbackRows = [];
+      const fallbackEntries = [];
+      let nativeSeen = 0;
+      let fallbackSeen = 0;
+
       for (const rawClaim of (Array.isArray(fetched) ? fetched : [])) {
         const shouldFetchDetail = options.enrichDetails || (options.onlyUnanswered && shouldFetchDetailForReplySignal(p, rawClaim));
         const claim = shouldFetchDetail ? await ensureClaimHasMessages(p, rawClaim, { force: Boolean(options.enrichDetails) }) : rawClaim;
         const ctx = claim._ctx || rawClaim._ctx || {};
-        if (ctx.kind !== 'incident' && !ctx.incidentId) continue;
+        const isNativeIncident = ctx.kind === 'incident' || Boolean(ctx.incidentId);
+        const isFallbackIncident = !isNativeIncident && options.includeThreadFallback && claimLooksLikeIncidentFallback(claim);
+        if (!isNativeIncident && !isFallbackIncident) continue;
         if (options.onlyUnanswered && !claimNeedsReply(claim)) continue;
         if (!claimIsRecentEnough(claim, providerMaxAgeDays)) continue;
 
-        const cachedClaim = { ...claim, _ctx: ctx };
-        incidentEntries.push({ id: claim.id, entry: { provider: p, ctx, claim: cachedClaim } });
-        rows.push(mapClaimToIncidentRow(cachedClaim));
+        const incidentCtx = isNativeIncident
+          ? ctx
+          : { ...ctx, kind: 'incident_fallback', fallbackFromThread: true, orderId: claim.orderId || ctx.orderId };
+        const cachedClaim = { ...claim, _ctx: incidentCtx };
+        const entry = { id: claim.id, entry: { provider: p, ctx: incidentCtx, claim: cachedClaim } };
+        const row = mapClaimToIncidentRow(cachedClaim);
+        if (!isNativeIncident) {
+          row.source = 'thread_fallback';
+          row.remote = true;
+        }
+
+        if (isNativeIncident) {
+          nativeSeen += 1;
+          nativeRows.push(row);
+          nativeEntries.push(entry);
+        } else {
+          fallbackSeen += 1;
+          fallbackRows.push(row);
+          fallbackEntries.push(entry);
+        }
       }
-      console.log(`[incidents/${p.code || ''}] ${rows.length} ligne(s) incident cumulée(s), fenêtre=${providerMaxAgeDays || 'illimitée'}j`);
+
+      // Priorité aux vrais incidents BOMP. Si BOMP ne renvoie aucun incident natif,
+      // on affiche les fils SAV/litiges comme fallback pour éviter un onglet vide.
+      const useFallback = !nativeRows.length && options.includeThreadFallback;
+      const selectedRows = useFallback ? fallbackRows : nativeRows;
+      const selectedEntries = useFallback ? fallbackEntries : nativeEntries;
+      rows.push(...selectedRows);
+      incidentEntries.push(...selectedEntries);
+      console.log(`[incidents/${p.code || ''}] ${selectedRows.length} ligne(s) incident ajoutée(s), native=${nativeSeen}, fallback=${fallbackSeen}${useFallback ? ' utilisé' : ''}, fenêtre=${providerMaxAgeDays || 'illimitée'}j`);
     } catch (e) {
       console.error(`[incidents/${p.code || ''}] ${e.message}`);
     }
@@ -4136,7 +4980,7 @@ app.get('/api/reclamations/tracking', async (req, res) => {
     if (!c) throw new Error('Transporteur non géré : ' + carrier);
     if (!number) throw new Error('Numéro de suivi manquant');
     const data = await c.track(number);   // { status, etaH, events:[{at,label}] }
-    res.json(data);
+    res.json(normalizeTracking({ ...(data || {}), carrier, number }, data || { carrier, number }));
   } catch (e) {
     res.status(502).json({ error: e.message });
   }
