@@ -125,7 +125,7 @@ function makeClaim(marketplace, o = {}) {
     subject: o.subject || 'Réclamation',
     orderId: o.orderId || '',
     product: o.product || '',
-    ean: firstOrderEan(o.ean, o.gtin, o.productEan, o.productEAN, o.product_ean, o.product_gtin, o.product_reference, o.productReference, o.barcode, o.gencod, o.ctx),
+    ean: firstOrderEan(o.ean, o.ean13, o.ean_13, o.gtin, o.gencod, o.productEan, o.productEAN, o.product_ean, o.product_gtin, o.barcode, o.bar_code, o.code_barre, o.ctx),
     priority: o.priority || 'moyenne',
     // Statut normalisé pour l'IHM + statut brut marketplace pour l'affichage fidèle.
     status: normalizedStatus,
@@ -442,7 +442,7 @@ function makeProductNote(marketplace, o = {}) {
     orderId: scalarFirst(o.orderId, o.order_id, o.orderFnacId, o.orderReference),
     customer: cleanText(scalarFirst(o.customer, o.customerName, o.buyer, o.client)) || 'Client',
     product: cleanText(scalarFirst(o.product, o.productName, o.product_title, o.title, o.offerSellerId, o.sku)),
-    ean: cleanText(scalarFirst(o.ean, o.gtin, o.product_reference, o.productReference, o.offerSellerId, o.sellerSku)),
+    ean: firstOrderEan(o.ean, o.ean13, o.ean_13, o.gtin, o.gencod, o.product_ean, o.product_gtin, o.barcode, o.bar_code, o.code_barre, o.ctx),
     rating,
     visible: o.visible !== false,
     comment: cleanText(scalarFirst(o.comment, o.review, o.body, o.text, o.message, o.description)),
@@ -467,6 +467,32 @@ function dedupeProductNotes(notes) {
     seen.add(key);
     return true;
   });
+}
+
+function noteTimestamp(n) {
+  const t = Number(n?.at || 0);
+  return Number.isFinite(t) && t > 0 ? t : 0;
+}
+
+function notesRecentCutoffMs(options = {}) {
+  if (options.since) {
+    const t = parseMarketplaceDate(options.since, 0);
+    if (t) return t;
+  }
+  const days = Number(options.recentDays || 0);
+  return days > 0 ? Date.now() - days * 24 * 3600 * 1000 : 0;
+}
+
+function filterRecentProductNotes(notes, options = {}) {
+  const cutoff = options.recentOnly ? notesRecentCutoffMs(options) : 0;
+  return dedupeProductNotes(notes)
+    .filter(n => !cutoff || noteTimestamp(n) >= cutoff)
+    .sort((a, b) => noteTimestamp(b) - noteTimestamp(a));
+}
+
+function limitRecentProductNotes(notes, options = {}) {
+  const clean = filterRecentProductNotes(notes, options);
+  return options.limit ? clean.slice(0, options.limit) : clean;
 }
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -691,9 +717,24 @@ function betterCustomerName(current, incoming) {
   return customerNameScore(inc) > customerNameScore(cur) ? inc : cur;
 }
 
+function validGtinChecksum(v) {
+  const s = cleanText(v).replace(/\D/g, '');
+  // On évite les EAN-8 dans l'IHM : sur plusieurs marketplaces ces 8 chiffres
+  // correspondent souvent à des IDs internes produit/offre, pas à un vrai EAN.
+  if (!/^\d{12,14}$/.test(s)) return false;
+  if (/^(\d)\1+$/.test(s)) return false;
+  const digits = s.split('').map(Number);
+  const check = digits.pop();
+  let sum = 0;
+  for (let i = digits.length - 1, pos = 0; i >= 0; i--, pos++) {
+    sum += digits[i] * (pos % 2 === 0 ? 3 : 1);
+  }
+  return ((10 - (sum % 10)) % 10) === check;
+}
+
 function looksLikeEan(v) {
   const s = cleanText(v).replace(/\D/g, '');
-  return /^(?:\d{8}|\d{12,14})$/.test(s) ? s : '';
+  return validGtinChecksum(s) ? s : '';
 }
 
 
@@ -711,7 +752,7 @@ function collectDeepEans(obj, out = [], seen = new Set(), depth = 0) {
     for (const item of obj) collectDeepEans(item, out, seen, depth + 1);
     return out;
   }
-  const keyRx = /^(ean|gtin|gencod|barcode|bar_code|code_barre|product_?ean|product_?gtin|product_?barcode|product_?reference|productReference)$/i;
+  const keyRx = /^(ean|ean13|ean_13|gtin|gencod|barcode|bar_code|code_barre|product_?ean|product_?gtin|product_?barcode|article_?ean|item_?ean|order_?line_?ean|line_?ean)$/i;
   for (const [k, v] of Object.entries(obj)) {
     if (keyRx.test(k)) {
       const got = looksLikeEan(v);
@@ -1245,6 +1286,62 @@ async function readReplyPayload(req) {
     files: [],
   };
 }
+
+const OCTOPIA_ALLOWED_ATTACHMENT_FORMATS = new Set(['gif', 'bmp', 'tif', 'jpeg', 'pdf', 'png', 'jpg', 'doc', 'docx', 'xls', 'xlsx']);
+const OCTOPIA_MIME_FORMATS = {
+  'image/gif': 'gif',
+  'image/bmp': 'bmp',
+  'image/tiff': 'tif',
+  'image/jpeg': 'jpg',
+  'image/jpg': 'jpg',
+  'image/png': 'png',
+  'application/pdf': 'pdf',
+  'application/msword': 'doc',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+  'application/vnd.ms-excel': 'xls',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
+};
+function octopiaAttachmentFormat(file = {}) {
+  const filename = cleanText(file.originalname || file.filename || file.name || '');
+  let ext = path.extname(filename).replace(/^\./, '').toLowerCase();
+  if (ext === 'tiff') ext = 'tif';
+  if (ext === 'jpe') ext = 'jpg';
+  if (OCTOPIA_ALLOWED_ATTACHMENT_FORMATS.has(ext)) return ext;
+  const mime = String(file.mimetype || file.type || '').toLowerCase().split(';')[0].trim();
+  const mapped = OCTOPIA_MIME_FORMATS[mime];
+  if (mapped && OCTOPIA_ALLOWED_ATTACHMENT_FORMATS.has(mapped)) return mapped;
+  return '';
+}
+function octopiaAttachmentName(file = {}, index = 0, format = '') {
+  const raw = cleanText(file.originalname || file.filename || file.name || `piece-jointe-${index + 1}`);
+  const base = path.basename(raw).replace(/[\r\n\t]/g, ' ').trim() || `piece-jointe-${index + 1}`;
+  const withoutExt = format ? base.replace(new RegExp(`\\.${format}$`, 'i'), '') : base.replace(/\.[^.]+$/, '');
+  return cleanText(withoutExt).slice(0, 120) || `piece-jointe-${index + 1}`;
+}
+function buildOctopiaAttachments(files = []) {
+  const list = Array.isArray(files) ? files.filter(f => f && f.buffer && f.size > 0) : [];
+  if (!list.length) return [];
+  if (list.length > 3) {
+    throw Object.assign(new Error('Octopia/Cdiscount refuse plus de 3 pièces jointes par message.'), { statusCode: 400, provider: 'octopia', operation: 'sendReply' });
+  }
+  const maxBytes = positiveInt(process.env.OCTOPIA_MAX_ATTACHMENT_BYTES, 4 * 1024 * 1024, 1, 25 * 1024 * 1024);
+  const total = list.reduce((sum, f) => sum + Number(f.size || f.buffer.length || 0), 0);
+  if (total > maxBytes) {
+    throw Object.assign(new Error(`Octopia/Cdiscount refuse les pièces jointes au-dessus de ${Math.round(maxBytes / 1024 / 1024)} Mo par message.`), { statusCode: 413, provider: 'octopia', operation: 'sendReply' });
+  }
+  return list.map((f, i) => {
+    const fileFormat = octopiaAttachmentFormat(f);
+    if (!fileFormat) {
+      throw Object.assign(new Error(`Format de pièce jointe non accepté par Octopia/Cdiscount : ${f.originalname || 'fichier'}. Formats acceptés : gif, bmp, tif, jpeg, jpg, pdf, png, doc, docx, xls, xlsx.`), { statusCode: 400, provider: 'octopia', operation: 'sendReply' });
+    }
+    return {
+      content: Buffer.isBuffer(f.buffer) ? f.buffer.toString('base64') : Buffer.from(f.buffer).toString('base64'),
+      name: octopiaAttachmentName(f, i, fileFormat),
+      fileFormat,
+    };
+  });
+}
+
 async function mapLimit(items, limit, fn) {
   const out = new Array(items.length);
   let i = 0;
@@ -1271,6 +1368,32 @@ function positiveInt(v, fallback, min = 0, max = Number.MAX_SAFE_INTEGER) {
 }
 
 const BOMP_ALLOWED_MESSAGE_FROM_TYPES = new Set(['CLIENT', 'CALLCENTER', 'SELLER', 'SYSTEM']);
+const BOMP_ALLOWED_REPLY_SUBJECTS = new Set([
+  'product_information',
+  'shipping_information',
+  'order_information',
+  'offer_problem',
+  'offer_not_received',
+  'other_question',
+]);
+function bompReplySubject(rawSubject = '', body = '') {
+  const forced = cleanText(process.env.BOMP_REPLY_SUBJECT || '');
+  if (BOMP_ALLOWED_REPLY_SUBJECTS.has(forced)) return forced;
+
+  // Fnac/Darty n'accepte pas les sujets libres dans messages_update.
+  // Les sujets affichés dans l'IHM peuvent être "Réclamation client", "Retard", etc. :
+  // s'ils sont envoyés tels quels, l'API BOMP refuse le XML et le proxy remonte une 502.
+  const raw = cleanText(rawSubject || '');
+  if (BOMP_ALLOWED_REPLY_SUBJECTS.has(raw)) return raw;
+
+  const t = foldStatusText(`${raw} ${body}`);
+  if (/non[ -]?recu|non[ -]?reçu|not[ -]?received|jamais[ -]?recu|jamais[ -]?reçu/.test(t)) return 'offer_not_received';
+  if (/livraison|colis|transport|suivi|tracking|expedi|expedie|expedition|retard|delivery|shipment/.test(t)) return 'shipping_information';
+  if (/produit|article|ean|gencod|reference|mod[eè]le|product|item/.test(t)) return 'product_information';
+  if (/offre|offer|prix|stock|sku/.test(t)) return 'offer_problem';
+  if (/autre|question|other/.test(t)) return 'other_question';
+  return 'order_information';
+}
 function bompMessageFromTypesFromEnv(name, fallback) {
   const raw = String(process.env[name] || fallback || '');
   const values = raw
@@ -1321,6 +1444,9 @@ function notesRequestOptions(query = {}) {
     pageSize: positiveInt(query.pageSize || query.limitPerPage, fast ? 50 : 100, 1, 500),
     maxOrders: positiveInt(query.maxOrders, fast ? 8 : 40, 0, 500),
     limit: positiveInt(query.limit, fast ? 150 : 0, 0, 5000),
+    recentOnly: parseBoolFlag(query.recentOnly ?? process.env.NOTES_RECENT_ONLY, true),
+    recentDays: positiveInt(query.recentDays || process.env.NOTES_RECENT_DAYS, 60, 1, 3650),
+    since: cleanText(query.since || process.env.NOTES_SINCE || ''),
     concurrency: positiveInt(query.concurrency || process.env.NOTES_PROVIDER_CONCURRENCY || process.env.PROVIDER_CONCURRENCY, fast ? 2 : 4, 1, 20),
     providerTimeoutMs: positiveInt(query.providerTimeoutMs || process.env.NOTES_PROVIDER_TIMEOUT_MS, fast ? 9000 : 30000, 0, 120000),
     cacheTtlMs: positiveInt(query.cacheTtlMs || process.env.NOTES_CACHE_TTL_MS, 10 * 60 * 1000, 0, 24 * 60 * 60 * 1000),
@@ -1339,6 +1465,9 @@ function notesCacheKey(opts) {
     pageSize: opts.pageSize,
     maxOrders: opts.maxOrders,
     limit: opts.limit,
+    recentOnly: opts.recentOnly,
+    recentDays: opts.recentDays,
+    since: opts.since,
   });
 }
 
@@ -1386,8 +1515,7 @@ async function collectProductNotes(options = {}) {
     }
   });
 
-  all.sort((a, b) => Number(b.at || 0) - Number(a.at || 0));
-  return options.limit ? all.slice(0, options.limit) : all;
+  return limitRecentProductNotes(all, options);
 }
 
 async function getProductNotesCached(options = {}, forceRefresh = false) {
@@ -1707,7 +1835,7 @@ const octopia = (() => {
               const count = Number(pi.productReviewsCount ?? pi.product_reviews_count ?? 0);
               if (!rating && !count) continue;
               const product = scalarFirst(offer.product?.title, offer.productTitle, offer.product_title, offer.title, offer.offerId, offer.sellerExternalReference);
-              const ean = scalarFirst(offer.gtin, offer.product?.gtin, offer.productReference, offer.product_reference, offer.sellerExternalReference);
+              const ean = firstOrderEan(offer.ean, offer.ean13, offer.gtin, offer.gencod, offer.barcode, offer.product?.ean, offer.product?.gtin, offer.product?.barcode, offer.product_ean, offer.product_gtin);
               notes.push(makeProductNote(marketplace, {
                 providerType: 'octopia',
                 id: scalarFirst(offer.offerId, offer.id, offer.sellerExternalReference, ean),
@@ -1725,11 +1853,12 @@ const octopia = (() => {
           if (!offers.length || offers.length < pageSize) break;
         }
       }
-      return dedupeProductNotes(notes);
+      return filterRecentProductNotes(notes, options);
     },
 
-    async sendReply(provider, ctx, body) {
-      // POST /messages — body 13–5000 caractères, destinataire = le client
+    async sendReply(provider, ctx, body, files = []) {
+      // POST /messages — Octopia attend un JSON. Les P.J. doivent être encodées en base64
+      // dans attachments[] (et non envoyées en multipart/form-data côté API Octopia).
       const message = cleanText(body);
       const discussionId = scalarFirst(ctx?.discussionId, ctx?.id);
       const salesChannel = scalarFirst(ctx?.salesChannel, ctx?.channel);
@@ -1738,16 +1867,19 @@ const octopia = (() => {
       if (!salesChannel) throw Object.assign(new Error('Octopia : salesChannel manquant'), { statusCode: 400, provider: 'octopia', operation: 'sendReply' });
       if (!customerId) throw Object.assign(new Error('Octopia : customerId manquant'), { statusCode: 400, provider: 'octopia', operation: 'sendReply' });
       if (message.length < 13) throw Object.assign(new Error('Octopia refuse les messages trop courts : minimum 13 caractères.'), { statusCode: 400, provider: 'octopia', operation: 'sendReply' });
-      await api(provider, '/messages', {
+      const attachments = buildOctopiaAttachments(files);
+      const payload = {
+        body: message,
+        discussionId,
+        salesChannel,
+        receivers: [{ userId: customerId, userType: 'Customer' }],
+        ...(attachments.length ? { attachments } : {}),
+      };
+      const result = await api(provider, '/messages', {
         method: 'POST',
-        body: JSON.stringify({
-          body: message,
-          discussionId,
-          salesChannel,
-          receivers: [{ userId: customerId, userType: 'Customer' }],
-        }),
+        body: JSON.stringify(payload),
       });
-      return { mode: 'octopia_messages' };
+      return { mode: 'octopia_messages', files: attachments.length, messageId: result?.messageId || result?.id || '' };
     },
 
     async downloadAttachment(provider, sourceUrl) {
@@ -1934,9 +2066,9 @@ const mirakl = {
     const orderEntity = Array.isArray(thread.entities) ? thread.entities.find(e => /order/i.test(e.type || e.entity_type || '')) : null;
     const eanFromThread = firstOrderEan(
       productEntity, thread.product, thread.offer, thread.entities,
-      productEntity?.ean, productEntity?.gtin, productEntity?.barcode, productEntity?.product_ean, productEntity?.product_sku,
+      productEntity?.ean, productEntity?.ean13, productEntity?.gtin, productEntity?.gencod, productEntity?.barcode, productEntity?.product_ean, productEntity?.product_gtin,
       thread.ean, thread.gtin, thread.product?.ean, thread.product?.gtin, thread.offer?.ean, thread.offer?.gtin,
-      firstDeepValue(thread, /^(ean|gtin|barcode|product_?ean|product_?gtin)$/i)
+      firstDeepValue(thread, /^(ean|ean13|ean_13|gtin|gencod|barcode|bar_code|code_barre|product_?ean|product_?gtin|product_?barcode)$/i)
     );
     const lastClientText = [...messages].reverse().find(m => m.from === 'client')?.text || '';
     const rawStatus = scalarFirst(thread.status, thread.state, thread.thread_status, thread.closed === true ? 'CLOSED' : 'OPEN');
@@ -2068,11 +2200,10 @@ const mirakl = {
     );
     const ean = firstOrderEan(
       ...lineArray,
-      firstLine.ean, firstLine.gtin, firstLine.barcode, firstLine.product_ean, firstLine.product_gtin,
-      firstLine.product?.ean, firstLine.product?.gtin, firstLine.product?.barcode,
-      firstLine.product_sku, firstLine.product?.sku, firstLine.product_id, firstLine.product_reference,
-      firstDeepValue(firstLine, /^(ean|gtin|barcode|product_?ean|product_?gtin|product_?sku|product_?reference)$/i),
-      firstDeepValue(order, /^(ean|gtin|barcode|product_?ean|product_?gtin|product_?reference)$/i)
+      firstLine.ean, firstLine.ean13, firstLine.ean_13, firstLine.gtin, firstLine.gencod, firstLine.barcode, firstLine.bar_code, firstLine.code_barre, firstLine.product_ean, firstLine.product_gtin, firstLine.product_barcode,
+      firstLine.product?.ean, firstLine.product?.ean13, firstLine.product?.gtin, firstLine.product?.gencod, firstLine.product?.barcode,
+      firstDeepValue(firstLine, /^(ean|ean13|ean_13|gtin|gencod|barcode|bar_code|code_barre|product_?ean|product_?gtin|product_?barcode|article_?ean|item_?ean|order_?line_?ean|line_?ean)$/i),
+      firstDeepValue(order, /^(ean|ean13|ean_13|gtin|gencod|barcode|bar_code|code_barre|product_?ean|product_?gtin|product_?barcode|article_?ean|item_?ean|order_?line_?ean|line_?ean)$/i)
     );
     const createdAt = parseMarketplaceDate(scalarFirst(order.date_created, order.created_at, order.order_date, order.createdDate, order.created), 0);
     return { orderId, customer, product, ean, orderCreatedAt: createdAt || null };
@@ -2115,12 +2246,15 @@ const mirakl = {
     const pageSize = Math.min(positiveInt(options.pageSize || process.env.MIRAKL_NOTES_PAGE_SIZE, fast ? 8 : 20, 1, 100), maxOrders);
     const evalConcurrency = positiveInt(options.evalConcurrency || process.env.MIRAKL_NOTES_CONCURRENCY, fast ? 2 : 3, 1, 10);
     const params = new URLSearchParams({ max: String(pageSize), offset: '0' });
+    const recentCutoff = options.recentOnly ? notesRecentCutoffMs(options) : 0;
     const monthsBack = Number(process.env.MIRAKL_NOTES_MONTHS_BACK || process.env.MIRAKL_MONTHS_BACK || 0);
+    let sinceMs = recentCutoff || 0;
     if (monthsBack > 0) {
       const since = new Date();
       since.setMonth(since.getMonth() - monthsBack);
-      params.set('start_date', since.toISOString());
+      sinceMs = Math.max(sinceMs, since.getTime());
     }
+    if (sinceMs > 0) params.set('start_date', new Date(sinceMs).toISOString());
 
     const ordersPayload = await this.api(provider, `/orders?${params.toString()}`);
     const orders = this.extractOrders(ordersPayload).slice(0, maxOrders);
@@ -2140,7 +2274,7 @@ const mirakl = {
       }
     });
 
-    return dedupeProductNotes(notes);
+    return filterRecentProductNotes(notes, options);
   },
 
   async fetchOrdersByIds(provider, orderIds) {
@@ -2917,18 +3051,72 @@ ${inner}
   }
 
 
+  function validGtinChecksum(v) {
+    const s = cleanText(v).replace(/\D/g, '');
+    if (!/^(?:\d{8}|\d{12,14})$/.test(s)) return false;
+    const digits = s.split('').map(Number);
+    const check = digits.pop();
+    let sum = 0;
+    // GTIN/EAN : pondération 3/1 depuis la droite, hors chiffre de contrôle.
+    for (let i = digits.length - 1, pos = 0; i >= 0; i--, pos++) {
+      sum += digits[i] * (pos % 2 === 0 ? 3 : 1);
+    }
+    return ((10 - (sum % 10)) % 10) === check;
+  }
+
+  function looksLikeBompEan(v) {
+    const s = cleanText(v).replace(/\D/g, '');
+    // Fnac/Darty renvoie très souvent des IDs produit internes à 8 chiffres
+    // (product_fnac_id / offer_fnac_id). Ces valeurs ressemblent à des EAN-8
+    // mais ne sont pas des EAN produits. Pour BOMP, on ne garde donc que les
+    // vrais GTIN/EAN longs, avec chiffre de contrôle valide.
+    if (!/^\d{12,14}$/.test(s)) return '';
+    return validGtinChecksum(s) ? s : '';
+  }
+
+  function collectDeepBompEans(obj, out = [], seen = new Set(), depth = 0) {
+    if (!obj || depth > 6) return out;
+    if (typeof obj === 'string' || typeof obj === 'number') {
+      const got = looksLikeBompEan(obj);
+      if (got) out.push(got);
+      return out;
+    }
+    if (typeof obj !== 'object' || seen.has(obj)) return out;
+    seen.add(obj);
+    if (Array.isArray(obj)) {
+      obj.forEach(v => collectDeepBompEans(v, out, seen, depth + 1));
+      return out;
+    }
+
+    const explicitEanKeyRx = /^(?:ean|ean13|ean_13|gtin|gencod|barcode|bar_code|code_barre|product_?ean|product_?gtin|product_?barcode|article_?ean|item_?ean|order_?detail_?ean|order_?line_?ean|line_?ean)$/i;
+    for (const [k, v] of Object.entries(obj)) {
+      if (explicitEanKeyRx.test(k)) {
+        const got = looksLikeBompEan(v);
+        if (got) out.push(got);
+      }
+    }
+
+    // On descend uniquement dans les objets/tableaux. Surtout pas dans les scalaires
+    // dont le nom contient product/offer, sinon product_fnac_id=42683462 est pris pour un EAN.
+    for (const [k, v] of Object.entries(obj)) {
+      if (v && typeof v === 'object' && /(?:product|produit|offer|article|item|line|ligne|order_detail|orderLine|orderLines|details?)/i.test(k)) {
+        collectDeepBompEans(v, out, seen, depth + 1);
+      }
+    }
+    return out;
+  }
+
   function extractBompEan(obj) {
     // Fnac/Darty/BOMP peut placer l'EAN/Gencod dans les lignes commande,
-    // les détails produit, ou parfois dans offer_seller_id lorsque le vendeur
-    // utilise l'EAN comme SKU. On accepte uniquement une vraie valeur EAN
-    // 8/12/13/14 chiffres, jamais un ID Fnac, un order_id ou un SKU quelconque.
+    // les détails produit, ou parfois dans le SKU vendeur. En revanche, les
+    // champs product_fnac_id / offer_fnac_id sont des IDs internes Fnac et ne
+    // doivent jamais être affichés comme EAN.
     if (!obj || typeof obj !== 'object') return '';
 
     const exactKeys = [
       'ean', 'ean13', 'ean_13', 'gencod', 'gtin', 'barcode', 'bar_code', 'code_barre',
       'product_ean', 'productEAN', 'product_gtin', 'productGtin', 'product_barcode',
-      'article_ean', 'item_ean', 'order_detail_ean', 'order_line_ean', 'line_ean',
-      'product_reference', 'productReference', 'product_ref', 'productRef'
+      'article_ean', 'item_ean', 'order_detail_ean', 'order_line_ean', 'line_ean'
     ];
 
     const directCandidates = [
@@ -2938,18 +3126,16 @@ ${inner}
       obj.article?.ean, obj.item?.ean, obj.order_detail?.ean, obj.order_line?.ean
     ];
     for (const v of directCandidates) {
-      const got = looksLikeEan(v);
+      const got = looksLikeBompEan(v);
       if (got) return got;
     }
 
-    // Recherche profonde mais priorisée : d'abord les clés explicitement EAN/Gencod/GTIN.
+    // Recherche profonde mais priorisée : uniquement les clés explicitement EAN/Gencod/GTIN.
     for (const v of bompDeepValues(obj, exactKeys)) {
-      const got = looksLikeEan(v);
+      const got = looksLikeBompEan(v);
       if (got) return got;
     }
 
-    // Certains retours BOMP exposent les lignes dans order_detail/order_details/order_lines.
-    // On scanne ces blocs pour récupérer l'EAN sans dépendre du nom exact du champ.
     const lineBlocks = [
       ...oneOrMany(obj.order_detail), ...oneOrMany(obj.order_details?.order_detail),
       ...oneOrMany(obj.order_line), ...oneOrMany(obj.order_lines?.order_line),
@@ -2958,18 +3144,18 @@ ${inner}
       ...collectNodes(obj, ['order_detail', 'order_line', 'product', 'item', 'article'])
     ];
     for (const block of lineBlocks) {
-      const got = firstOrderEan(block);
+      const got = collectDeepBompEans(block).find(Boolean);
       if (got) return got;
     }
 
     // Dernier secours : certains vendeurs mettent l'EAN dans leur référence offre/SKU.
-    // On n'accepte que si la valeur contient un vrai EAN, sinon on ne renvoie rien.
+    // On accepte uniquement un GTIN long et valide, jamais un offer_fnac_id/product_fnac_id.
     const skuKeys = [
       'offer_seller_id', 'offerSellerId', 'seller_sku', 'sellerSku', 'sku', 'reference',
       'seller_reference', 'sellerReference', 'shop_reference', 'merchant_sku'
     ];
     for (const v of bompDeepValues(obj, skuKeys)) {
-      const got = looksLikeEan(v);
+      const got = looksLikeBompEan(v);
       if (got) return got;
     }
 
@@ -3265,6 +3451,7 @@ ${inner}
 
   function mapEmbeddedBompMessage(m, defaultAuthor = 'client') {
     const attachments = normalizeInboundAttachments(m);
+    const messageId = cleanText(extractBompMessageId(m));
     return {
       from: parseBompAuthor(extractBompMessageFromType(m) || defaultAuthor),
       at: parseBompDate(
@@ -3272,6 +3459,7 @@ ${inner}
         m.sent_at, m.creation_date, m.modification_date
       ),
       text: extractBompClientText(m),
+      ...(messageId ? { messageId } : {}),
       ...(attachments.length ? { attachments } : {})
     };
   }
@@ -3282,10 +3470,13 @@ ${inner}
       .map(m => {
         const attachments = Array.isArray(m?.attachments) ? m.attachments : normalizeInboundAttachments(m);
         const text = cleanText(m?.text || m?.body || m?.message || m?.description || m?.content || '');
+        const messageId = cleanText(m?.messageId || m?.message_id || m?.id || m?._ctx?.messageId || '');
         return {
           from: m?.from || parseBompAuthor(m?.author || m?.message_from || m?.from_type || m?.['@_from']),
+          author: cleanText(m?.author || m?.sender || m?.user || ''),
           at: Number(m?.at) || parseBompDate(m?.rawAt || m?.date || m?.created_at || m?.updated_at),
           text,
+          ...(messageId ? { messageId } : {}),
           ...(attachments.length ? { attachments } : {})
         };
       })
@@ -3452,7 +3643,14 @@ ${inner}
       marketplaceStatus: scalarFirst(m.message_state, m.state),
       updatedAt: at,
       messages: (text || normalizeInboundAttachments(m).length)
-        ? [{ from: author, at, text, attachments: normalizeInboundAttachments(m) }]
+        ? [{
+            from: author,
+            author: fromLabel || (author === 'client' ? 'Client' : 'Agent'),
+            at,
+            text,
+            ...(id ? { messageId: id } : {}),
+            attachments: normalizeInboundAttachments(m)
+          }]
         : [],
       tracking: extractBompTracking(m, { providerCode: provider.code, orderId, messageId: id }),
       ctx: { kind: 'message', messageId: id, orderId, ...(extractBompEan(m) ? { ean: extractBompEan(m) } : {}), marketplaceStatus: scalarFirst(m.message_state, m.state), rawStatus: scalarFirst(m.message_state, m.state), needsReply: author === 'client' },
@@ -3583,14 +3781,29 @@ ${inner}
         }
       }
 
+      const recentCutoff = options.recentOnly ? notesRecentCutoffMs(options) : 0;
+      const recentDate = recentCutoff ? new Date(recentCutoff).toISOString().slice(0, 10) : '';
       for (let page = 1; page <= maxPages; page++) {
-        const response = await safeQuery(
+        const queryElements = { paging: page };
+        if (recentDate) queryElements.date = recentDate;
+        let response = await safeQuery(
           'client_order_comments_query',
-          bompQueryXml(provider, token, 'client_order_comments_query', { paging: page }, pageSize),
+          bompQueryXml(provider, token, 'client_order_comments_query', queryElements, pageSize),
           `client_order_comments_query/page:${page}`
         );
-        const root = response?.client_order_comments_query_response || response?.client_order_comments || response || {};
-        const comments = response ? extractBompNodes(root, ['client_order_comment', 'comment']) : [];
+        let root = response?.client_order_comments_query_response || response?.client_order_comments || response || {};
+        let comments = response ? extractBompNodes(root, ['client_order_comment', 'comment']) : [];
+        // Certaines versions BOMP interprètent <date> comme une date exacte plutôt qu'un "depuis".
+        // Dans ce cas, on retente sans date et le filtre local garde uniquement les avis récents.
+        if (recentDate && page === 1 && (!response || !comments.length)) {
+          response = await safeQuery(
+            'client_order_comments_query',
+            bompQueryXml(provider, token, 'client_order_comments_query', { paging: page }, pageSize),
+            `client_order_comments_query/page:${page}/sans-date`
+          );
+          root = response?.client_order_comments_query_response || response?.client_order_comments || response || {};
+          comments = response ? extractBompNodes(root, ['client_order_comment', 'comment']) : [];
+        }
         notes.push(...comments.map(c => mapClientOrderCommentToNote(provider, c)).filter(productNoteIsUsable));
         if (!comments.length || comments.length < pageSize) break;
       }
@@ -3621,7 +3834,7 @@ ${inner}
       if (String(process.env.BOMP_DEBUG || '') === '1') {
         console.log(`[bomp/${provider.code}] notes comments=${notes.length}, ordersEnriched=${orderInfoById.size}, errors=${errors.length}`);
       }
-      return dedupeProductNotes(notes);
+      return filterRecentProductNotes(notes, options);
     },
 
     async fetchThread(provider, ctxOrClaim = {}) {
@@ -4082,9 +4295,41 @@ ${inner}
       return finalClaims;
     },
 
+    bompUsableRemoteId(v) {
+      const s = cleanText(v || '').replace(/\s+/g, '');
+      if (!s || s.length > 80) return '';
+      if (/^[a-z]+:bomp:/i.test(s)) return '';
+      return s;
+    },
+
+    bompReplyMessageIds(ctx, orderId, commentId) {
+      const out = [];
+      const banned = new Set([
+        this.bompUsableRemoteId(orderId),
+        this.bompUsableRemoteId(commentId),
+        this.bompUsableRemoteId(ctx?.incidentId),
+      ].filter(Boolean).map(v => v.toUpperCase()));
+      const add = (v) => {
+        const id = this.bompUsableRemoteId(v);
+        if (!id || banned.has(id.toUpperCase())) return;
+        if (!out.some(x => x.toUpperCase() === id.toUpperCase())) out.push(id);
+      };
+
+      const claim = ctx?.claim || ctx?._claim || null;
+      const messages = Array.isArray(claim?.messages) ? claim.messages : [];
+      [...messages]
+        .filter(m => m?.from === 'client')
+        .sort((a, b) => Number(b?.at || 0) - Number(a?.at || 0))
+        .forEach(m => add(m.messageId || m.message_id || m.id || m._ctx?.messageId));
+
+      add(ctx?.lastClientMessageId);
+      add(ctx?.messageId);
+      add(ctx?.id);
+      return out;
+    },
+
     async sendReply(provider, ctx, body) {
       const token = await getToken(provider);
-      const messageId = scalarFirst(ctx?.messageId, ctx?.id);
       const orderId = scalarFirst(ctx?.orderId, ctx?.order_fnac_id, ctx?.order);
       const commentId = scalarFirst(ctx?.commentId, ctx?.clientOrderCommentId, ctx?.client_order_comment_id);
       const safeBody = String(body || '').trim().replace(/]]>/g, ']]]]><![CDATA[>');
@@ -4092,15 +4337,16 @@ ${inner}
 
       const debugSend = String(process.env.BOMP_SEND_DEBUG || process.env.BOMP_DEBUG || '') === '1';
       const errors = [];
-      const subject = firstReadableSubject(ctx?.messageSubject, ctx?.subject) || 'order_information';
+      const subject = bompReplySubject(firstReadableSubject(ctx?.messageSubject, ctx?.subject), safeBody);
       const rawType = cleanText(ctx?.rawType || ctx?.type || '').toUpperCase();
       const messageType = rawType === 'OFFER' ? 'OFFER' : 'ORDER';
+      const messageIds = this.bompReplyMessageIds(ctx, orderId, commentId);
 
-      const attempt = async (mode, operation, inner) => {
+      const attempt = async (mode, operation, inner, targetMessageId = '') => {
         try {
           const xml = authedRequest(provider, token, operation, inner);
           if (debugSend) {
-            console.log(`[bomp/${provider.code}] send attempt=${mode} operation=${operation} messageId=${messageId || '-'} orderId=${orderId || '-'} commentId=${commentId || '-'}`);
+            console.log(`[bomp/${provider.code}] send attempt=${mode} operation=${operation} messageId=${targetMessageId || '-'} orderId=${orderId || '-'} commentId=${commentId || '-'} subject=${subject}`);
             console.log(maskBompSecrets(xml));
           }
           await postXml(provider, operation, xml);
@@ -4112,50 +4358,37 @@ ${inner}
         }
       };
 
-      // Chemin officiel fnapy : update_messages(Message(action='reply', id=..., to='ALL')).
-      // Avant on forçait to=CLIENT : certains comptes Fnac/Darty le refusent en 400.
-      // On tente donc ALL d'abord, puis CLIENT en compatibilité.
-      if (messageId) {
-        const all = await attempt('messages_update:reply:ALL', 'messages_update',
-          `  <message action="reply" id="${xmlEscape(messageId)}" to="ALL">
-    <description><![CDATA[${safeBody}]]></description>
-    <subject>${xmlEscape(subject)}</subject>
-    <type>${xmlEscape(messageType)}</type>
-  </message>`);
-        if (all.ok) return { mode: all.mode };
+      const bompMessageXml = (messageId, messageTo = '') => `  <message action="reply" id="${xmlEscape(messageId)}">
+${messageTo ? `    <message_to>${xmlEscape(messageTo)}</message_to>
+` : ''}    <message_subject>${xmlEscape(subject)}</message_subject>
+    <message_description><![CDATA[${safeBody}]]></message_description>
+    <message_type>${xmlEscape(messageType)}</message_type>
+  </message>`;
 
-        const client = await attempt('messages_update:reply:CLIENT', 'messages_update',
-          `  <message action="reply" id="${xmlEscape(messageId)}" to="CLIENT">
-    <description><![CDATA[${safeBody}]]></description>
-    <subject>${xmlEscape(subject)}</subject>
-    <type>${xmlEscape(messageType)}</type>
-  </message>`);
-        if (client.ok) return { mode: client.mode };
+      const isBompUuid = (v) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(v || '').trim());
 
-        // Variante ultra stricte : sans destinataire explicite. Certains schémas historiques
-        // acceptent l'action reply mais refusent l'attribut to selon le canal du message.
-        const noTo = await attempt('messages_update:reply:no-to', 'messages_update',
-          `  <message action="reply" id="${xmlEscape(messageId)}">
-    <description><![CDATA[${safeBody}]]></description>
-    <subject>${xmlEscape(subject)}</subject>
-    <type>${xmlEscape(messageType)}</type>
-  </message>`);
-        if (noTo.ok) return { mode: noTo.mode };
+      // Correction BOMP Fnac/Darty : le schéma messages_update refuse l'attribut XML `to`
+      // et les balises génériques <description>/<subject>/<type>.
+      // Il attend des enfants nommés message_to, message_subject, message_description, message_type.
+      for (const messageId of messageIds) {
+        const client = await attempt('messages_update:reply:message_to:CLIENT', 'messages_update',
+          bompMessageXml(messageId, 'CLIENT'), messageId);
+        if (client.ok) return { mode: client.mode, messageId };
+
+        const all = await attempt('messages_update:reply:message_to:ALL', 'messages_update',
+          bompMessageXml(messageId, 'ALL'), messageId);
+        if (all.ok) return { mode: all.mode, messageId };
+
+        // Variante stricte sans destinataire : utile si le canal choisi impose déjà le client.
+        const noTo = await attempt('messages_update:reply:no-message_to', 'messages_update',
+          bompMessageXml(messageId, ''), messageId);
+        if (noTo.ok) return { mode: noTo.mode, messageId };
       }
 
-      // Secours officiel BOMP/fnapy : réponse à un commentaire client via l'id de commande FNAC/Darty.
-      // Même si messages_update a échoué, on tente ce chemin quand un n° commande existe.
-      if (orderId) {
-        const byOrder = await attempt('client_order_comments_update:order', 'client_order_comments_update',
-          `  <comment id="${xmlEscape(orderId)}">
-    <comment_reply><![CDATA[${safeBody}]]></comment_reply>
-  </comment>`);
-        if (byOrder.ok) return { mode: byOrder.mode };
-      }
-
-      // Dernier secours : certains retours exposent un vrai client_order_comment_id.
-      if (commentId && commentId !== orderId) {
-        const byComment = await attempt('client_order_comments_update:comment', 'client_order_comments_update',
+      // Secours BOMP : client_order_comments_update exige un vrai UUID de commentaire.
+      // Ne jamais lui envoyer un order_fnac_id du type 95E564BSF3PS4, sinon ERR_146 pattern UUID.
+      if (commentId && isBompUuid(commentId)) {
+        const byComment = await attempt('client_order_comments_update:comment_uuid', 'client_order_comments_update',
           `  <comment id="${xmlEscape(commentId)}">
     <comment_reply><![CDATA[${safeBody}]]></comment_reply>
   </comment>`);
@@ -5180,7 +5413,8 @@ app.post('/api/reclamations/incidents/:id/message', async (req, res) => {
     const { provider, ctx } = entry;
     const adapter = ADAPTERS[provider.type];
     if (!adapter?.sendReply) throw new Error(`Réponse incident non gérée pour ${provider.type}`);
-    const result = await adapter.sendReply(provider, ctx, body, files);
+    const sendCtx = provider.type === 'bomp' ? { ...(ctx || {}), claim: entry.claim } : ctx;
+    const result = await adapter.sendReply(provider, sendCtx, body, files);
     res.json({ ok: true, mode: result?.mode || 'reply', files: files.length });
   } catch (e) {
     const payload = publicErrorPayload(e);
@@ -5242,11 +5476,13 @@ app.get('/api/reclamations/threads/:id', async (req, res) => {
         fullClaim = claim;
       }
 
-      claimIndex.set(fullClaim.id, {
+      const fullEntry = {
         provider,
         ctx: fullClaim._ctx || ctx,
         claim: fullClaim
-      });
+      };
+      claimIndex.set(fullClaim.id, fullEntry);
+      claimIndex.set(req.params.id, fullEntry);
 
       return res.json(cloneForPublic(fullClaim, provider));
     }
@@ -5416,7 +5652,7 @@ app.post('/api/reclamations/threads/:id/message', async (req, res) => {
     const result =
       await adapter.sendReply(
         provider,
-        ctx,
+        provider.type === 'bomp' ? { ...(ctx || {}), claim: entry.claim } : ctx,
         body,
         files
       );

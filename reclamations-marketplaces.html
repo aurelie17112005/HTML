@@ -1234,35 +1234,56 @@ function trackingStatusInfo(t){
 }
 
 
-function normalizeEanUi(v){
+function validGtinChecksumUi(v){
   const digits = String(v ?? '').replace(/\D/g,'');
-  if(!/^(?:\d{8}|\d{12,14})$/.test(digits)) return '';
+  if(!/^\d{12,14}$/.test(digits)) return false;
+  const arr = digits.split('').map(Number);
+  const check = arr.pop();
+  let sum = 0;
+  for(let i=arr.length-1,pos=0;i>=0;i--,pos++){ sum += arr[i] * (pos % 2 === 0 ? 3 : 1); }
+  return ((10 - (sum % 10)) % 10) === check;
+}
+function normalizeEanUi(v, opts={}){
+  const digits = String(v ?? '').replace(/\D/g,'');
+  // Sécurité IHM : Boulanger/Conforama/Fnac peuvent remonter des IDs internes
+  // à 8 chiffres. On n'affiche donc que de vrais GTIN longs avec checksum.
+  if(!/^\d{12,14}$/.test(digits)) return '';
+  if(!validGtinChecksumUi(digits)) return '';
   return digits;
 }
-function deepEanFromUi(obj, depth=0, seen=new Set()){
+function isBompMarketplaceUi(c){
+  const m = String(c?.marketplace || c?.provider || c?.code || '').toLowerCase();
+  const t = String(c?.providerType || c?._ctx?.providerType || c?._ctx?.kind || '').toLowerCase();
+  return m === 'fnac' || m === 'darty' || t === 'bomp';
+}
+function normalizeClaimEanUi(v, c){
+  return normalizeEanUi(v);
+}
+function deepEanFromUi(obj, depth=0, seen=new Set(), rootClaim=null){
   if(!obj || depth>5) return '';
+  const ctxClaim = rootClaim || (obj && typeof obj === 'object' ? obj : null);
   if(typeof obj === 'string'){
     const m = obj.match(/(?:EAN|GTIN|GENCOD|CODE\s*BARRE?S?)\D{0,25}((?:\d[\s.\-]?){8,14})/i);
-    return m ? normalizeEanUi(m[1]) : '';
+    return m ? normalizeClaimEanUi(m[1], ctxClaim) : '';
   }
   if(typeof obj !== 'object') return '';
   if(seen.has(obj)) return '';
   seen.add(obj);
   if(Array.isArray(obj)){
-    for(const item of obj){ const got=deepEanFromUi(item, depth+1, seen); if(got) return got; }
+    for(const item of obj){ const got=deepEanFromUi(item, depth+1, seen, ctxClaim); if(got) return got; }
     return '';
   }
-  const keyRx = /^(?:ean|gtin|gencod|barcode|bar_code|code_barre|product_?ean|product_?gtin|product_?barcode|product_?reference|productReference)$/i;
+  const keyRx = /^(?:ean|ean13|ean_13|gtin|gencod|barcode|bar_code|code_barre|product_?ean|product_?gtin|product_?barcode|article_?ean|item_?ean|order_?line_?ean|line_?ean)$/i;
   for(const [k,v] of Object.entries(obj)){
     if(keyRx.test(k)){
-      const direct = normalizeEanUi(v);
+      const direct = normalizeClaimEanUi(v, ctxClaim);
       if(direct) return direct;
     }
   }
   for(const [k,v] of Object.entries(obj)){
     // On descend dans les zones produit/ligne/commande/contexte, mais on évite de confondre un ID client/commande avec un EAN.
     if(/(?:product|produit|offer|article|item|line|ligne|order_line|orderLines|ctx|context|_ctx|entities|entity)/i.test(k)){
-      const got=deepEanFromUi(v, depth+1, seen);
+      const got=deepEanFromUi(v, depth+1, seen, ctxClaim);
       if(got) return got;
     }
   }
@@ -1272,14 +1293,14 @@ function claimEan(c){
   if(!c) return '';
   const ctx=c._ctx || c.ctx || {};
   const direct=[
-    c.ean,c.gtin,c.productEan,c.productEAN,c.product_ean,c.product_gtin,c.product_reference,c.productReference,c.barcode,c.gencod,
-    ctx.ean,ctx.gtin,ctx.productEan,ctx.productEAN,ctx.product_ean,ctx.product_gtin,ctx.product_reference,ctx.productReference,ctx.barcode,ctx.gencod
-  ].map(normalizeEanUi).find(Boolean);
+    c.ean,c.ean13,c.ean_13,c.gtin,c.gencod,c.productEan,c.productEAN,c.product_ean,c.product_gtin,c.barcode,c.bar_code,c.code_barre,
+    ctx.ean,ctx.ean13,ctx.ean_13,ctx.gtin,ctx.gencod,ctx.productEan,ctx.productEAN,ctx.product_ean,ctx.product_gtin,ctx.barcode,ctx.bar_code,ctx.code_barre
+  ].map(v => normalizeClaimEanUi(v, c)).find(Boolean);
   if(direct) return direct;
-  const deep=deepEanFromUi(c);
+  const deep=deepEanFromUi(c, 0, new Set(), c);
   if(deep) return deep;
   const msgs=Array.isArray(c.messages)?c.messages:[];
-  for(const m of msgs){ const got=deepEanFromUi(String(m.text||'')); if(got) return got; }
+  for(const m of msgs){ const got=deepEanFromUi(String(m.text||''), 0, new Set(), c); if(got) return got; }
   return '';
 }
 function sanitizeProductNameUi(v, c={}){
@@ -1713,6 +1734,9 @@ const DataAPI = {
   if(options.pages) params.set('pages', String(options.pages));
   if(options.pageSize) params.set('pageSize', String(options.pageSize));
   if(options.evalConcurrency) params.set('evalConcurrency', String(options.evalConcurrency));
+  if(options.recentOnly !== undefined) params.set('recentOnly', options.recentOnly ? '1' : '0');
+  if(options.recentDays) params.set('recentDays', String(options.recentDays));
+  if(options.since) params.set('since', String(options.since));
   const r = await fetch(`${CONFIG.API_BASE}/notes?${params.toString()}`, {
     headers:{'Accept':'application/json'}
   });
@@ -1747,7 +1771,11 @@ const DataAPI = {
       opts={method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({body:message,status})};
     }
     const r = await fetch(`${CONFIG.API_BASE}/threads/${encodeURIComponent(id)}/message`,opts);
-    if(!r.ok) throw new Error("Échec de l'envoi ("+r.status+")");
+    if(!r.ok){
+      let msg = "Échec de l'envoi ("+r.status+")";
+      try{ msg = await readApiError(r,msg); }catch(e){}
+      throw new Error(msg);
+    }
     return await r.json();
   },
   /* Récupération automatique du suivi auprès du transporteur (via le proxy).
@@ -3537,7 +3565,7 @@ function showPage(tabId){
   });
   try{localStorage.setItem("activePage",tabId);}catch(e){}
   if(tabId==="tabNotes" && !CONFIG.USE_DEMO_DATA && !notesLoaded && !notesLoading){
-    loadNotesAsync({limit:150, providerTimeoutMs:12000, miraklTimeoutMs:45000, maxOrders:40, pages:3, pageSize:25}).catch(()=>{});
+    loadNotesAsync({limit:150, recentOnly:true, recentDays:60, providerTimeoutMs:12000, miraklTimeoutMs:45000, maxOrders:40, pages:3, pageSize:25}).catch(()=>{});
   }
   if(tabId==="tabIncidents" && !CONFIG.USE_DEMO_DATA && !incidentsLoaded && !incidentsLoading){
     loadIncidents({enrichDetails:false}).catch(()=>{});
@@ -3587,7 +3615,9 @@ async function loadNotesAsync(options={}){
       providers: options.providers || 'octopia,bomp',
       includeMirakl:false,
       providerTimeoutMs: options.providerTimeoutMs || 12000,
-      limit: options.limit || 150
+      limit: options.limit || 150,
+      recentOnly: options.recentOnly !== false,
+      recentDays: options.recentDays || 60
     });
     NOTES.splice(0, NOTES.length, ...fastNotes);
     notesLoaded=true;
@@ -3604,7 +3634,9 @@ async function loadNotesAsync(options={}){
       pages: options.pages || 3,
       pageSize: options.pageSize || 25,
       evalConcurrency: options.evalConcurrency || 4,
-      limit: options.limit || 300
+      limit: options.limit || 300,
+      recentOnly: options.recentOnly !== false,
+      recentDays: options.recentDays || 60
     });
     NOTES.splice(0, NOTES.length, ...mergeNotesLists(NOTES, miraklNotes));
   }catch(ne){
