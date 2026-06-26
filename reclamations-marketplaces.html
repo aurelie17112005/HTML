@@ -385,6 +385,7 @@
   .ordref.copied::after{content:"✓"}
   .eanlink{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;color:var(--navy);background:var(--navy-50);padding:2px 7px;border-radius:6px;cursor:pointer;font-weight:700}
   .eanlink:hover{background:var(--navy);color:#fff;text-decoration:underline}
+  .eanplain{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;color:var(--muted);background:var(--line-2);padding:2px 7px;border-radius:6px;font-weight:700}
   .ordref.on-dark{background:rgba(255,255,255,.16);color:#fff}
   .ordref.on-dark:hover{background:rgba(255,255,255,.28);color:#fff}
 
@@ -537,6 +538,7 @@
     background:rgba(0,0,0,.06);font-weight:600}
   .bubble-att-link{color:inherit;text-decoration:none;cursor:pointer;transition:.12s}
   .bubble-att-link:hover{filter:brightness(.95);box-shadow:0 0 0 1px var(--navy-700) inset}
+  .bubble-att-info{opacity:.78;cursor:default}
   .bubble.seller .bubble-att{background:rgba(255,255,255,.18)}
   .foot-row{display:flex;gap:9px;align-items:center;margin-top:11px}
   .status-select{margin-left:auto}
@@ -1280,15 +1282,65 @@ function claimEan(c){
   for(const m of msgs){ const got=deepEanFromUi(String(m.text||'')); if(got) return got; }
   return '';
 }
+function sanitizeProductNameUi(v, c={}){
+  let s=cleanSubjectText(v);
+  if(!s) return "";
+  s=s.replace(/\s+(?:[-|•·]\s*)?(?:Cdiscount|Fnac|Darty|Carrefour|Boulanger|E\.Leclerc|Leclerc|Leroy\s*Merlin|But|Conforama|Cultura|Auchan|Ubaldi|Rue\s*du\s*Commerce|Castorama)\s*$/i,"").trim();
+  const order=cleanSubjectText(c.orderId||c.order||c._ctx?.orderId||'');
+  const ean=normalizeEanUi(s);
+  if(order && s===order) return "";
+  if(ean && s.replace(/\D/g,'')===ean) return "";
+  if(/^https?:\/\//i.test(s)) return "";
+  if(/^(?:order|commande|client|customer|product|produit|article|item|sku|ean|gtin|undefined|null|unknown)$/i.test(s)) return "";
+  if(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s)) return "";
+  if(/^[A-Z0-9_\-]{6,32}$/i.test(s) && !/[\sàâäéèêëîïôöùûüç]/i.test(s)) return "";
+  const folded=s.normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase();
+  if(/^(bonjour|bonsoir|bjr|hello|madame|monsieur|cher|chere)\b/.test(folded)) return "";
+  if(/\b(reclamation|commande|colis|livraison|remboursement|retour|incident|message client|service client|marketplace|seller|vendeur|boutique)\b/.test(folded) && s.length>90) return "";
+  if(s.length>180) return "";
+  return s;
+}
+function isBadProductNameUi(v, c={}){
+  return !sanitizeProductNameUi(v,c);
+}
+function productNameScoreUi(v, c={}){
+  const s=sanitizeProductNameUi(v,c);
+  if(!s) return -999;
+  let score=10;
+  if(/[a-zàâäéèêëîïôöùûüç]/i.test(s)) score+=8;
+  if(/\s/.test(s)) score+=5;
+  if(/\d/.test(s)) score+=1;
+  if(s.length>=8 && s.length<=90) score+=7;
+  if(s.length>90) score-=Math.min(20,Math.round((s.length-90)/10));
+  if(/[.!?;:]{2,}/.test(s)) score-=6;
+  const folded=s.normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase();
+  if(/\b(reclamation|message|commande|colis|client|remboursement|livraison|retour|incident)\b/.test(folded)) score-=8;
+  if(/^[A-Z0-9_\-]+$/i.test(s) && !/\s/.test(s)) score-=15;
+  return score;
+}
+function claimProductName(c){
+  if(!c) return '';
+  const ctx=c._ctx||c.ctx||{};
+  const candidates=[
+    c.productName,c.product_name,c.productTitle,c.product_title,c.productLabel,c.product_label,
+    ctx.productName,ctx.product_name,ctx.productTitle,ctx.product_title,ctx.productLabel,ctx.product_label,ctx.product,
+    c.product,c.itemName,c.item_name,c.articleName,c.article_name,ctx.itemName,ctx.articleName
+  ];
+  return candidates
+    .map(v=>sanitizeProductNameUi(v,c))
+    .filter(Boolean)
+    .sort((a,b)=>productNameScoreUi(b,c)-productNameScoreUi(a,c))[0] || '';
+}
 function claimHeaderMetaHtml(c, opts={}){
   const dark = opts.dark !== false;
   const ean = claimEan(c);
+  const productName = claimProductName(c);
   const eanHtml = ean
     ? `<span class="ordref ${dark?'on-dark':''}" data-lbl="Code EAN">${esc(ean)}</span>`
     : `<span class="missing-ean">non disponible</span>`;
   return `<div class="meta-line meta-ean"><b>EAN :</b> ${eanHtml}</div>`
     + `<div class="meta-line">Client : ${esc(c.customer || 'Client')}</div>`
-    + (c.product ? `<div class="meta-line">Produit : ${esc(c.product)}</div>` : '');
+    + `<div class="meta-line">Produit : ${productName ? esc(productName) : '<span class="missing-ean">non disponible</span>'}</div>`;
 }
 
 function tsSafe(v, fallback=Date.now()){
@@ -1321,7 +1373,7 @@ function normalizeClaim(c){
     customerId: c.customerId || c.clientId || c.customer_id || "",
     subject: normalizeDisplaySubject(subjectSource, messages),
     orderId: c.orderId || "",
-    product: c.product || "",
+    product: claimProductName(c),
     ean: claimEan(c),
     priority: c.priority || "moyenne",
     status: c.status || "nouveau",
@@ -2200,6 +2252,8 @@ function renderActiveRecView(){
   else if($("#treatView").style.display!=="none") renderTreat();
   else if($("#claudeView").style.display!=="none") renderClaude();
   else renderTable();
+  updateTreatCount();
+  updateClaudeCount();
 }
 
 /* ===== Poste de traitement (liste + détail simultanés) ===== */
@@ -2378,12 +2432,13 @@ let claudeSelectedId=null, claudeFiles=[];
 
 function updateClaudeCount(){
   const el=$("#claudeCount"); if(!el)return;
-  const n=claims.filter(c=>effNiveau(c)===1 && needsReply(c)).length;
+  const n=claims.filter(c=>matchCurrentMarketplace(c) && effNiveau(c)===1 && needsReply(c)).length;
   el.textContent=n; el.classList.toggle("zero",n===0);
 }
 function renderClaude(){
   const f=$("#fClaude").value;
-  const list=claims.filter(c=>effNiveau(c)===1 && (!f || claudeState(c)===f))
+  // Important : la liste Claude reprend le filtre marketplace global, sans mélanger les autres marketplaces.
+  const list=claims.filter(c=>matchCurrentMarketplace(c) && effNiveau(c)===1 && (!f || claudeState(c)===f))
     .sort((a,b)=>{const o={a_valider:0,attente:1,faite:2};return (o[claudeState(a)]-o[claudeState(b)])||(createdAt(a)-createdAt(b));});
   $("#claudeList").innerHTML = list.length ? list.map(c=>{
     const cs=claudeState(c);
@@ -2797,9 +2852,12 @@ function renderKPIs(){
   { const el=$("#reclamBadge"); if(el){ const n=claims.filter(needsReply).length; el.textContent=n; el.classList.toggle("zero",n===0);} }
 }
 /* Compteur de réclamations restant à traiter (non répondues, non résolues) */
+function currentMarketplaceFilter(){ const el=$("#fMp"); return el ? String(el.value||"") : ""; }
+function matchCurrentMarketplace(c){ const mp=currentMarketplaceFilter(); return !mp || String(c&&c.marketplace||"")===mp; }
+
 function updateTreatCount(){
   const el=$("#treatCount"); if(!el)return;
-  const n=claims.filter(c=>needsReply(c) && effNiveau(c)!==1).length;
+  const n=claims.filter(c=>matchCurrentMarketplace(c) && needsReply(c) && effNiveau(c)!==1).length;
   el.textContent=n; el.classList.toggle("zero",n===0);
 }
 
@@ -2940,7 +2998,7 @@ function renderTable(){
       <td><span class="ordref" data-lbl="N° de commande">${c.orderId}</span><div class="meta dt">Récl. ${fmtDate(createdAt(c))}</div><div class="meta dt">Dern. ${fmtDate(lastOpenedMessageAt(c))}</div></td>
       <td class="col-c">${c.tracking?carrierMark(c.tracking.carrier):'<span class="meta">—</span>'}</td>
       <td class="col-c">${trackBar(c.tracking)}</td>
-      <td>${customerHtml(c)}<div class="meta">${esc(c.product||"")}${c.ean?` <span class="ordref" data-lbl="Code EAN">${esc(c.ean)}</span>`:""}</div></td>
+      <td>${customerHtml(c)}<div class="meta">Produit : ${esc(claimProductName(c)||"—")}</div><div class="meta">EAN : ${c.ean?`<span class="eanplain">${esc(c.ean)}</span>`:"—"}</div></td>
       <td>${esc(c.subject)}</td>
       <td>${statusBadge(c)}</td>
       <td><span class="meta">${fmtAgo(c.updatedAt)}</span></td></tr>`;}).join("");
@@ -3194,12 +3252,31 @@ async function downloadAttachmentClick(ev,el){
   }
   return false;
 }
+function looksLikeMentionAttachment(a){
+  if(!a || typeof a!=="object") return false;
+  const href=attachmentHref(a);
+  const rawName=cleanSubjectText(a.name || a.filename || a.label || a.title || "");
+  const type=cleanSubjectText(a.type || a.role || a.userType || a.user_type || a.entity_type || "");
+  const reason=cleanSubjectText(a.reason || "");
+  const folded=[rawName,type,reason].join(" ").normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase();
+  const hasFileSignal=Boolean(href || a.size || looksLikeDisplayAttachmentFilename(rawName) || /^(application|image|text|audio|video|message)\//i.test(type));
+  if(hasFileSignal) return false;
+  if(/\b(client|customer|acheteur|buyer|vendeur|seller|shop|boutique|operateur|operator|agent|participant|recipient|destinataire|personne|person|contact|logo|avatar)\b/.test(folded)) return true;
+  if(/url absente|endpoint connu|non telechargeable|non disponible/.test(folded)) return true;
+  return false;
+}
 function renderAttachment(a){
-  const name=esc((a&&a.name) || (a&&a.filename) || "Pièce jointe");
-  const rawName=((a&&a.name) || (a&&a.filename) || "piece-jointe").replace(/[\r\n"]/g,"");
+  const displayName=(a&&a.name) || (a&&a.filename) || "Pièce jointe";
+  const name=esc(displayName);
+  const rawName=String((a&&a.name) || (a&&a.filename) || "piece-jointe").replace(/[\r\n"]/g,"");
   const size=a&&a.size?` <span style="opacity:.7">(${fmtSize(Number(a.size)||0)})</span>`:"";
   const href=attachmentHref(a);
   const reason=(a&&a.reason)?` — ${esc(a.reason)}`:"";
+  if(!href && looksLikeMentionAttachment(a)){
+    const isLogo=/logo|avatar/i.test(String(displayName||"") + " " + String(a&&a.type||""));
+    const txt=isLogo ? "Élément mentionné" : "Personne mentionnée";
+    return `<span class="bubble-att bubble-att-info" title="${txt}, non téléchargeable">ℹ️ <span class="att-name">${txt} : ${name}</span></span>`;
+  }
   const label=`📎 <span class="att-name">${name}</span>${size}`;
   return href
     ? `<a class="bubble-att bubble-att-link" href="${esc(href)}" data-filename="${esc(rawName)}" onclick="return downloadAttachmentClick(event,this)" download title="Télécharger ${name}">${label}</a>`
@@ -3436,7 +3513,14 @@ function initUser(){
   let saved=""; try{saved=localStorage.getItem("currentUser")||"";}catch(e){}
   if(USERS.includes(saved)) currentUser=saved;
   sel.innerHTML=USERS.map(u=>`<option value="${u}"${u===currentUser?" selected":""}>${u}${u==="Claude"?" (assistant)":""}</option>`).join("");
-  sel.onchange=()=>{currentUser=sel.value;try{localStorage.setItem("currentUser",currentUser);}catch(e){}toast("Connecté en tant que "+currentUser);};
+  sel.onchange=()=>{
+    currentUser=sel.value;
+    try{localStorage.setItem("currentUser",currentUser);}catch(e){}
+    treatFiles=[]; claudeFiles=[];
+    renderActiveRecView();
+    if(selectedId && $("#drawer").classList.contains("show")) openDrawer(selectedId,true);
+    toast("Connecté en tant que "+currentUser);
+  };
 }
 
 /* Onglet d'affichage (afficher/masquer une section, état mémorisé) */

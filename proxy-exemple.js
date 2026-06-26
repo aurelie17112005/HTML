@@ -621,6 +621,32 @@ function attachmentKeyNorm(k) {
   return String(k || '').replace(/^@_/, '').replace(/[^a-z0-9]/gi, '').toLowerCase();
 }
 
+function looksLikeFileMimeType(v) {
+  const s = cleanText(v);
+  if (!s) return false;
+  if (/^(?:application|image|text|audio|video|message)\/[a-z0-9.+_-]+$/i.test(s)) return true;
+  if (/^(?:pdf|png|jpe?g|gif|webp|heic|bmp|tiff?|docx?|xlsx?|xls|pptx?|zip|rar|7z|txt|csv|json|xml|eml|msg|mp4|mov|avi|mkv|webm|wav|mp3)$/i.test(s)) return true;
+  return false;
+}
+
+function isPersonLikeAttachmentObject(source, rawName = '') {
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return false;
+  const role = foldStatusText(scalarFirst(
+    source.type, source.userType, source.user_type, source.role, source.entity_type, source['@_type'],
+    source.participant_type, source.recipient_type, source.author_type
+  ));
+  if (!/^(customer|client|buyer|seller|shop|operator|agent|user|person|participant|recipient|contact|from|to|cc|bcc)$/.test(role)) return false;
+  const hasStrongFileField = Boolean(
+    source.downloadUrl || source.download_url || source.file_url || source.fileUrl || source.content_url || source.contentUrl ||
+    source.attachment_id || source.attachmentId || source.file_id || source.fileId || source.document_id || source.documentId ||
+    source.file_name || source.filename || source.fileName || source.originalname || source.document_name || source.documentName ||
+    source.size || source.file_size || source.fileSize || source.content_length || source.contentLength ||
+    looksLikeFileMimeType(source.mimeType || source.mimetype || source.mime_type || source.content_type || source.contentType) ||
+    looksLikeAttachmentFilename(rawName)
+  );
+  return !hasStrongFileField;
+}
+
 function looksLikeAttachmentFilename(v) {
   const s = cleanText(v);
   if (!s) return false;
@@ -644,6 +670,25 @@ function isBadCustomerName(v) {
 function sanitizeCustomerName(v) {
   const s = cleanText(v);
   return isBadCustomerName(s) ? '' : s;
+}
+
+function customerNameScore(v) {
+  const s = sanitizeCustomerName(v);
+  if (!s) return 0;
+  let score = 1;
+  const parts = s.split(/\s+/).filter(Boolean);
+  if (parts.length >= 2) score += 4;
+  if (/[A-ZÀÂÄÉÈÊËÎÏÔÖÙÛÜÇ][a-zàâäéèêëîïôöùûüç'-]+\s+[A-ZÀÂÄÉÈÊËÎÏÔÖÙÛÜÇ]/.test(s)) score += 2;
+  if (/@/.test(s)) score -= 2;
+  if (/^\S+$/.test(s)) score -= 1;
+  return score;
+}
+function betterCustomerName(current, incoming) {
+  const cur = sanitizeCustomerName(current);
+  const inc = sanitizeCustomerName(incoming);
+  if (!inc) return cur;
+  if (!cur || cur === 'Client') return inc;
+  return customerNameScore(inc) > customerNameScore(cur) ? inc : cur;
 }
 
 function looksLikeEan(v) {
@@ -690,6 +735,95 @@ function firstOrderEan(...sources) {
   return '';
 }
 
+function looksLikeTechnicalProduct(v, orderId = '') {
+  const s = cleanText(v);
+  if (!s) return true;
+  if (orderId && s === cleanText(orderId)) return true;
+  const ean = looksLikeEan(s);
+  if (ean && s.replace(/\D/g, '') === ean) return true;
+  if (/^https?:\/\//i.test(s)) return true;
+  if (/^(?:ORDER|COMMANDE|CLIENT|CUSTOMER|PRODUCT|PRODUIT|ARTICLE|ITEM|SKU|EAN|GTIN|UNKNOWN|UNDEFINED|NULL)$/i.test(s)) return true;
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s)) return true;
+  if (/^[A-Z0-9_\-]{6,32}$/i.test(s) && !/[\sàâäéèêëîïôöùûüç]/i.test(s)) return true;
+  // Un message client, un sujet de page ou un gros <title> n'est pas un nom produit.
+  const folded = foldStatusText(s);
+  if (/^(bonjour|bonsoir|bjr|hello|madame|monsieur|cher|chere)\b/.test(folded)) return true;
+  if (/\b(reclamation|commande|colis|livraison|remboursement|retour|incident|message client|service client|marketplace|seller|vendeur|boutique)\b/.test(folded) && s.length > 90) return true;
+  if (s.length > 180) return true;
+  return false;
+}
+function sanitizeProductName(v, orderId = '') {
+  let s = cleanText(v);
+  // Nettoyage des titres trop riches du type "Produit - Cdiscount" ou "Produit | Marketplace".
+  s = s.replace(/\s+(?:[-|•·]\s*)?(?:Cdiscount|Fnac|Darty|Carrefour|Boulanger|E\.Leclerc|Leclerc|Leroy\s*Merlin|But|Conforama|Cultura|Auchan|Ubaldi|Rue\s*du\s*Commerce|Castorama)\s*$/i, '').trim();
+  return looksLikeTechnicalProduct(s, orderId) ? '' : s;
+}
+function productNameScore(v, orderId = '') {
+  const s = sanitizeProductName(v, orderId);
+  if (!s) return -999;
+  let score = 10;
+  if (/[a-zàâäéèêëîïôöùûüç]/i.test(s)) score += 8;
+  if (/\s/.test(s)) score += 5;
+  if (/\d/.test(s)) score += 1;
+  if (s.length >= 8 && s.length <= 90) score += 7;
+  if (s.length > 90) score -= Math.min(20, Math.round((s.length - 90) / 10));
+  if (/[.!?;:]{2,}/.test(s)) score -= 6;
+  const folded = foldStatusText(s);
+  if (/\b(reclamation|message|commande|colis|client|remboursement|livraison|retour|incident)\b/.test(folded)) score -= 8;
+  if (/^[A-Z0-9_\-]+$/i.test(s) && !/\s/.test(s)) score -= 15;
+  return score;
+}
+function betterProductName(current, incoming, orderId = '') {
+  const cur = sanitizeProductName(current, orderId);
+  const inc = sanitizeProductName(incoming, orderId);
+  if (!inc) return cur;
+  if (!cur) return inc;
+  const curScore = productNameScore(cur, orderId);
+  const incScore = productNameScore(inc, orderId);
+  if (incScore > curScore) return inc;
+  if (incScore === curScore && inc.length < cur.length && cur.length > 90) return inc;
+  return cur;
+}
+function collectDeepProductNames(obj, out = [], seen = new Set(), depth = 0, hint = false) {
+  if (!obj || depth > 6) return out;
+  if (typeof obj === 'string' || typeof obj === 'number') {
+    if (hint) out.push(obj);
+    return out;
+  }
+  if (typeof obj !== 'object' || seen.has(obj)) return out;
+  seen.add(obj);
+  if (Array.isArray(obj)) {
+    obj.forEach(v => collectDeepProductNames(v, out, seen, depth + 1, hint));
+    return out;
+  }
+  const titleKeyRx = /^(?:product_?title|productTitle|product_?name|productName|product_?label|productLabel|article_?title|article_?name|article_?label|item_?title|item_?name|item_?label|offer_?title|offerTitle|offer_?name|offerName|designation|designations?|libelle|libell[eé]|label|title|name)$/i;
+  for (const [k, v] of Object.entries(obj)) {
+    if (titleKeyRx.test(k)) {
+      const got = scalarValue(v);
+      if (got) out.push(got);
+    }
+  }
+  for (const [k, v] of Object.entries(obj)) {
+    const childHint = hint || /(?:product|produit|offer|article|item|line|ligne|order_line|orderLines|entities|entity|productInformation)/i.test(k);
+    if (childHint || (v && typeof v === 'object' && /(?:product|produit|offer|article|item|line|ligne|entity)/i.test(k))) {
+      collectDeepProductNames(v, out, seen, depth + 1, childHint);
+    }
+  }
+  return out;
+}
+function firstProductName(...sources) {
+  const candidates = [];
+  for (const source of sources) collectDeepProductNames(source, candidates);
+  for (const source of sources) {
+    const direct = scalarValue(source);
+    if (direct) candidates.unshift(direct);
+  }
+  return candidates
+    .map(v => sanitizeProductName(v))
+    .filter(Boolean)
+    .sort((a, b) => productNameScore(b) - productNameScore(a))[0] || '';
+}
+
 function fullNameFromPieces(...parts) {
   const out = parts.map(cleanText).filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
   return sanitizeCustomerName(out);
@@ -724,10 +858,11 @@ function collectAttachmentCandidates(source, out = [], seen = new Set(), hint = 
   const sourceId = attachmentSourceId(source);
   const sizeRaw = scalarFirst(source.size, source.file_size, source.fileSize, source.length, source.content_length, source.contentLength, source['@_size']);
   const typeRaw = scalarFirst(source.mimeType, source.mimetype, source.mime_type, source.content_type, source.contentType, source.type, source['@_mime_type'], source['@_content_type']);
+  const typeLooksFile = looksLikeFileMimeType(typeRaw);
   const nameLooksFile = looksLikeAttachmentFilename(rawName);
-  const hasFileSignal = Boolean(sourceUrl || sizeRaw || typeRaw || nameLooksFile);
+  const hasFileSignal = Boolean(sourceUrl || sizeRaw || typeLooksFile || nameLooksFile);
 
-  if ((hint || nameLooksFile || sourceUrl || typeRaw || sizeRaw) && hasFileSignal && (rawName || sourceUrl || sourceId)) {
+  if (!isPersonLikeAttachmentObject(source, rawName) && (hint || nameLooksFile || sourceUrl || typeLooksFile || sizeRaw) && hasFileSignal && (rawName || sourceUrl || sourceId)) {
     out.push(source);
   }
 
@@ -793,7 +928,8 @@ function normalizeAttachmentObject(a, index = 0) {
   const cleanName = cleanText(rawName || fromUrl);
   const sizeRaw = typeof a === 'string' ? '' : scalarFirst(a?.size, a?.file_size, a?.fileSize, a?.length, a?.content_length, a?.contentLength, a?.['@_size']);
   const size = Number(sizeRaw) || null;
-  const type = typeof a === 'string' ? '' : cleanText(scalarFirst(a?.mimeType, a?.mimetype, a?.mime_type, a?.content_type, a?.contentType, a?.type, a?.['@_mime_type'], a?.['@_content_type']));
+  const typeRaw = typeof a === 'string' ? '' : cleanText(scalarFirst(a?.mimeType, a?.mimetype, a?.mime_type, a?.content_type, a?.contentType, a?.type, a?.['@_mime_type'], a?.['@_content_type']));
+  const type = looksLikeFileMimeType(typeRaw) ? typeRaw : '';
   const id = attachmentSourceId(a);
   const name = cleanName || (sourceUrl ? `Pièce jointe ${index + 1}` : '');
   const out = { name, size, type, id, url: sourceUrl };
@@ -868,14 +1004,14 @@ function foldStatusText(v) {
 function isClosedMarketplaceStatus(raw) {
   const s = foldStatusText(raw);
   if (!s) return false;
-  return /(closed|close|cloture|cloturee|resolved|resolu|resolue|termine|terminee|terminated|done|complete|completed|archive|archived|annule|annulee|cancelled|canceled)/.test(s);
+  return /\b(closed|close|cloture|cloturee|resolved|resolu|resolue|termine|terminee|terminated|done|complete|completed|archive|archived|annule|annulee|cancelled|canceled)\b/.test(s);
 }
 
 function normalizeMarketplaceStatus(raw, fallback = 'nouveau') {
   const s = foldStatusText(raw);
   if (!s) return fallback;
   if (isClosedMarketplaceStatus(s)) return 'resolu';
-  if (/(waiting|pending|attente|a traiter|a repondre|answer required|seller answer|unread|nouveau|new|opened|open|ongoing|in progress|en cours)/.test(s)) return 'nouveau';
+  if (/\b(waiting|pending|attente|a traiter|a repondre|answer required|seller answer|unread|nouveau|new|opened|open|ongoing|in progress|en cours)\b/.test(s)) return 'nouveau';
   return fallback;
 }
 
@@ -1401,7 +1537,7 @@ const octopia = (() => {
       customer: scalarFirst(d.customer?.name, d.customerName, d.buyer?.name, customerId) || 'Client',
       subject: normalizeSubject(firstReadableSubject(d.subject, d.title, d.topic, d.reason, d.reasonLabel), lastClientText),
       orderId: scalarFirst(d.orderSellerId, d.orderReference, d.orderId, d.order?.id, d.order?.orderId),
-      product: scalarFirst(d.productId, d.product?.id, d.product?.title, d.offerSellerId, d.sku),
+      product: firstProductName(d.product?.title, d.productTitle, d.product_title, d.productName, d.product_name, d.offer?.productTitle, d.offer?.product_title, d.offer?.title, d.item?.title, d.lines, d.order?.lines, d.product, d.offer),
       priority: graduationToPriority(d.graduation || d.level || d.type),
       status: isOpen ? normalizeMarketplaceStatus(rawStatus, 'nouveau') : 'resolu',
       marketplaceStatus: rawStatus,
@@ -1410,6 +1546,106 @@ const octopia = (() => {
       tracking: normalizeTracking(d.tracking || d.shipment || d.shipping || d.delivery, d),
       ctx: { discussionId, salesChannel, customerId, kind: 'discussion', marketplaceStatus: rawStatus, rawStatus, closedByMarketplace: !isOpen },
     });
+  }
+
+  function extractOctopiaOrderList(payload) {
+    return extractList(payload?.orders || payload?.data || payload?.items || payload);
+  }
+
+  function octopiaOrderInfo(order = {}) {
+    const linesRaw = order.lines || order.orderLines || order.order_lines || order.items || order.orderItems || [];
+    const lines = Array.isArray(linesRaw) ? linesRaw : (linesRaw ? [linesRaw] : []);
+    const firstLine = lines[0] || {};
+    const offer = firstLine.offer || firstLine.productOffer || firstLine.offerInfo || order.offer || {};
+    const shipping = firstLine.shippingAddress || order.shippingAddress || order.deliveryAddress || order.recipient || {};
+    const billing = order.billingAddress || order.invoiceAddress || {};
+    const customer = sanitizeCustomerName(scalarFirst(
+      fullNameFromPieces(shipping.firstName, shipping.lastName),
+      fullNameFromPieces(shipping.firstname, shipping.lastname),
+      fullNameFromPieces(billing.firstName, billing.lastName),
+      fullNameFromPieces(billing.firstname, billing.lastname),
+      shipping.name, shipping.fullName, billing.name, billing.fullName,
+      order.customer?.name, order.customerName, order.buyerName, order.customer?.reference
+    ));
+    const product = firstProductName(
+      offer.productTitle, offer.product_title, offer.productName, offer.product_name, offer.title, offer.name,
+      firstLine.productTitle, firstLine.product_title, firstLine.productName, firstLine.product_name, firstLine.title, firstLine.name,
+      firstLine.product, offer.product, lines
+    );
+    const ean = firstOrderEan(
+      offer.productGtin, offer.product_gtin, offer.gtin, offer.ean, offer.barcode,
+      firstLine.productGtin, firstLine.product_gtin, firstLine.gtin, firstLine.ean, firstLine.barcode,
+      firstLine.product?.gtin, firstLine.product?.ean, firstLine.product?.barcode,
+      lines
+    );
+    return {
+      orderId: scalarFirst(order.orderId, order.id, order.reference),
+      reference: scalarFirst(order.reference, order.orderReference, order.order_reference),
+      customer,
+      product,
+      ean,
+      orderCreatedAt: parseMarketplaceDate(scalarFirst(order.purchasedAt, order.createdAt, order.created_at), 0) || null,
+      tracking: normalizeOrderTracking(order),
+    };
+  }
+
+  async function fetchOrderByKnownId(provider, id) {
+    const orderId = cleanText(id);
+    if (!orderId) return null;
+    try {
+      const data = await api(provider, `/orders/${encodeURIComponent(orderId)}`);
+      return data?.order || data?.data || data;
+    } catch (e) {
+      if (![400, 404].includes(Number(e.statusCode || e.status))) throw e;
+    }
+
+    const attempts = [
+      { reference: orderId },
+      { orderId },
+    ];
+    for (const params of attempts) {
+      const qs = new URLSearchParams({ pageIndex: '1', pageSize: '10', ...params });
+      try {
+        const data = await api(provider, `/orders?${qs.toString()}`);
+        const orders = extractOctopiaOrderList(data);
+        const exact = orders.find(o => [o.orderId, o.id, o.reference, o.orderReference, o.order_reference].map(scalarValue).includes(orderId)) || orders[0];
+        if (exact) return exact;
+      } catch (e) {
+        if (String(process.env.OCTOPIA_DEBUG || '') === '1') console.warn(`[octopia] recherche commande ${orderId} ignorée: ${e.message}`);
+      }
+    }
+    return null;
+  }
+
+  async function enrichClaimsWithOrders(provider, claims) {
+    if (String(process.env.OCTOPIA_FETCH_ORDER_DETAILS || 'true') === 'false') return claims;
+    const targets = (claims || []).filter(c => c?.orderId && (
+      !sanitizeCustomerName(c.customer) || c.customer === 'Client' || !c.ean || !c.product || !c.tracking
+    ));
+    if (!targets.length) return claims;
+    const concurrency = positiveInt(process.env.OCTOPIA_ORDER_ENRICH_CONCURRENCY, 3, 1, 10);
+    const byOrderId = new Map();
+    await mapLimit([...new Set(targets.map(c => c.orderId).filter(Boolean))], concurrency, async (orderId) => {
+      try {
+        const order = await fetchOrderByKnownId(provider, orderId);
+        if (order) byOrderId.set(orderId, octopiaOrderInfo(order));
+      } catch (e) {
+        console.warn(`[octopia] enrichissement commande ${orderId} ignoré: ${e.message}`);
+      }
+    });
+    for (const claim of targets) {
+      const info = byOrderId.get(claim.orderId);
+      if (!info) continue;
+      const betterCustomer = betterCustomerName(claim.customer, info.customer);
+      if (betterCustomer && betterCustomer !== claim.customer) claim.customer = betterCustomer;
+      const betterProduct = betterProductName(claim.product, info.product, claim.orderId || info.orderId || info.reference);
+      if (betterProduct && betterProduct !== claim.product) claim.product = betterProduct;
+      if (!claim.ean && info.ean) claim.ean = info.ean;
+      if (info.orderCreatedAt) claim.orderCreatedAt = info.orderCreatedAt;
+      if (info.tracking) claim.tracking = mergeTrackingInfo(claim.tracking, info.tracking);
+      claim._ctx = { ...(claim._ctx || {}), ...(info.ean ? { ean: info.ean } : {}), ...(info.product ? { product: info.product } : {}), orderId: claim.orderId };
+    }
+    return claims;
   }
 
   return {
@@ -1431,7 +1667,7 @@ const octopia = (() => {
         all.push(...items.map(d => mapDiscussion(provider, d)).filter(c => c._ctx.discussionId));
         if (!items.length || items.length < pageSize) break;
       }
-      return all;
+      return enrichClaimsWithOrders(provider, all);
     },
 
     // Récupère et normalise le fil complet d'une discussion.
@@ -1439,7 +1675,8 @@ const octopia = (() => {
       const discussionId = scalarFirst(ctxOrId?.discussionId, ctxOrId?.id, ctxOrId);
       if (!discussionId) throw Object.assign(new Error('Octopia : discussionId manquant pour le détail'), { statusCode: 400, provider: 'octopia', operation: 'fetchThread' });
       const raw = await api(provider, `/discussions/${encodeURIComponent(discussionId)}`);
-      return mapDiscussion(provider, raw);
+      const claim = mapDiscussion(provider, raw);
+      return (await enrichClaimsWithOrders(provider, [claim]))[0] || claim;
     },
 
     async fetchProductNotes(provider, options = {}) {
@@ -1722,7 +1959,7 @@ const mirakl = {
       customer,
       subject: normalizeSubject(subject, lastClientText),
       orderId: scalarFirst(orderEntity?.id, orderEntity?.order_id, thread.order_id, thread.orderId, thread.order?.id, thread.entities?.[0]?.id),
-      product: scalarFirst(productEntity?.label, productEntity?.name, thread.product_title, thread.product, thread.offer?.sku, thread.entities?.[0]?.label),
+      product: firstProductName(productEntity, thread.product_title, thread.productTitle, thread.product, thread.offer, thread.entities),
       ean: eanFromThread,
       status: normalizeMarketplaceStatus(rawStatus, 'nouveau'),
       marketplaceStatus: rawStatus,
@@ -1823,11 +2060,12 @@ const mirakl = {
     ));
     const lines = order.order_lines || order.lines || order.orderLines || [];
     const firstLine = Array.isArray(lines) ? (lines[0] || {}) : lines;
-    const product = scalarFirst(
-      firstLine.product_title, firstLine.productTitle, firstLine.product?.title, firstLine.product?.name,
-      firstLine.offer_sku, firstLine.offer_id, firstLine.product?.sku, order.product_title
-    );
     const lineArray = Array.isArray(lines) ? lines : (lines ? [lines] : []);
+    const product = firstProductName(
+      firstLine.product_title, firstLine.productTitle, firstLine.product?.title, firstLine.product?.name,
+      firstLine.offer?.product_title, firstLine.offer?.productTitle, firstLine.offer?.product?.title, firstLine.offer?.product?.name,
+      firstLine.offer?.title, firstLine.offer?.name, order.product_title, order.productTitle, lineArray
+    );
     const ean = firstOrderEan(
       ...lineArray,
       firstLine.ean, firstLine.gtin, firstLine.barcode, firstLine.product_ean, firstLine.product_gtin,
@@ -1965,7 +2203,8 @@ const mirakl = {
           claim.customer = info.customer;
           claim._ctx = { ...(claim._ctx || {}), customer: info.customer };
         }
-        if (info.product && !claim.product) claim.product = info.product;
+        const betterProduct = betterProductName(claim.product, info.product, claim.orderId || info.orderId);
+        if (betterProduct && betterProduct !== claim.product) claim.product = betterProduct;
         if (info.ean && !claim.ean) { claim.ean = info.ean; claim._ctx = { ...(claim._ctx || {}), ean: info.ean }; }
         if (info.orderCreatedAt) claim.orderCreatedAt = info.orderCreatedAt;
         const t = normalizeOrderTracking(order);
@@ -2847,8 +3086,10 @@ ${inner}
   function mergeClaimDetails(base, detail) {
     if (!base || !detail) return base;
     if (!base.orderId && detail.orderId) base.orderId = detail.orderId;
-    if ((!base.customer || base.customer === 'Client') && detail.customer && detail.customer !== 'Client') base.customer = detail.customer;
-    if (!base.product && detail.product) base.product = detail.product;
+    const betterCustomer = betterCustomerName(base.customer, detail.customer);
+    if (betterCustomer && betterCustomer !== base.customer) base.customer = betterCustomer;
+    const betterProduct = betterProductName(base.product, detail.product, base.orderId || detail.orderId);
+    if (betterProduct && betterProduct !== base.product) base.product = betterProduct;
     if (!base.ean && detail.ean) base.ean = detail.ean;
     if (detail._ctx?.ean && !base._ctx?.ean) base._ctx = { ...(base._ctx || {}), ean: detail._ctx.ean };
     if (detail.tracking) base.tracking = mergeTrackingInfo(base.tracking, detail.tracking);
@@ -2892,8 +3133,14 @@ ${inner}
   }
 
   function extractBompCustomerInfo(obj) {
-    const first = bompDeepText(obj, ['client_firstname', 'buyer_firstname', 'customer_firstname', 'firstname', 'first_name']);
-    const last = bompDeepText(obj, ['client_lastname', 'buyer_lastname', 'customer_lastname', 'lastname', 'last_name']);
+    const first = bompDeepText(obj, [
+      'client_firstname', 'buyer_firstname', 'customer_firstname', 'recipient_firstname', 'shipping_firstname', 'billing_firstname',
+      'firstname', 'first_name', 'firstName', 'prenom', 'prénom', 'given_name', 'givenName'
+    ]);
+    const last = bompDeepText(obj, [
+      'client_lastname', 'buyer_lastname', 'customer_lastname', 'recipient_lastname', 'shipping_lastname', 'billing_lastname',
+      'lastname', 'last_name', 'lastName', 'surname', 'family_name', 'familyName', 'nom'
+    ]);
     const name = sanitizeCustomerName([first, last].filter(Boolean).join(' '));
 
     const customerId = cleanText(
@@ -2913,14 +3160,16 @@ ${inner}
     const email = cleanText(bompDeepText(obj, ['client_email', 'customer_email', 'buyer_email', 'email', 'mail']));
     // IMPORTANT Darty : ne jamais chercher le champ générique "name".
     // Il apparaît aussi dans <attachment><name>photo.jpg</name></attachment> et finissait en nom client.
-    const labelCandidate = bompDeepText(obj, ['customer_name', 'buyer_name', 'client_name'])
+    const labelCandidate = bompDeepText(obj, [
+        'customer_name', 'buyer_name', 'client_name', 'recipient_name', 'shipping_name', 'billing_name',
+        'full_name', 'fullname', 'display_name', 'displayName'
+      ])
       || bompFuzzyText(obj,
-        ['customername', 'buyername', 'clientname'],
+        ['customername', 'buyername', 'clientname', 'recipientname', 'shippingname', 'billingname', 'fullname', 'displayname'],
         ['attachment', 'file', 'document', 'piecejointe', 'filename'],
         v => !isBadCustomerName(v)
       );
-    const label = name
-      || sanitizeCustomerName(labelCandidate)
+    const label = betterCustomerName(name, labelCandidate)
       || sanitizeCustomerName(customerId)
       || sanitizeCustomerName(email);
 
@@ -2935,8 +3184,11 @@ ${inner}
     const orderId = extractBompOrderId(o);
     if (!orderId) return null;
     const customerInfo = extractBompCustomerInfo(o);
-    const product = bompDeepText(o, ['product_name', 'product_label', 'product_title', 'title', 'description'])
-      || bompDeepText(o, ['offer_seller_id', 'offer_fnac_id', 'seller_sku', 'sku']);
+    const product = sanitizeProductName(
+      bompDeepText(o, ['product_name', 'product_label', 'product_title', 'title', 'article_label', 'item_label', 'label', 'description'])
+      || bompDeepText(o, ['offer_title', 'offer_label', 'offer_name']),
+      orderId
+    );
     const ean = extractBompEan(o);
     if (String(process.env.BOMP_EAN_DEBUG || '') === '1') {
       console.log(`[bomp/order] ean order=${orderId} ean=${ean || '-'} product=${cleanText(product) || '-'}`);
@@ -2954,9 +3206,11 @@ ${inner}
   function enrichClaimFromOrderInfo(claim, infoByOrderId) {
     const info = claim?.orderId ? infoByOrderId.get(claim.orderId) : null;
     if (!info) return claim;
-    if ((!claim.customer || claim.customer === 'Client') && info.customer) claim.customer = info.customer;
+    const betterCustomer = betterCustomerName(claim.customer, info.customer);
+    if (betterCustomer && betterCustomer !== claim.customer) claim.customer = betterCustomer;
     if (!claim.customerId && info.customerId) claim.customerId = info.customerId;
-    if (!claim.product && info.product) claim.product = info.product;
+    const betterProduct = betterProductName(claim.product, info.product, claim.orderId || info.orderId);
+    if (betterProduct && betterProduct !== claim.product) claim.product = betterProduct;
     if (!claim.ean && info.ean) claim.ean = info.ean;
     if (info.tracking) claim.tracking = mergeTrackingInfo(claim.tracking, info.tracking);
     claim._ctx = { ...(claim._ctx || {}), orderId: claim.orderId, ...(info.ean ? { ean: info.ean } : {}) };
@@ -3131,9 +3385,9 @@ ${inner}
       customerId: extractBompCustomerInfo(it).customerId,
       subject,
       orderId,
-      product: bompText(it['@_product'], it.product_name, it.product, it.offer_seller_id, it.offer_fnac_id) || bompDeepText(it, [
-        'product', 'product_name', 'product_label', 'product_title', 'title', 'offer_seller_id', 'offer_fnac_id', 'seller_sku', 'sku'
-      ]),
+      product: sanitizeProductName(bompText(it['@_product'], it.product_name, it.product_name, it.product_label, it.product_title, it.product, it.title) || bompDeepText(it, [
+        'product_name', 'product_label', 'product_title', 'article_label', 'item_label', 'title', 'label', 'description'
+      ]), orderId),
       ean: extractBompEan(it),
       priority: 'haute',
       status: normalizeMarketplaceStatus(statusRaw, 'nouveau'),
@@ -3189,9 +3443,9 @@ ${inner}
         bompDeepText(m, ['subject', 'message_subject', 'reason', 'reason_label', 'motif', 'type'])
       ), text),
       orderId,
-      product: bompText(m.offer_seller_id, m.offer_fnac_id, m.product_name) || bompDeepText(m, [
-        'product', 'product_name', 'product_label', 'product_title', 'offer_seller_id', 'offer_fnac_id', 'seller_sku', 'sku'
-      ]),
+      product: sanitizeProductName(bompText(m.product_name, m.product_label, m.product_title, m.product, m.title) || bompDeepText(m, [
+        'product_name', 'product_label', 'product_title', 'article_label', 'item_label', 'title', 'label', 'description'
+      ]), orderId),
       ean: extractBompEan(m),
       priority: 'moyenne',
       status: normalizeMarketplaceStatus(scalarFirst(m.message_state, m.state), String(m.message_state || m.state || '').toLowerCase().includes('read') ? 'attente' : 'nouveau'),
@@ -3233,9 +3487,9 @@ ${inner}
         c.subject, c.type, bompDeepText(c, ['subject', 'message_subject', 'reason', 'reason_label', 'motif', 'type'])
       ), clientText),
       orderId,
-      product: bompText(c.offer_seller_id, c.offer_fnac_id, c.product_name) || bompDeepText(c, [
-        'product', 'product_name', 'product_label', 'product_title', 'offer_seller_id', 'offer_fnac_id', 'seller_sku', 'sku'
-      ]),
+      product: sanitizeProductName(bompText(c.product_name, c.product_label, c.product_title, c.product, c.title) || bompDeepText(c, [
+        'product_name', 'product_label', 'product_title', 'article_label', 'item_label', 'title', 'label', 'description'
+      ]), orderId),
       ean: extractBompEan(c),
       priority: 'moyenne',
       status: sellerReply ? 'attente' : 'nouveau',
@@ -4265,7 +4519,7 @@ function claimLooksLikeIncidentFallback(claim) {
     claim.statusRaw,
     ...(messages || []).map(m => m?.text || '')
   ].join(' '));
-  if (/(incident|litige|reclamation|reclamations|sav|garantie|panne|defectueux|defectueuse|casse|cas[se]e|endommage|non recu|pas recu|jamais recu|colis perdu|retard|non conforme|rembours|retour|piece manquante|article manquant)/.test(text)) return true;
+  if (/\b(incident|litige|reclamation|reclamations|sav|garantie|panne|defectueux|defectueuse|casse|cas[se]e|endommage|non recu|pas recu|jamais recu|colis perdu|retard|non conforme|rembours|retour|piece manquante|article manquant)\b/.test(text)) return true;
   return claimNeedsReply(claim);
 }
 
