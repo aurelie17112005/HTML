@@ -93,6 +93,12 @@ function computeDueAt(messages) {
 }
 function makeClaim(marketplace, o = {}) {
   const messages = normalizeClaimMessages(o.messages || []);
+  const messageTimes = messages.map(m => Number(m.at || 0)).filter(Number.isFinite).filter(Boolean);
+  const firstMessageAt = messageTimes.length ? Math.min(...messageTimes) : 0;
+  const lastMessageAt = messageTimes.length ? Math.max(...messageTimes) : 0;
+  const lastClientMessageAt = messages.filter(m => m.from === 'client').map(m => Number(m.at || 0)).filter(Number.isFinite).filter(Boolean).sort((a, b) => b - a)[0] || 0;
+  const claimCreatedAt = parseMarketplaceDate(scalarFirst(o.createdAt, o.claimCreatedAt, o.openedAt, o.created_at, o.dateCreated), firstMessageAt || o.updatedAt || Date.now());
+  const claimLastMessageAt = parseMarketplaceDate(scalarFirst(o.lastMessageAt, o.last_message_at, o.lastMessageDate, o.rawUpdatedAt), lastMessageAt || o.updatedAt || claimCreatedAt);
   const rawMarketplaceStatus = scalarFirst(
     o.marketplaceStatus,
     o.marketplaceStatusLabel,
@@ -119,12 +125,17 @@ function makeClaim(marketplace, o = {}) {
     subject: o.subject || 'Réclamation',
     orderId: o.orderId || '',
     product: o.product || '',
+    ean: firstOrderEan(o.ean, o.gtin, o.productEan, o.productEAN, o.product_ean, o.product_gtin, o.product_reference, o.productReference, o.barcode, o.gencod, o.ctx),
     priority: o.priority || 'moyenne',
     // Statut normalisé pour l'IHM + statut brut marketplace pour l'affichage fidèle.
     status: normalizedStatus,
     marketplaceStatus: rawMarketplaceStatus || normalizedStatus,
     statusRaw: rawMarketplaceStatus || normalizedStatus,
-    updatedAt: o.updatedAt || Date.now(),
+    updatedAt: o.updatedAt || claimLastMessageAt || Date.now(),
+    createdAt: claimCreatedAt,
+    claimCreatedAt,
+    lastMessageAt: claimLastMessageAt,
+    lastClientMessageAt: lastClientMessageAt || null,
     dueAt: o.dueAt || computeDueAt(messages),
     messages,
     tracking: normalizeTracking(o.tracking, o),
@@ -633,6 +644,55 @@ function isBadCustomerName(v) {
 function sanitizeCustomerName(v) {
   const s = cleanText(v);
   return isBadCustomerName(s) ? '' : s;
+}
+
+function looksLikeEan(v) {
+  const s = cleanText(v).replace(/\D/g, '');
+  return /^(?:\d{8}|\d{12,14})$/.test(s) ? s : '';
+}
+
+
+function collectDeepEans(obj, out = [], seen = new Set(), depth = 0) {
+  if (!obj || depth > 6) return out;
+  if (typeof obj === 'string' || typeof obj === 'number') {
+    const got = looksLikeEan(obj);
+    if (got) out.push(got);
+    return out;
+  }
+  if (typeof obj !== 'object') return out;
+  if (seen.has(obj)) return out;
+  seen.add(obj);
+  if (Array.isArray(obj)) {
+    for (const item of obj) collectDeepEans(item, out, seen, depth + 1);
+    return out;
+  }
+  const keyRx = /^(ean|gtin|gencod|barcode|bar_code|code_barre|product_?ean|product_?gtin|product_?barcode|product_?reference|productReference)$/i;
+  for (const [k, v] of Object.entries(obj)) {
+    if (keyRx.test(k)) {
+      const got = looksLikeEan(v);
+      if (got) out.push(got);
+    }
+  }
+  for (const [k, v] of Object.entries(obj)) {
+    if (/(product|produit|offer|article|item|line|ligne|order_line|orderLines|entities|entity)/i.test(k)) {
+      collectDeepEans(v, out, seen, depth + 1);
+    }
+  }
+  return out;
+}
+function firstOrderEan(...sources) {
+  for (const source of sources) {
+    const direct = looksLikeEan(source);
+    if (direct) return direct;
+    const found = collectDeepEans(source).find(Boolean);
+    if (found) return found;
+  }
+  return '';
+}
+
+function fullNameFromPieces(...parts) {
+  const out = parts.map(cleanText).filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+  return sanitizeCustomerName(out);
 }
 
 const ATTACHMENT_CONTAINER_KEYS = new Set([
@@ -1621,9 +1681,26 @@ const mirakl = {
 
   mapThread(provider, thread, ctx = {}) {
     const id = scalarFirst(thread.id, thread.thread_id, thread.threadId, thread.uuid, ctx.threadId);
-    const customer = scalarFirst(thread.from?.display_name, thread.from?.name, thread.customer?.name, thread.buyer?.name) || 'Client';
+    const customer = sanitizeCustomerName(scalarFirst(
+      fullNameFromPieces(thread.customer?.firstname, thread.customer?.lastname),
+      fullNameFromPieces(thread.customer?.first_name, thread.customer?.last_name),
+      fullNameFromPieces(thread.buyer?.firstname, thread.buyer?.lastname),
+      fullNameFromPieces(thread.buyer?.first_name, thread.buyer?.last_name),
+      thread.from?.display_name, thread.from?.name, thread.customer?.name, thread.customer?.display_name,
+      thread.customer_name, thread.buyer?.name, thread.buyer_name, ctx.customer
+    )) || 'Client';
+    const rawCreatedAt = thread.date_created || thread.created_at || thread.creation_date || thread.createdDate || null;
     const rawUpdatedAt = thread.date_updated || thread.updated_at || thread.last_message_date || thread.date_created || thread.created_at || null;
     const messages = this.extractMessages(thread).map(m => this.mapMessage(m, customer));
+    const lastMsgAt = messages.map(m => Number(m.at || 0)).filter(Boolean).sort((a, b) => b - a)[0] || parseMarketplaceDate(rawUpdatedAt, Date.now());
+    const productEntity = Array.isArray(thread.entities) ? thread.entities.find(e => /product|offer/i.test(e.type || e.entity_type || '')) : null;
+    const orderEntity = Array.isArray(thread.entities) ? thread.entities.find(e => /order/i.test(e.type || e.entity_type || '')) : null;
+    const eanFromThread = firstOrderEan(
+      productEntity, thread.product, thread.offer, thread.entities,
+      productEntity?.ean, productEntity?.gtin, productEntity?.barcode, productEntity?.product_ean, productEntity?.product_sku,
+      thread.ean, thread.gtin, thread.product?.ean, thread.product?.gtin, thread.offer?.ean, thread.offer?.gtin,
+      firstDeepValue(thread, /^(ean|gtin|barcode|product_?ean|product_?gtin)$/i)
+    );
     const lastClientText = [...messages].reverse().find(m => m.from === 'client')?.text || '';
     const rawStatus = scalarFirst(thread.status, thread.state, thread.thread_status, thread.closed === true ? 'CLOSED' : 'OPEN');
 
@@ -1644,16 +1721,21 @@ const mirakl = {
       id,
       customer,
       subject: normalizeSubject(subject, lastClientText),
-      orderId: scalarFirst(thread.entities?.find?.(e => /order/i.test(e.type || e.entity_type || ''))?.id, thread.order_id, thread.orderId, thread.order?.id, thread.entities?.[0]?.id),
-      product: scalarFirst(thread.entities?.find?.(e => /product|offer/i.test(e.type || e.entity_type || ''))?.label, thread.product_title, thread.product, thread.offer?.sku, thread.entities?.[0]?.label),
+      orderId: scalarFirst(orderEntity?.id, orderEntity?.order_id, thread.order_id, thread.orderId, thread.order?.id, thread.entities?.[0]?.id),
+      product: scalarFirst(productEntity?.label, productEntity?.name, thread.product_title, thread.product, thread.offer?.sku, thread.entities?.[0]?.label),
+      ean: eanFromThread,
       status: normalizeMarketplaceStatus(rawStatus, 'nouveau'),
       marketplaceStatus: rawStatus,
-      updatedAt: parseMarketplaceDate(rawUpdatedAt),
+      createdAt: parseMarketplaceDate(rawCreatedAt, messages.length ? Math.min(...messages.map(m => m.at || Date.now())) : Date.now()),
+      updatedAt: parseMarketplaceDate(rawUpdatedAt, lastMsgAt),
+      lastMessageAt: lastMsgAt,
       messages,
       tracking: normalizeTracking(thread.tracking || thread.shipment || thread.shipping || thread.delivery, thread),
       ctx: {
         threadId: id,
+        rawCreatedAt,
         rawUpdatedAt,
+        lastMessageAt: lastMsgAt,
         marketplaceStatus: rawStatus,
         rawStatus,
         closedByMarketplace: isClosedMarketplaceStatus(rawStatus),
@@ -1714,22 +1796,48 @@ const mirakl = {
   },
 
   mapOrderForNote(order) {
+    return this.mapOrderForClaim(order);
+  },
+
+  mapOrderForClaim(order = {}) {
     const orderId = scalarFirst(order.order_id, order.id, order.commercial_id, order.orderId);
-    const customer = scalarFirst(
-      order.customer?.firstname && order.customer?.lastname ? `${order.customer.firstname} ${order.customer.lastname}` : '',
-      order.customer?.name, order.customer_name, order.buyer?.name, order.customer?.email
-    );
+    const c = order.customer || {};
+    const b = order.buyer || {};
+    const ship = order.shipping_address || order.shippingAddress || order.customer_shipping_address || order.customerShippingAddress || {};
+    const bill = order.billing_address || order.billingAddress || {};
+    const customer = sanitizeCustomerName(scalarFirst(
+      fullNameFromPieces(c.firstname, c.lastname),
+      fullNameFromPieces(c.first_name, c.last_name),
+      fullNameFromPieces(c.firstName, c.lastName),
+      c.full_name, c.fullName, c.name, c.display_name,
+      fullNameFromPieces(b.firstname, b.lastname),
+      fullNameFromPieces(b.first_name, b.last_name),
+      b.full_name, b.fullName, b.name,
+      fullNameFromPieces(ship.firstname, ship.lastname),
+      fullNameFromPieces(ship.first_name, ship.last_name),
+      ship.full_name, ship.fullName, ship.name,
+      fullNameFromPieces(bill.firstname, bill.lastname),
+      fullNameFromPieces(bill.first_name, bill.last_name),
+      bill.full_name, bill.fullName, bill.name,
+      order.customer_name, order.customerName, order.buyer_name, order.buyerName
+    ));
     const lines = order.order_lines || order.lines || order.orderLines || [];
     const firstLine = Array.isArray(lines) ? (lines[0] || {}) : lines;
     const product = scalarFirst(
-      firstLine.product_title, firstLine.product?.title, firstLine.offer_sku, firstLine.offer_id,
-      firstLine.product?.sku, order.product_title
+      firstLine.product_title, firstLine.productTitle, firstLine.product?.title, firstLine.product?.name,
+      firstLine.offer_sku, firstLine.offer_id, firstLine.product?.sku, order.product_title
     );
-    const ean = scalarFirst(
-      firstLine.product_sku, firstLine.product?.sku, firstLine.product?.id, firstLine.offer_sku,
-      firstLine.product_id, firstLine.product_reference
+    const lineArray = Array.isArray(lines) ? lines : (lines ? [lines] : []);
+    const ean = firstOrderEan(
+      ...lineArray,
+      firstLine.ean, firstLine.gtin, firstLine.barcode, firstLine.product_ean, firstLine.product_gtin,
+      firstLine.product?.ean, firstLine.product?.gtin, firstLine.product?.barcode,
+      firstLine.product_sku, firstLine.product?.sku, firstLine.product_id, firstLine.product_reference,
+      firstDeepValue(firstLine, /^(ean|gtin|barcode|product_?ean|product_?gtin|product_?sku|product_?reference)$/i),
+      firstDeepValue(order, /^(ean|gtin|barcode|product_?ean|product_?gtin|product_?reference)$/i)
     );
-    return { orderId, customer, product, ean };
+    const createdAt = parseMarketplaceDate(scalarFirst(order.date_created, order.created_at, order.order_date, order.createdDate, order.created), 0);
+    return { orderId, customer, product, ean, orderCreatedAt: createdAt || null };
   },
 
   mapEvaluationToNote(provider, order, evaluationPayload) {
@@ -1830,8 +1938,13 @@ const mirakl = {
   },
 
   async enrichClaimsWithOrderTracking(provider, claims) {
+    // Cette étape enrichit aussi les réclamations Mirakl avec les informations commande
+    // (nom/prénom client, EAN, produit), pas seulement le suivi transporteur.
     if (String(process.env.MIRAKL_FETCH_ORDER_TRACKING || 'true') === 'false') return claims;
-    const targets = (claims || []).filter(c => c?.orderId && (!c.tracking || !c.tracking.carrier || c.tracking.carrier === 'transporteur'));
+    const targets = (claims || []).filter(c => c?.orderId && (
+      !sanitizeCustomerName(c.customer) || c.customer === 'Client' || !c.ean || !c.product ||
+      !c.tracking || !c.tracking.carrier || c.tracking.carrier === 'transporteur'
+    ));
     if (!targets.length) return claims;
 
     try {
@@ -1846,7 +1959,16 @@ const mirakl = {
       }
       for (const claim of targets) {
         const order = byId.get(String(claim.orderId));
-        const t = order ? normalizeOrderTracking(order) : null;
+        if (!order) continue;
+        const info = this.mapOrderForClaim(order);
+        if (info.customer && (!sanitizeCustomerName(claim.customer) || claim.customer === 'Client')) {
+          claim.customer = info.customer;
+          claim._ctx = { ...(claim._ctx || {}), customer: info.customer };
+        }
+        if (info.product && !claim.product) claim.product = info.product;
+        if (info.ean && !claim.ean) { claim.ean = info.ean; claim._ctx = { ...(claim._ctx || {}), ean: info.ean }; }
+        if (info.orderCreatedAt) claim.orderCreatedAt = info.orderCreatedAt;
+        const t = normalizeOrderTracking(order);
         if (t) claim.tracking = mergeTrackingInfo(claim.tracking, t);
       }
     } catch (e) {
@@ -2555,6 +2677,66 @@ ${inner}
       || bompFuzzyText(obj, ['orderdetailid', 'lineid'], ['orderid']);
   }
 
+
+  function extractBompEan(obj) {
+    // Fnac/Darty/BOMP peut placer l'EAN/Gencod dans les lignes commande,
+    // les détails produit, ou parfois dans offer_seller_id lorsque le vendeur
+    // utilise l'EAN comme SKU. On accepte uniquement une vraie valeur EAN
+    // 8/12/13/14 chiffres, jamais un ID Fnac, un order_id ou un SKU quelconque.
+    if (!obj || typeof obj !== 'object') return '';
+
+    const exactKeys = [
+      'ean', 'ean13', 'ean_13', 'gencod', 'gtin', 'barcode', 'bar_code', 'code_barre',
+      'product_ean', 'productEAN', 'product_gtin', 'productGtin', 'product_barcode',
+      'article_ean', 'item_ean', 'order_detail_ean', 'order_line_ean', 'line_ean',
+      'product_reference', 'productReference', 'product_ref', 'productRef'
+    ];
+
+    const directCandidates = [
+      obj.ean, obj.ean13, obj.ean_13, obj.gencod, obj.gtin, obj.barcode, obj.bar_code, obj.code_barre,
+      obj.product_ean, obj.productEAN, obj.product_gtin, obj.productGtin, obj.product_barcode,
+      obj.product?.ean, obj.product?.ean13, obj.product?.gtin, obj.product?.gencod, obj.product?.barcode,
+      obj.article?.ean, obj.item?.ean, obj.order_detail?.ean, obj.order_line?.ean
+    ];
+    for (const v of directCandidates) {
+      const got = looksLikeEan(v);
+      if (got) return got;
+    }
+
+    // Recherche profonde mais priorisée : d'abord les clés explicitement EAN/Gencod/GTIN.
+    for (const v of bompDeepValues(obj, exactKeys)) {
+      const got = looksLikeEan(v);
+      if (got) return got;
+    }
+
+    // Certains retours BOMP exposent les lignes dans order_detail/order_details/order_lines.
+    // On scanne ces blocs pour récupérer l'EAN sans dépendre du nom exact du champ.
+    const lineBlocks = [
+      ...oneOrMany(obj.order_detail), ...oneOrMany(obj.order_details?.order_detail),
+      ...oneOrMany(obj.order_line), ...oneOrMany(obj.order_lines?.order_line),
+      ...oneOrMany(obj.product), ...oneOrMany(obj.products?.product),
+      ...oneOrMany(obj.item), ...oneOrMany(obj.items?.item),
+      ...collectNodes(obj, ['order_detail', 'order_line', 'product', 'item', 'article'])
+    ];
+    for (const block of lineBlocks) {
+      const got = firstOrderEan(block);
+      if (got) return got;
+    }
+
+    // Dernier secours : certains vendeurs mettent l'EAN dans leur référence offre/SKU.
+    // On n'accepte que si la valeur contient un vrai EAN, sinon on ne renvoie rien.
+    const skuKeys = [
+      'offer_seller_id', 'offerSellerId', 'seller_sku', 'sellerSku', 'sku', 'reference',
+      'seller_reference', 'sellerReference', 'shop_reference', 'merchant_sku'
+    ];
+    for (const v of bompDeepValues(obj, skuKeys)) {
+      const got = looksLikeEan(v);
+      if (got) return got;
+    }
+
+    return '';
+  }
+
   function extractBompMessageId(obj) {
     return bompText(obj?.message_id, obj?.messageId, obj?.id, obj?.['@_id'], obj?.['@_message_id'])
       || bompDeepText(obj, ['message_id', 'messageId', 'last_message_id', 'thread_id', 'discussion_id', '@_message_id'])
@@ -2667,6 +2849,8 @@ ${inner}
     if (!base.orderId && detail.orderId) base.orderId = detail.orderId;
     if ((!base.customer || base.customer === 'Client') && detail.customer && detail.customer !== 'Client') base.customer = detail.customer;
     if (!base.product && detail.product) base.product = detail.product;
+    if (!base.ean && detail.ean) base.ean = detail.ean;
+    if (detail._ctx?.ean && !base._ctx?.ean) base._ctx = { ...(base._ctx || {}), ean: detail._ctx.ean };
     if (detail.tracking) base.tracking = mergeTrackingInfo(base.tracking, detail.tracking);
     if (isBadSubject(base.subject) && detail.subject && !isBadSubject(detail.subject)) base.subject = detail.subject;
     // Le statut marketplace le plus précis doit survivre aux fusions message/incident.
@@ -2752,8 +2936,11 @@ ${inner}
     if (!orderId) return null;
     const customerInfo = extractBompCustomerInfo(o);
     const product = bompDeepText(o, ['product_name', 'product_label', 'product_title', 'title', 'description'])
-      || bompDeepText(o, ['offer_seller_id', 'offer_fnac_id', 'seller_sku', 'sku', 'ean']);
-    const ean = bompDeepText(o, ['ean', 'product_ean', 'gtin', 'offer_seller_id', 'seller_sku', 'sku']);
+      || bompDeepText(o, ['offer_seller_id', 'offer_fnac_id', 'seller_sku', 'sku']);
+    const ean = extractBompEan(o);
+    if (String(process.env.BOMP_EAN_DEBUG || '') === '1') {
+      console.log(`[bomp/order] ean order=${orderId} ean=${ean || '-'} product=${cleanText(product) || '-'}`);
+    }
     return {
       orderId,
       customer: cleanText(customerInfo.customer),
@@ -2770,8 +2957,9 @@ ${inner}
     if ((!claim.customer || claim.customer === 'Client') && info.customer) claim.customer = info.customer;
     if (!claim.customerId && info.customerId) claim.customerId = info.customerId;
     if (!claim.product && info.product) claim.product = info.product;
+    if (!claim.ean && info.ean) claim.ean = info.ean;
     if (info.tracking) claim.tracking = mergeTrackingInfo(claim.tracking, info.tracking);
-    claim._ctx = { ...(claim._ctx || {}), orderId: claim.orderId };
+    claim._ctx = { ...(claim._ctx || {}), orderId: claim.orderId, ...(info.ean ? { ean: info.ean } : {}) };
     return claim;
   }
 
@@ -2944,8 +3132,9 @@ ${inner}
       subject,
       orderId,
       product: bompText(it['@_product'], it.product_name, it.product, it.offer_seller_id, it.offer_fnac_id) || bompDeepText(it, [
-        'product', 'product_name', 'product_label', 'product_title', 'title', 'offer_seller_id', 'offer_fnac_id', 'seller_sku', 'sku', 'ean'
+        'product', 'product_name', 'product_label', 'product_title', 'title', 'offer_seller_id', 'offer_fnac_id', 'seller_sku', 'sku'
       ]),
+      ean: extractBompEan(it),
       priority: 'haute',
       status: normalizeMarketplaceStatus(statusRaw, 'nouveau'),
       marketplaceStatus: statusRaw,
@@ -2958,6 +3147,7 @@ ${inner}
         incidentId,
         orderId,
         orderDetailId,
+        ...(extractBompEan(it) ? { ean: extractBompEan(it) } : {}),
         messageId: extractBompMessageId(it),
         rawType: bompText(it.type, it.incident_type, it.reason) || bompDeepText(it, ['type', 'incident_type', 'reason', 'motif']),
         openedAt,
@@ -3000,8 +3190,9 @@ ${inner}
       ), text),
       orderId,
       product: bompText(m.offer_seller_id, m.offer_fnac_id, m.product_name) || bompDeepText(m, [
-        'product', 'product_name', 'product_label', 'product_title', 'offer_seller_id', 'offer_fnac_id', 'seller_sku', 'sku', 'ean'
+        'product', 'product_name', 'product_label', 'product_title', 'offer_seller_id', 'offer_fnac_id', 'seller_sku', 'sku'
       ]),
+      ean: extractBompEan(m),
       priority: 'moyenne',
       status: normalizeMarketplaceStatus(scalarFirst(m.message_state, m.state), String(m.message_state || m.state || '').toLowerCase().includes('read') ? 'attente' : 'nouveau'),
       marketplaceStatus: scalarFirst(m.message_state, m.state),
@@ -3010,7 +3201,7 @@ ${inner}
         ? [{ from: author, at, text, attachments: normalizeInboundAttachments(m) }]
         : [],
       tracking: extractBompTracking(m, { providerCode: provider.code, orderId, messageId: id }),
-      ctx: { kind: 'message', messageId: id, orderId, marketplaceStatus: scalarFirst(m.message_state, m.state), rawStatus: scalarFirst(m.message_state, m.state), needsReply: author === 'client' },
+      ctx: { kind: 'message', messageId: id, orderId, ...(extractBompEan(m) ? { ean: extractBompEan(m) } : {}), marketplaceStatus: scalarFirst(m.message_state, m.state), rawStatus: scalarFirst(m.message_state, m.state), needsReply: author === 'client' },
     });
   }
 
@@ -3043,8 +3234,9 @@ ${inner}
       ), clientText),
       orderId,
       product: bompText(c.offer_seller_id, c.offer_fnac_id, c.product_name) || bompDeepText(c, [
-        'product', 'product_name', 'product_label', 'product_title', 'offer_seller_id', 'offer_fnac_id', 'seller_sku', 'sku', 'ean'
+        'product', 'product_name', 'product_label', 'product_title', 'offer_seller_id', 'offer_fnac_id', 'seller_sku', 'sku'
       ]),
+      ean: extractBompEan(c),
       priority: 'moyenne',
       status: sellerReply ? 'attente' : 'nouveau',
       updatedAt: at,
@@ -3054,6 +3246,7 @@ ${inner}
         kind: 'order_comment',
         commentId,
         orderId,
+        ...(extractBompEan(c) ? { ean: extractBompEan(c) } : {}),
         needsReply: Boolean(clientText && !sellerReply),
       },
     });
@@ -3076,9 +3269,9 @@ ${inner}
       bompDeepText(c, ['date', 'created_at', 'createdAt', 'updated_at', 'updatedAt', 'creation_date'])
     );
     const product = bompText(c.offer_seller_id, c.offer_fnac_id, c.product_name) || bompDeepText(c, [
-      'product', 'product_name', 'product_label', 'product_title', 'offer_seller_id', 'offer_fnac_id', 'seller_sku', 'sku', 'ean'
+      'product', 'product_name', 'product_label', 'product_title', 'offer_seller_id', 'offer_fnac_id', 'seller_sku', 'sku'
     ]);
-    const ean = bompDeepText(c, ['ean', 'product_ean', 'gtin', 'offer_seller_id', 'seller_sku', 'sku']);
+    const ean = extractBompEan(c);
 
     return makeProductNote(provider.code, {
       providerType: 'bomp',
@@ -3639,33 +3832,89 @@ ${inner}
       const token = await getToken(provider);
       const messageId = scalarFirst(ctx?.messageId, ctx?.id);
       const orderId = scalarFirst(ctx?.orderId, ctx?.order_fnac_id, ctx?.order);
+      const commentId = scalarFirst(ctx?.commentId, ctx?.clientOrderCommentId, ctx?.client_order_comment_id);
       const safeBody = String(body || '').trim().replace(/]]>/g, ']]]]><![CDATA[>');
       if (!safeBody) throw Object.assign(new Error('Message vide'), { statusCode: 400, provider: provider.code, operation: 'sendReply' });
 
-      // Chemin fiable : les messages Fnac/Darty se répondent via messages_update + message_id.
-      // Cf. fnapy : update_messages permet l'action reply avec description, subject et type.
+      const debugSend = String(process.env.BOMP_SEND_DEBUG || process.env.BOMP_DEBUG || '') === '1';
+      const errors = [];
+      const subject = firstReadableSubject(ctx?.messageSubject, ctx?.subject) || 'order_information';
+      const rawType = cleanText(ctx?.rawType || ctx?.type || '').toUpperCase();
+      const messageType = rawType === 'OFFER' ? 'OFFER' : 'ORDER';
+
+      const attempt = async (mode, operation, inner) => {
+        try {
+          const xml = authedRequest(provider, token, operation, inner);
+          if (debugSend) {
+            console.log(`[bomp/${provider.code}] send attempt=${mode} operation=${operation} messageId=${messageId || '-'} orderId=${orderId || '-'} commentId=${commentId || '-'}`);
+            console.log(maskBompSecrets(xml));
+          }
+          await postXml(provider, operation, xml);
+          return { ok: true, mode };
+        } catch (e) {
+          errors.push({ mode, operation, status: e.statusCode || e.status || 0, message: e.message });
+          if (debugSend) console.warn(`[bomp/${provider.code}] send failed ${mode}: ${e.message}`);
+          return { ok: false, error: e };
+        }
+      };
+
+      // Chemin officiel fnapy : update_messages(Message(action='reply', id=..., to='ALL')).
+      // Avant on forçait to=CLIENT : certains comptes Fnac/Darty le refusent en 400.
+      // On tente donc ALL d'abord, puis CLIENT en compatibilité.
       if (messageId) {
-        const xml = authedRequest(provider, token, 'messages_update',
+        const all = await attempt('messages_update:reply:ALL', 'messages_update',
+          `  <message action="reply" id="${xmlEscape(messageId)}" to="ALL">
+    <description><![CDATA[${safeBody}]]></description>
+    <subject>${xmlEscape(subject)}</subject>
+    <type>${xmlEscape(messageType)}</type>
+  </message>`);
+        if (all.ok) return { mode: all.mode };
+
+        const client = await attempt('messages_update:reply:CLIENT', 'messages_update',
           `  <message action="reply" id="${xmlEscape(messageId)}" to="CLIENT">
     <description><![CDATA[${safeBody}]]></description>
-    <subject>order_information</subject>
-    <type>ORDER</type>
+    <subject>${xmlEscape(subject)}</subject>
+    <type>${xmlEscape(messageType)}</type>
   </message>`);
-        await postXml(provider, 'messages_update', xml);
-        return { mode: 'messages_update' };
+        if (client.ok) return { mode: client.mode };
+
+        // Variante ultra stricte : sans destinataire explicite. Certains schémas historiques
+        // acceptent l'action reply mais refusent l'attribut to selon le canal du message.
+        const noTo = await attempt('messages_update:reply:no-to', 'messages_update',
+          `  <message action="reply" id="${xmlEscape(messageId)}">
+    <description><![CDATA[${safeBody}]]></description>
+    <subject>${xmlEscape(subject)}</subject>
+    <type>${xmlEscape(messageType)}</type>
+  </message>`);
+        if (noTo.ok) return { mode: noTo.mode };
       }
 
-      // Secours officiel BOMP : réponse à un commentaire client via l'id de commande FNAC/Darty.
+      // Secours officiel BOMP/fnapy : réponse à un commentaire client via l'id de commande FNAC/Darty.
+      // Même si messages_update a échoué, on tente ce chemin quand un n° commande existe.
       if (orderId) {
-        const xml = authedRequest(provider, token, 'client_order_comments_update',
+        const byOrder = await attempt('client_order_comments_update:order', 'client_order_comments_update',
           `  <comment id="${xmlEscape(orderId)}">
     <comment_reply><![CDATA[${safeBody}]]></comment_reply>
   </comment>`);
-        await postXml(provider, 'client_order_comments_update', xml);
-        return { mode: 'client_order_comments_update' };
+        if (byOrder.ok) return { mode: byOrder.mode };
       }
 
-      throw Object.assign(new Error('Réponse BOMP impossible : aucun message_id ni order_id exploitable pour cet incident'), { statusCode: 400, provider: provider.code, operation: 'sendReply' });
+      // Dernier secours : certains retours exposent un vrai client_order_comment_id.
+      if (commentId && commentId !== orderId) {
+        const byComment = await attempt('client_order_comments_update:comment', 'client_order_comments_update',
+          `  <comment id="${xmlEscape(commentId)}">
+    <comment_reply><![CDATA[${safeBody}]]></comment_reply>
+  </comment>`);
+        if (byComment.ok) return { mode: byComment.mode };
+      }
+
+      const summary = errors.map(e => `${e.mode}: ${e.message}`).join(' | ');
+      throw Object.assign(new Error(summary || 'Réponse BOMP impossible : aucun message_id ni order_id exploitable'), {
+        statusCode: errors.find(e => e.status >= 400 && e.status < 500)?.status || 400,
+        provider: provider.code,
+        operation: 'sendReply',
+        attempts: errors,
+      });
     },
   };
 })();

@@ -420,6 +420,11 @@
   .drawer-head h2{margin:0 0 7px;font-size:16px;padding-right:28px;font-weight:700;display:flex;align-items:center;gap:8px}
   .drawer-head .dmeta{font-size:12.5px;color:rgba(255,255,255,.8)}
   .drawer-head .dmeta b{color:var(--gold)}
+  .drawer-head .dmeta .meta-line{margin-top:3px}
+  .drawer-head .dmeta .meta-ean{font-size:13.5px;color:#fff}
+  .drawer-head .dmeta .missing-ean{color:rgba(255,255,255,.62);font-style:italic}
+  .td-head .meta .meta-line{margin-top:3px}
+  .td-head .meta .missing-ean{color:var(--muted);font-style:italic}
   .tags{display:flex;gap:7px;flex-wrap:wrap;margin-top:12px}
   .tags .st{background:rgba(255,255,255,.15)!important;color:#fff!important}
   .drawer-body{padding:20px 22px;overflow-y:auto;flex:1}
@@ -1226,25 +1231,108 @@ function trackingStatusInfo(t){
   return TSTATUS[key] || TSTATUS.inconnu;
 }
 
+
+function normalizeEanUi(v){
+  const digits = String(v ?? '').replace(/\D/g,'');
+  if(!/^(?:\d{8}|\d{12,14})$/.test(digits)) return '';
+  return digits;
+}
+function deepEanFromUi(obj, depth=0, seen=new Set()){
+  if(!obj || depth>5) return '';
+  if(typeof obj === 'string'){
+    const m = obj.match(/(?:EAN|GTIN|GENCOD|CODE\s*BARRE?S?)\D{0,25}((?:\d[\s.\-]?){8,14})/i);
+    return m ? normalizeEanUi(m[1]) : '';
+  }
+  if(typeof obj !== 'object') return '';
+  if(seen.has(obj)) return '';
+  seen.add(obj);
+  if(Array.isArray(obj)){
+    for(const item of obj){ const got=deepEanFromUi(item, depth+1, seen); if(got) return got; }
+    return '';
+  }
+  const keyRx = /^(?:ean|gtin|gencod|barcode|bar_code|code_barre|product_?ean|product_?gtin|product_?barcode|product_?reference|productReference)$/i;
+  for(const [k,v] of Object.entries(obj)){
+    if(keyRx.test(k)){
+      const direct = normalizeEanUi(v);
+      if(direct) return direct;
+    }
+  }
+  for(const [k,v] of Object.entries(obj)){
+    // On descend dans les zones produit/ligne/commande/contexte, mais on évite de confondre un ID client/commande avec un EAN.
+    if(/(?:product|produit|offer|article|item|line|ligne|order_line|orderLines|ctx|context|_ctx|entities|entity)/i.test(k)){
+      const got=deepEanFromUi(v, depth+1, seen);
+      if(got) return got;
+    }
+  }
+  return '';
+}
+function claimEan(c){
+  if(!c) return '';
+  const ctx=c._ctx || c.ctx || {};
+  const direct=[
+    c.ean,c.gtin,c.productEan,c.productEAN,c.product_ean,c.product_gtin,c.product_reference,c.productReference,c.barcode,c.gencod,
+    ctx.ean,ctx.gtin,ctx.productEan,ctx.productEAN,ctx.product_ean,ctx.product_gtin,ctx.product_reference,ctx.productReference,ctx.barcode,ctx.gencod
+  ].map(normalizeEanUi).find(Boolean);
+  if(direct) return direct;
+  const deep=deepEanFromUi(c);
+  if(deep) return deep;
+  const msgs=Array.isArray(c.messages)?c.messages:[];
+  for(const m of msgs){ const got=deepEanFromUi(String(m.text||'')); if(got) return got; }
+  return '';
+}
+function claimHeaderMetaHtml(c, opts={}){
+  const dark = opts.dark !== false;
+  const ean = claimEan(c);
+  const eanHtml = ean
+    ? `<span class="ordref ${dark?'on-dark':''}" data-lbl="Code EAN">${esc(ean)}</span>`
+    : `<span class="missing-ean">non disponible</span>`;
+  return `<div class="meta-line meta-ean"><b>EAN :</b> ${eanHtml}</div>`
+    + `<div class="meta-line">Client : ${esc(c.customer || 'Client')}</div>`
+    + (c.product ? `<div class="meta-line">Produit : ${esc(c.product)}</div>` : '');
+}
+
+function tsSafe(v, fallback=Date.now()){
+  if(v===undefined || v===null || v==='') return fallback;
+  if(typeof v==='number' || /^\d+$/.test(String(v))){
+    const n=Number(v);
+    if(!Number.isFinite(n)) return fallback;
+    return String(Math.abs(n)).length>=13 ? n : n*1000;
+  }
+  const t=new Date(v).getTime();
+  return Number.isFinite(t) ? t : fallback;
+}
+
 function normalizeClaim(c){
   const ctx = c._ctx || c.ctx || {};
   const messages = Array.isArray(c.messages) ? c.messages.map(normalizeDisplayMessage) : [];
+  const msgTimes = messages.map(m=>Number(m.at||0)).filter(Boolean);
+  const firstMsgAt = msgTimes.length ? Math.min(...msgTimes) : 0;
+  const lastMsgAt = msgTimes.length ? Math.max(...msgTimes) : 0;
+  const clientTimes = messages.filter(m=>m.from==='client').map(m=>Number(m.at||0)).filter(Boolean);
+  const lastClientMsgAt = clientTimes.length ? Math.max(...clientTimes) : 0;
   const subjectSource = c.subject || ctx.subject || c.messageSubject || c.message_subject || c.reason || c.reason_label || c.motif || c.type || c.incident_type || "";
+  const created = tsSafe(c.createdAt || c.claimCreatedAt || c.openedAt || c.created_at || ctx.createdAt || ctx.rawCreatedAt, firstMsgAt || c.updatedAt || Date.now());
+  const lastMessage = tsSafe(c.lastMessageAt || c.last_message_at || c.lastMessageDate || ctx.lastMessageAt || ctx.rawLastMessageAt || c.updatedAt, lastMsgAt || c.updatedAt || created);
+  const lastClientMessage = tsSafe(c.lastClientMessageAt || c.last_client_message_at || ctx.lastClientMessageAt, lastClientMsgAt || lastMessage || created);
   return {
     id: c.id || `${c.marketplace || "unknown"}-${Math.random().toString(36).slice(2)}`,
     marketplace: c.marketplace || "unknown",
-    customer: sanitizeDisplayCustomer(c.customer || (c._ctx&&c._ctx.customer) || (c.ctx&&c.ctx.customer)) || "Client",
+    customer: sanitizeDisplayCustomer(c.customer || ctx.customer || c.customerName || c.buyerName || c.buyer_name) || "Client",
     customerId: c.customerId || c.clientId || c.customer_id || "",
     subject: normalizeDisplaySubject(subjectSource, messages),
     orderId: c.orderId || "",
     product: c.product || "",
-    ean: c.ean || "",
+    ean: claimEan(c),
     priority: c.priority || "moyenne",
     status: c.status || "nouveau",
     marketplaceStatus: c.marketplaceStatus || c.statusRaw || c.marketplace_status || c.rawStatus || "",
     statusRaw: c.statusRaw || c.rawStatus || c.marketplaceStatus || "",
-    updatedAt: c.updatedAt || Date.now(),
-    dueAt: c.dueAt || Date.now() + 24 * 3600 * 1000,
+    updatedAt: tsSafe(c.updatedAt, lastMessage || Date.now()),
+    createdAt: created,
+    claimCreatedAt: created,
+    lastMessageAt: lastMessage,
+    lastClientMessageAt: lastClientMessage,
+    dueAt: tsSafe(c.dueAt, Date.now() + 24 * 3600 * 1000),
     messages,
     tracking: normalizeDisplayTracking(c.tracking || {
       number: c.trackingNumber || c.tracking_number || c.trackingCode || c.tracking_code || c.parcelNumber || c.parcel_number || c.shipmentNumber || c.shipment_number || c.awb || c.waybill,
@@ -1258,9 +1346,7 @@ function normalizeClaim(c){
 }
 
 function customerHtml(c){
-  const id = c.customerId && !String(c.customer || "").includes(String(c.customerId)) ? String(c.customerId) : "";
-  const idLine = id ? `<div class="meta">N° client <span class="ordref" data-lbl="N° client">${esc(id)}</span></div>` : "";
-  return `<div class="cust">${esc(c.customer || "Client")}</div>${idLine}`;
+  return `<div class="cust">${esc(c.customer || "Client")}</div>`;
 }
 
 function normalizeNote(n){
@@ -2157,8 +2243,8 @@ function renderTreatDetail(c){
     return `<div class="bubble ${m.from}"><div class="who">${m.from==="client"?esc(c.customer||"Client"):("2KINGS — "+esc(m.author||"Agent"))}</div><div class="msg-text">${messageHtml(m.text)}</div>${att}<div class="t">il y a ${fmtAgo(m.at)}</div></div>`;}).join("");
   box.innerHTML=`
     <div class="td-head">
-      <h3><span class="subj-mp">${mpMarkLink(c.marketplace,c.orderId)}</span> ${esc(c.subject)} <span class="subj-ord ordref" data-lbl="N° de commande">${c.orderId}</span> <span class="subj-date" title="Date de commande">📅 ${fmtDate(createdAt(c))}</span></h3>
-      <div class="meta">${esc(c.customer)} · ${esc(c.product)}${c.ean?` <span class="ordref" data-lbl="Code EAN">${c.ean}</span>`:""}</div>
+      <h3><span class="subj-mp">${mpMarkLink(c.marketplace,c.orderId)}</span> ${esc(c.subject)} <span class="subj-ord ordref" data-lbl="N° de commande">${c.orderId}</span> ${claimDatesHtml(c)}</h3>
+      <div class="meta">${claimHeaderMetaHtml(c,{dark:false})}</div>
       <div class="tags">${statusBadge(c)} ${niveauSelector(c)}${euroFields(c)}</div>
       ${trackHeader(c)}
     </div>
@@ -2320,8 +2406,8 @@ function renderClaudeDetail(c){
     return `<div class="bubble ${m.from}"><div class="who">${m.from==="client"?esc(c.customer||"Client"):("2KINGS — "+esc(m.author||"Agent"))}</div><div class="msg-text">${messageHtml(m.text)}</div>${att}<div class="t">il y a ${fmtAgo(m.at)}</div></div>`;}).join("");
   box.innerHTML=`
     <div class="td-head">
-      <h3><span class="subj-mp">${mpMarkLink(c.marketplace,c.orderId)}</span> ${esc(c.subject)} <span class="subj-ord ordref" data-lbl="N° de commande">${c.orderId}</span> <span class="subj-date" title="Date de commande">📅 ${fmtDate(createdAt(c))}</span></h3>
-      <div class="meta">${esc(c.customer)} · ${esc(c.product)}${c.ean?` <span class="ordref" data-lbl="Code EAN">${c.ean}</span>`:""}</div>
+      <h3><span class="subj-mp">${mpMarkLink(c.marketplace,c.orderId)}</span> ${esc(c.subject)} <span class="subj-ord ordref" data-lbl="N° de commande">${c.orderId}</span> ${claimDatesHtml(c)}</h3>
+      <div class="meta">${claimHeaderMetaHtml(c,{dark:false})}</div>
       <div class="tags">${statusBadge(c)} ${niveauSelector(c)} <span class="cstate cs-${cs}">${CSTATE_LABEL[cs]}</span>${euroFields(c)}</div>
       ${trackHeader(c)}
     </div>
@@ -2718,7 +2804,16 @@ function updateTreatCount(){
 }
 
 /* Date de création d'une réclamation = 1er message (sinon dernière MàJ) */
-function createdAt(c){ return (c.messages&&c.messages.length) ? Math.min(...c.messages.map(m=>m.at)) : c.updatedAt; }
+function createdAt(c){
+  if(c && c.createdAt) return c.createdAt;
+  return (c.messages&&c.messages.length) ? Math.min(...c.messages.map(m=>m.at)) : c.updatedAt;
+}
+function lastOpenedMessageAt(c){
+  return (c && (c.lastClientMessageAt || c.lastMessageAt || c.updatedAt || createdAt(c))) || Date.now();
+}
+function claimDatesHtml(c){
+  return `<span class="subj-date" title="Date de réclamation">🕘 Réclamation ${fmtDate(createdAt(c))}</span> <span class="subj-date" title="Date d'ouverture du dernier message client">💬 Dernier message ${fmtDate(lastOpenedMessageAt(c))}</span>`;
+}
 function countBetween(a,b){ return claims.filter(c=>{const t=createdAt(c); return t>=a && t<b;}).length; }
 function renderEvo(){
   const DAY=24*H;
@@ -2842,7 +2937,7 @@ function renderTable(){
     return `<tr data-id="${c.id}" class="${c.id===selectedId?'sel':''}">
       <td class="th-num meta">${startIdx+i+1}</td>
       <td>${mpBadgeLink(c.marketplace,c.orderId)}</td>
-      <td><span class="ordref" data-lbl="N° de commande">${c.orderId}</span><div class="meta dt">${fmtDate(createdAt(c))}</div></td>
+      <td><span class="ordref" data-lbl="N° de commande">${c.orderId}</span><div class="meta dt">Récl. ${fmtDate(createdAt(c))}</div><div class="meta dt">Dern. ${fmtDate(lastOpenedMessageAt(c))}</div></td>
       <td class="col-c">${c.tracking?carrierMark(c.tracking.carrier):'<span class="meta">—</span>'}</td>
       <td class="col-c">${trackBar(c.tracking)}</td>
       <td>${customerHtml(c)}<div class="meta">${esc(c.product||"")}${c.ean?` <span class="ordref" data-lbl="Code EAN">${esc(c.ean)}</span>`:""}</div></td>
@@ -2876,11 +2971,9 @@ async function openDrawer(id, skipRemoteDetail=false){
   let c=claims.find(x=>x.id===id); if(!c)return;
   selectedId=id; renderTable();
   const mp=mpOf(c.marketplace),st=STATUS[businessStatus(c)],pr=PRIO[c.priority],sla=slaInfo(c);
-  $("#dSubject").innerHTML='<span class="subj-mp">'+mpMarkLink(c.marketplace,c.orderId)+'</span> '+esc(c.subject)+' <span class="subj-ord ordref" data-lbl="N° de commande">'+esc(c.orderId)+'</span> <span class="subj-date" title="Date de commande">📅 '+fmtDate(createdAt(c))+'</span>';
+  $("#dSubject").innerHTML='<span class="subj-mp">'+mpMarkLink(c.marketplace,c.orderId)+'</span> '+esc(c.subject)+' <span class="subj-ord ordref" data-lbl="N° de commande">'+esc(c.orderId)+'</span> '+claimDatesHtml(c);
   $("#dSubject").querySelectorAll(".ordref").forEach(el=>el.onclick=e=>copyCode(e,el,el.dataset.lbl||"Valeur"));
-  const customerIdMeta = c.customerId && !String(c.customer || "").includes(String(c.customerId))
-    ? ` <span class="ordref on-dark" data-lbl="N° client">Client ${esc(c.customerId)}</span>` : "";
-  $("#dMeta").innerHTML=`${esc(c.customer || "Client")}${customerIdMeta} · ${esc(c.product||"")}${c.ean?` <span class="ordref on-dark" data-lbl="Code EAN">${esc(c.ean)}</span>`:""}`;
+  $("#dMeta").innerHTML=claimHeaderMetaHtml(c,{dark:true});
   $("#dMeta").querySelectorAll(".ordref").forEach(el=>el.onclick=e=>copyCode(e,el,el.dataset.lbl||"Valeur"));
   $("#dTags").innerHTML=`${statusBadge(c)} ${niveauSelector(c)}${euroFields(c)}`;
   bindNiveau($("#dTags")); bindEuroFields($("#dTags"));
