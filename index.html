@@ -549,9 +549,60 @@
   .toast.err{background:var(--red)}
   .empty{padding:48px;text-align:center;color:var(--muted-2)}
   @media(max-width:1100px){.kpis{grid-template-columns:repeat(2,1fr)}.charts{grid-template-columns:1fr}}
+
+  /* ===== Authentification ===== */
+  body.auth-locked{overflow:hidden}
+  body.auth-locked>header,body.auth-locked>.wrap{filter:blur(3px);pointer-events:none;user-select:none}
+  .auth-gate{position:fixed;inset:0;z-index:1000;background:rgba(8,24,44,.76);backdrop-filter:blur(8px);display:flex;align-items:center;justify-content:center;padding:24px}
+  .auth-gate.hidden{display:none}
+  .auth-card{width:min(430px,100%);background:#fff;border-radius:20px;box-shadow:0 28px 80px rgba(0,0,0,.32);padding:30px;border:1px solid rgba(255,255,255,.55)}
+  .auth-logo{font-size:14px;font-weight:900;letter-spacing:.7px;color:var(--navy);margin-bottom:18px}
+  .auth-card h1{font-size:24px;color:var(--navy);margin:0 0 8px}
+  .auth-card p{font-size:13px;color:var(--muted);line-height:1.55;margin:0 0 20px}
+  .auth-field{display:flex;flex-direction:column;gap:7px;margin:13px 0}
+  .auth-field label{font-size:11px;text-transform:uppercase;letter-spacing:.45px;color:var(--muted-2);font-weight:800}
+  .auth-field select,.auth-field input{width:100%;border:1px solid var(--line);border-radius:11px;padding:12px 13px;font:inherit;color:var(--navy);background:#fff;outline:none}
+  .auth-field select:focus,.auth-field input:focus{border-color:var(--navy);box-shadow:0 0 0 3px var(--navy-50)}
+  .auth-submit{width:100%;border:0;border-radius:11px;padding:13px 16px;background:var(--navy);color:#fff;font-weight:800;cursor:pointer;margin-top:8px}
+  .auth-submit:disabled{opacity:.65;cursor:wait}
+  .auth-error{min-height:20px;color:var(--red);font-size:12px;margin-top:10px;font-weight:650}
+  .auth-note{font-size:11px!important;background:var(--navy-50);border-radius:9px;padding:10px 12px;margin-top:15px!important}
+  .session-user{display:inline-flex;align-items:center;gap:7px;background:var(--surface);border:1px solid var(--line);border-radius:9px;padding:7px 10px;color:var(--navy);font-weight:800;font-size:13px}
+  .session-user .dot{width:8px;height:8px;border-radius:50%;background:var(--green)}
+  .logout-btn{border:1px solid var(--line);background:var(--surface);color:var(--muted);border-radius:9px;padding:7px 10px;cursor:pointer;font-weight:700}
+  .logout-btn:hover{color:var(--red);border-color:#f3b8bc}
+  .ai-tools{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:9px}
+  .ai-meta{background:#f7f8fc;border:1px solid var(--line);border-radius:10px;padding:9px 11px;font-size:12px;color:var(--muted);line-height:1.45;margin-bottom:9px}
+  .ai-meta.warn{background:#fff7e8;border-color:#f0d59c;color:#7b570d}
+  .ai-secondary{border:1px solid var(--line);background:#fff;color:var(--navy);border-radius:8px;padding:7px 10px;font-weight:700;cursor:pointer}
+  .ai-secondary.danger{color:var(--red)}
+
 </style>
 </head>
-<body>
+<body class="auth-locked">
+
+<div class="auth-gate" id="authGate" role="dialog" aria-modal="true" aria-labelledby="authTitle">
+  <form class="auth-card" id="loginForm">
+    <div class="auth-logo">2KINGS · SAV CENTRALISÉ</div>
+    <h1 id="authTitle">Connexion</h1>
+    <p>Guillaume et Sandy sont les comptes humains. Claude est un assistant local alimenté par Ollama : il prépare des brouillons, mais ne peut ni se connecter ni envoyer un message seul.</p>
+    <div class="auth-field">
+      <label for="loginUser">Utilisateur</label>
+      <select id="loginUser" autocomplete="username">
+        <option value="guillaume">Guillaume — administrateur</option>
+        <option value="sandy">Sandy — agent SAV</option>
+      </select>
+    </div>
+    <div class="auth-field">
+      <label for="loginPassword">Mot de passe</label>
+      <input id="loginPassword" type="password" autocomplete="current-password" required>
+    </div>
+    <button class="auth-submit" id="loginBtn" type="submit">Se connecter</button>
+    <div class="auth-error" id="loginError" aria-live="polite"></div>
+    <p class="auth-note">Les brouillons IA doivent être relus puis validés par l’utilisateur connecté avant tout envoi vers une marketplace.</p>
+  </form>
+</div>
+
 <header class="topbar">
   <div class="topbar-inner">
     <!-- ===== LOGO 2KINGS (SVG recréé). Pour utiliser votre fichier :
@@ -565,7 +616,8 @@
     <div class="daily-quote" id="dailyQuote"></div>
     <div class="user-box">
       <span class="user-lbl">Connecté en tant que</span>
-      <select id="userSelect"></select>
+      <span class="session-user"><span class="dot"></span><span id="sessionUserName">—</span></span>
+      <button class="logout-btn" id="logoutBtn" type="button">Déconnexion</button>
     </div>
     <span id="modeBadge" class="mode-badge">● Mode démo</span>
   </div>
@@ -991,6 +1043,96 @@ const CONFIG = {
   SLA_LATE: 0, SLA_SOON: 8,
 };
 
+/* =====================================================================
+   AUTHENTIFICATION — session HTTP-only + protection CSRF
+   =====================================================================*/
+const AUTH_STATE={user:null,csrfToken:"",systemUsers:[]};
+let appInitialized=false;
+
+function authBaseUrl(){
+  const api=new URL(CONFIG.API_BASE,window.location.href);
+  return api.origin+"/api/auth";
+}
+function showLogin(message=""){
+  document.body.classList.add("auth-locked");
+  const gate=document.getElementById("authGate");
+  if(gate) gate.classList.remove("hidden");
+  const err=document.getElementById("loginError");
+  if(err) err.textContent=message;
+}
+function enterAuthenticatedApp(payload){
+  AUTH_STATE.user=payload.user;
+  AUTH_STATE.csrfToken=payload.csrfToken||"";
+  AUTH_STATE.systemUsers=payload.systemUsers||[];
+  currentUser=payload.user?.displayName||"Agent";
+  const name=document.getElementById("sessionUserName");
+  if(name) name.textContent=currentUser+(payload.user?.role==="admin"?" · admin":"");
+  document.body.classList.remove("auth-locked");
+  document.getElementById("authGate")?.classList.add("hidden");
+  if(!appInitialized){appInitialized=true;init();}
+}
+async function apiFetch(url,options={}){
+  const opts={...options,credentials:"include"};
+  const headers=new Headers(options.headers||{});
+  const method=String(opts.method||"GET").toUpperCase();
+  if(!["GET","HEAD","OPTIONS"].includes(method)&&AUTH_STATE.csrfToken){
+    headers.set("X-CSRF-Token",AUTH_STATE.csrfToken);
+  }
+  opts.headers=headers;
+  const response=await window.fetch(url,opts);
+  if(response.status===401&&!String(url).includes("/api/auth/")){
+    AUTH_STATE.user=null;AUTH_STATE.csrfToken="";
+    showLogin("Votre session a expiré. Reconnectez-vous.");
+  }
+  return response;
+}
+const AuthAPI={
+  async me(){
+    const r=await window.fetch(authBaseUrl()+"/me",{credentials:"include",headers:{Accept:"application/json"}});
+    if(r.status===401)return null;
+    if(!r.ok)throw new Error("Vérification de session impossible ("+r.status+")");
+    return r.json();
+  },
+  async login(userId,password){
+    const r=await window.fetch(authBaseUrl()+"/login",{
+      method:"POST",credentials:"include",headers:{"Content-Type":"application/json","Accept":"application/json"},
+      body:JSON.stringify({userId,password})
+    });
+    if(!r.ok)throw new Error(await readApiError(r,"Connexion impossible"));
+    return r.json();
+  },
+  async logout(){
+    const r=await apiFetch(authBaseUrl()+"/logout",{method:"POST",headers:{Accept:"application/json"}});
+    if(!r.ok)throw new Error(await readApiError(r,"Déconnexion impossible"));
+    return r.json();
+  }
+};
+function bindAuthUi(){
+  const form=document.getElementById("loginForm");
+  form?.addEventListener("submit",async event=>{
+    event.preventDefault();
+    const btn=document.getElementById("loginBtn"),err=document.getElementById("loginError");
+    btn.disabled=true;btn.textContent="Connexion…";err.textContent="";
+    try{
+      const payload=await AuthAPI.login(document.getElementById("loginUser").value,document.getElementById("loginPassword").value);
+      enterAuthenticatedApp(payload);
+      document.getElementById("loginPassword").value="";
+    }catch(error){err.textContent=error.message;}
+    finally{btn.disabled=false;btn.textContent="Se connecter";}
+  });
+  document.getElementById("logoutBtn")?.addEventListener("click",async()=>{
+    try{await AuthAPI.logout();}catch(error){console.warn(error);}
+    window.location.reload();
+  });
+}
+async function bootstrapAuth(){
+  bindAuthUi();
+  try{
+    const payload=await AuthAPI.me();
+    if(payload?.authenticated) enterAuthenticatedApp(payload);
+    else showLogin();
+  }catch(error){showLogin(error.message);}
+}
 
 function decodeHtmlEntitiesText(v){
   let s=String(v ?? "");
@@ -1544,7 +1686,7 @@ const DataAPI = {
   if(options.providers) params.set('providers', options.providers);
   if(options.enrichDetails) params.set('enrichDetails','1');
 
-  const r = await fetch(`${CONFIG.API_BASE}/threads?${params.toString()}`, {
+  const r = await apiFetch(`${CONFIG.API_BASE}/threads?${params.toString()}`, {
     headers:{'Accept':'application/json'}
   });
 
@@ -1571,7 +1713,7 @@ const DataAPI = {
   if(options.all) params.set('all','1');
   if(options.days!=null) params.set('days', String(options.days));
 
-  const r = await fetch(`${CONFIG.API_BASE}/threads?${params.toString()}`, {
+  const r = await apiFetch(`${CONFIG.API_BASE}/threads?${params.toString()}`, {
     headers:{'Accept':'application/json'}
   });
 
@@ -1597,10 +1739,12 @@ const DataAPI = {
   // Si le cache est frais (HIT), on s'arrête là. S'il est périmé (STALE),
   // on l'affiche immédiatement puis le flux ci-dessous déclenchera au maximum
   // un seul refresh serveur partagé entre tous les utilisateurs.
+  let initialRows = [];
   if(!options.refresh){
     try{
       const cached = await this.fetchClaimsCacheOnly(options);
       if(cached && cached.data && cached.data.length){
+        initialRows = cached.data.slice();
         onProvider(cached.data, {
           provider:{code:'threads-cache',label:'Cache réclamations',type:'cache'},
           completed:1,total:1,cache:cached.cache,ageMs:cached.ageMs,cachePreview:true
@@ -1632,13 +1776,14 @@ const DataAPI = {
   if(options.days!=null) params.set('days', String(options.days));
 
   const url = `${CONFIG.API_BASE}/threads-stream?${params.toString()}`;
-  const all = [];
-  const seen = new Set();
+  // Conserver le snapshot cache pendant le refresh évite le flash d'un tableau vide.
+  const all = initialRows.map(normalizeClaim);
+  const seen = new Set(all.map(c=>c.id));
 
   return await new Promise((resolve, reject)=>{
     let settled = false;
     let gotAnyEvent = false;
-    const es = new EventSource(url);
+    const es = new EventSource(url,{withCredentials:true});
 
     function finish(value){
       if(settled) return;
@@ -1696,7 +1841,16 @@ const DataAPI = {
 
     es.addEventListener('done', ev=>{
       gotAnyEvent = true;
-      try{ onProvider([], JSON.parse(ev.data||'{}'), all.slice()); }catch(_){ }
+      try{
+        const payload = JSON.parse(ev.data||'{}');
+        if(Array.isArray(payload.rows)){
+          all.splice(0, all.length, ...payload.rows.map(normalizeClaim));
+          seen.clear();
+          all.forEach(c=>seen.add(c.id));
+          all.sort((a,b)=>Number(b.updatedAt||0)-Number(a.updatedAt||0));
+        }
+        onProvider([], payload, all.slice());
+      }catch(_){ }
       finish(all.slice());
     });
 
@@ -1737,7 +1891,7 @@ const DataAPI = {
   if(options.recentOnly !== undefined) params.set('recentOnly', options.recentOnly ? '1' : '0');
   if(options.recentDays) params.set('recentDays', String(options.recentDays));
   if(options.since) params.set('since', String(options.since));
-  const r = await fetch(`${CONFIG.API_BASE}/notes?${params.toString()}`, {
+  const r = await apiFetch(`${CONFIG.API_BASE}/notes?${params.toString()}`, {
     headers:{'Accept':'application/json'}
   });
   if(!r.ok){
@@ -1754,23 +1908,50 @@ const DataAPI = {
       await new Promise(r=>setTimeout(r,250));
       return claims.find(c=>c.id===id) || null;
     }
-    const r = await fetch(`${CONFIG.API_BASE}/threads/${encodeURIComponent(id)}`, {
+    const r = await apiFetch(`${CONFIG.API_BASE}/threads/${encodeURIComponent(id)}`, {
       headers:{'Accept':'application/json'}
     });
     if(!r.ok) throw new Error("Erreur détail "+r.status);
     return normalizeClaim(await r.json());
   },
-  async sendReply(id,message,status,files){
+  async fetchAiDraft(claimId){
+    if(CONFIG.USE_DEMO_DATA) return null;
+    const r=await apiFetch(`${CONFIG.API_BASE}/ai/drafts?claimId=${encodeURIComponent(claimId)}`,{headers:{Accept:'application/json'}});
+    if(!r.ok) throw new Error(await readApiError(r,"Brouillon IA indisponible"));
+    const data=await r.json();
+    return data.draft||null;
+  },
+  async generateAiDraft(claimId,instructions=""){
+    if(CONFIG.USE_DEMO_DATA){await new Promise(r=>setTimeout(r,500));return null;}
+    const r=await apiFetch(`${CONFIG.API_BASE}/ai/drafts`,{
+      method:'POST',headers:{'Content-Type':'application/json','Accept':'application/json'},
+      body:JSON.stringify({claimId,instructions})
+    });
+    if(!r.ok) throw new Error(await readApiError(r,"Génération du brouillon impossible"));
+    const data=await r.json();
+    return data.draft||null;
+  },
+  async reviewAiDraft(draftId,action,text=""){
+    const r=await apiFetch(`${CONFIG.API_BASE}/ai/drafts/${encodeURIComponent(draftId)}`,{
+      method:'PATCH',headers:{'Content-Type':'application/json','Accept':'application/json'},
+      body:JSON.stringify({action,text})
+    });
+    if(!r.ok) throw new Error(await readApiError(r,"Validation du brouillon impossible"));
+    const data=await r.json();
+    return data.draft||null;
+  },
+  async sendReply(id,message,status,files,meta={}){
     if(CONFIG.USE_DEMO_DATA){ await new Promise(r=>setTimeout(r,400)); return {ok:true}; }
     let opts;
     if(files&&files.length){            // envoi multipart si pièces jointes
       const fd=new FormData(); fd.append("body",message); fd.append("status",status);
+      if(meta.aiDraftId) fd.append("aiDraftId",meta.aiDraftId);
       files.forEach(f=>fd.append("attachments",f,f.name));
       opts={method:'POST',body:fd};     // ne pas fixer Content-Type : le navigateur gère la frontière
     } else {
-      opts={method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({body:message,status})};
+      opts={method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({body:message,status,aiDraftId:meta.aiDraftId||""})};
     }
-    const r = await fetch(`${CONFIG.API_BASE}/threads/${encodeURIComponent(id)}/message`,opts);
+    const r = await apiFetch(`${CONFIG.API_BASE}/threads/${encodeURIComponent(id)}/message`,opts);
     if(!r.ok){
       let msg = "Échec de l'envoi ("+r.status+")";
       try{ msg = await readApiError(r,msg); }catch(e){}
@@ -1782,7 +1963,7 @@ const DataAPI = {
      En démo, on renvoie le suivi déjà présent sur la réclamation. */
   async fetchTracking(carrier,number){
     if(CONFIG.USE_DEMO_DATA){ await new Promise(r=>setTimeout(r,500)); return null; }
-    const r = await fetch(`${CONFIG.API_BASE}/tracking?carrier=${encodeURIComponent(carrier)}&number=${encodeURIComponent(number)}`,
+    const r = await apiFetch(`${CONFIG.API_BASE}/tracking?carrier=${encodeURIComponent(carrier)}&number=${encodeURIComponent(number)}`,
       {headers:{'Accept':'application/json'}});
     if(!r.ok) throw new Error("Suivi indisponible ("+r.status+")");
     return await r.json();   // { status, etaH|eta, events:[{h|at,label}] }
@@ -1797,7 +1978,10 @@ const DataAPI = {
       refreshCooldownMs: String(options.refreshCooldownMs || 60000),
       providerTimeoutMs: String(options.providerTimeoutMs || 60000),
       concurrency: String(options.concurrency || 2),
-      enrichDetails: options.enrichDetails ? '1' : '0'
+      enrichDetails: options.enrichDetails ? '1' : '0',
+      // L'onglet incidents est chargé à la demande : s'il est périmé, on préfère
+      // attendre le résultat frais plutôt qu'un refresh invisible en arrière-plan.
+      stale: options.stale === true ? '1' : '0'
     });
     if(options.refresh) params.set('refresh','1');
     if(options.providers) params.set('providers', options.providers);
@@ -1808,7 +1992,7 @@ const DataAPI = {
     else params.set('all','1');
     if(options.includeThreadFallback === false) params.set('includeThreadFallback','0');
     if(options.days!=null) params.set('days', String(options.days));
-    const r = await fetch(`${CONFIG.API_BASE}/incidents?${params.toString()}`, {headers:{'Accept':'application/json'}});
+    const r = await apiFetch(`${CONFIG.API_BASE}/incidents?${params.toString()}`, {headers:{'Accept':'application/json'}});
     if(!r.ok){
       let msg = "Erreur incidents "+r.status;
       try{ msg = await readApiError(r,msg); }catch(e){}
@@ -1828,7 +2012,7 @@ const DataAPI = {
     }else{
       opts={method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({body:message})};
     }
-    const r = await fetch(`${CONFIG.API_BASE}/incidents/${encodeURIComponent(id)}/message`, opts);
+    const r = await apiFetch(`${CONFIG.API_BASE}/incidents/${encodeURIComponent(id)}/message`, opts);
     if(!r.ok){
       let msg = "Échec envoi incident ("+r.status+")";
       try{ msg = await readApiError(r,msg); }catch(e){}
@@ -1838,7 +2022,7 @@ const DataAPI = {
   },
   async updateIncident(id,patch={}){
     if(CONFIG.USE_DEMO_DATA){ await new Promise(r=>setTimeout(r,120)); return {ok:true,persisted:false}; }
-    const r = await fetch(`${CONFIG.API_BASE}/incidents/${encodeURIComponent(id)}`, {
+    const r = await apiFetch(`${CONFIG.API_BASE}/incidents/${encodeURIComponent(id)}`, {
       method:'PATCH',
       headers:{'Content-Type':'application/json','Accept':'application/json'},
       body:JSON.stringify(patch)
@@ -2050,7 +2234,7 @@ const CANNED="Bonjour,\n\nMerci pour votre message et désolé pour la gêne occ
 
 /* Utilisateurs pouvant traiter les réclamations */
 const USERS=["Claude","Sandy","Guillaume"];
-let currentUser="Guillaume";   // utilisateur courant (modifiable via le sélecteur)
+let currentUser="Agent";       // défini par la session authentifiée
 
 let claims=[], sort={key:"updatedAt",dir:-1}, selectedId=null; // défaut : du plus récent au plus ancien
 let notesLoading=false, notesLoaded=CONFIG.USE_DEMO_DATA;
@@ -2387,15 +2571,17 @@ async function sendTreatReply(){
   finally{const b=$("#tSend"); if(b){b.disabled=false;b.textContent="Envoyer la réponse";}}
 }
 
-/* ===== Espace Claude (Niveau 1 : brouillons à valider) ===== */
-const firstName=c=>(c.customer||"").split(" ")[0]||"";
-const CLAUDE_TEMPLATES={
-  facture_document:c=>`Bonjour ${firstName(c)},\n\nMerci pour votre message. Vous trouverez votre facture pour la commande ${c.orderId} en pièce jointe à ce message.\n\nN'hésitez pas à revenir vers nous pour toute autre question.\n\nBien cordialement,\nLe service client 2KINGS`,
-  question_garantie:c=>`Bonjour ${firstName(c)},\n\nMerci pour votre message concernant ${c.product}. Ce produit bénéficie de la garantie légale de conformité de 2 ans, ainsi que de la garantie constructeur. La batterie et les pièces sont incluses.\n\nSi vous constatez un défaut, contactez-nous avec une photo ou une description et nous prendrons en charge votre demande.\n\nBien cordialement,\nLe service client 2KINGS`,
-  demande_retour:c=>`Bonjour ${firstName(c)},\n\nMerci pour votre message. Vous pouvez retourner l'article « ${c.product} » (commande ${c.orderId}) sous 14 jours. Voici la marche à suivre :\n1. Remettez l'article dans son emballage d'origine.\n2. Utilisez l'étiquette de retour prépayée jointe à ce message.\n3. Déposez le colis dans un point de dépôt.\n\nDès réception, nous procéderons au remboursement sous 3 à 5 jours.\n\nBien cordialement,\nLe service client 2KINGS`
-};
-function claudeDraft(c){ const f=CLAUDE_TEMPLATES[typologyOf(c)]; if(f) return f(c); const s=suggestedReplies(c); return s.length?s[0].body:""; }
-function claudeState(c){ if(answered(c)) return "faite"; return claudeDraft(c)?"a_valider":"attente"; }
+/* ===== Espace Claude (Niveau 1 : brouillons IA à valider) ===== */
+const AI_DRAFTS=new Map();
+const AI_DRAFT_LOADING=new Set();
+const AI_DRAFT_CHECKED=new Set();
+function claudeDraftRecord(c){return c?AI_DRAFTS.get(c.id)||null:null;}
+function claudeDraft(c){const d=claudeDraftRecord(c);return d?.text||"";}
+function claudeState(c){
+  if(answered(c))return "faite";
+  const d=claudeDraftRecord(c);
+  return d&&["pending","approved"].includes(d.status)?"a_valider":"attente";
+}
 const CSTATE_LABEL={a_valider:"À valider",attente:"En attente",faite:"Faite"};
 
 /* ===== Réponses types : affectation cohérente par sujet + sélecteur ===== */
@@ -2463,94 +2649,146 @@ function updateClaudeCount(){
   const n=claims.filter(c=>matchCurrentMarketplace(c) && effNiveau(c)===1 && needsReply(c)).length;
   el.textContent=n; el.classList.toggle("zero",n===0);
 }
+async function ensureClaudeDraft(claimId){
+  if(!claimId||AI_DRAFTS.has(claimId)||AI_DRAFT_LOADING.has(claimId)||AI_DRAFT_CHECKED.has(claimId))return;
+  AI_DRAFT_LOADING.add(claimId);
+  try{
+    const draft=await DataAPI.fetchAiDraft(claimId);
+    AI_DRAFT_CHECKED.add(claimId);
+    if(draft)AI_DRAFTS.set(claimId,draft);
+  }catch(error){console.warn(error);}
+  finally{AI_DRAFT_LOADING.delete(claimId);if(claudeSelectedId===claimId)renderClaude();}
+}
 function renderClaude(){
   const f=$("#fClaude").value;
-  // Important : la liste Claude reprend le filtre marketplace global, sans mélanger les autres marketplaces.
   const list=claims.filter(c=>matchCurrentMarketplace(c) && effNiveau(c)===1 && (!f || claudeState(c)===f))
     .sort((a,b)=>{const o={a_valider:0,attente:1,faite:2};return (o[claudeState(a)]-o[claudeState(b)])||(createdAt(a)-createdAt(b));});
   $("#claudeList").innerHTML = list.length ? list.map(c=>{
-    const cs=claudeState(c);
+    const cs=claudeState(c),draft=claudeDraftRecord(c);
     return `<div class="tl-item ${c.id===claudeSelectedId?'sel':''} ${cs==='faite'?'done':''}" data-id="${c.id}">
-      <div class="tl-top">${mpBadge(c.marketplace)}<span style="display:flex;gap:5px;align-items:center"><span class="tl-niv">N${effNiveau(c)}</span><span class="cstate cs-${cs}">${CSTATE_LABEL[cs]}</span>${euroBadge(c)}${cacaBadge(c)}${agentAvatar(lastAgent(c))}</span></div>
+      <div class="tl-top">${mpBadge(c.marketplace)}<span style="display:flex;gap:5px;align-items:center"><span class="tl-niv">N${effNiveau(c)}</span><span class="cstate cs-${cs}">${CSTATE_LABEL[cs]}</span>${draft?.confidence?`<span class="tl-niv">IA ${esc(draft.confidence)}</span>`:""}${euroBadge(c)}${cacaBadge(c)}${agentAvatar(lastAgent(c))}</span></div>
       <div class="tl-sub">${esc(c.subject)}</div>
       <div class="tl-meta">${esc(c.customer)} · ${esc(c.orderId)} · ${TYPO_MAP[typologyOf(c)]?TYPO_MAP[typologyOf(c)].label:typologyOf(c)}${lastClientAt(c)?` · 📅 ${fmtDate(lastClientAt(c))}`:""}</div>
     </div>`;}).join("") : '<div class="empty">Aucune réclamation Niveau 1.</div>';
   $("#claudeList").querySelectorAll(".tl-item").forEach(it=>it.onclick=()=>selectClaude(it.dataset.id));
   if(!list.find(c=>c.id===claudeSelectedId)) claudeSelectedId = list.length?list[0].id:null;
   renderClaudeDetail(claims.find(c=>c.id===claudeSelectedId));
+  if(claudeSelectedId)ensureClaudeDraft(claudeSelectedId);
 }
-function selectClaude(id){ claudeSelectedId=id; claudeFiles=[]; renderClaude(); }
+function selectClaude(id){claudeSelectedId=id;claudeFiles=[];renderClaude();}
+function aiDraftMetaHtml(draft){
+  if(!draft)return '<div class="ai-meta">Aucun brouillon IA enregistré. Claude ne génère rien automatiquement : cliquez sur « Générer avec Claude ».</div>';
+  const missing=(draft.missingInformation||[]).map(x=>`<li>${esc(x)}</li>`).join("");
+  return `<div class="ai-meta ${draft.needsHumanInput?'warn':''}">
+    <b>Claude · ${esc(draft.model||'modèle IA')}</b> · confiance ${esc(draft.confidence||'medium')} · état ${esc(draft.status||'pending')}
+    ${draft.internalNote?`<div>${esc(draft.internalNote)}</div>`:""}
+    ${missing?`<div><b>Informations à vérifier :</b><ul>${missing}</ul></div>`:""}
+  </div>`;
+}
 function renderClaudeDetail(c){
   const box=$("#claudeDetail");
-  if(!c){ box.innerHTML='<div class="td-empty">Aucune réclamation à afficher.</div>'; return; }
-  const st=STATUS[businessStatus(c)],sla=slaInfo(c),cs=claudeState(c),draft=claudeDraft(c);
+  if(!c){box.innerHTML='<div class="td-empty">Aucune réclamation à afficher.</div>';return;}
+  const cs=claudeState(c),draft=claudeDraftRecord(c),draftText=draft?.text||"",loading=AI_DRAFT_LOADING.has(c.id);
+  const canReview=Boolean(draft&&["pending","approved"].includes(draft.status));
   const conv=c.messages.map(m=>{
     const att=(m.attachments&&m.attachments.length)?`<div class="bubble-attach">${m.attachments.map(a=>renderAttachment(a)).join("")}</div>`:"";
-    return `<div class="bubble ${m.from}"><div class="who">${m.from==="client"?esc(c.customer||"Client"):("2KINGS — "+esc(m.author||"Agent"))}</div><div class="msg-text">${messageHtml(m.text)}</div>${att}<div class="t">il y a ${fmtAgo(m.at)}</div></div>`;}).join("");
+    return `<div class="bubble ${m.from}"><div class="who">${m.from==="client"?esc(c.customer||"Client"):("2KINGS — "+esc(m.author||"Agent"))}</div><div class="msg-text">${messageHtml(m.text)}</div>${att}<div class="t">il y a ${fmtAgo(m.at)}</div></div>`;
+  }).join("");
+  const sent=cs==="faite"||draft?.status==="sent";
   box.innerHTML=`
     <div class="td-head">
-      <h3><span class="subj-mp">${mpMarkLink(c.marketplace,c.orderId)}</span> ${esc(c.subject)} <span class="subj-ord ordref" data-lbl="N° de commande">${c.orderId}</span> ${claimDatesHtml(c)}</h3>
+      <h3><span class="subj-mp">${mpMarkLink(c.marketplace,c.orderId)}</span> ${esc(c.subject)} <span class="subj-ord ordref" data-lbl="N° de commande">${esc(c.orderId)}</span> ${claimDatesHtml(c)}</h3>
       <div class="meta">${claimHeaderMetaHtml(c,{dark:false})}</div>
       <div class="tags">${statusBadge(c)} ${niveauSelector(c)} <span class="cstate cs-${cs}">${CSTATE_LABEL[cs]}</span>${euroFields(c)}</div>
       ${trackHeader(c)}
     </div>
     <div class="td-body">${conv}</div>
     <div class="td-foot">
+      <div class="ai-tools">
+        <button class="btn btn-primary" id="cGenerate" ${loading||sent?'disabled':''}>${loading?'Claude rédige…':(draft?'↻ Régénérer avec Claude':'🤖 Générer avec Claude')}</button>
+        ${draft&&!sent?'<button class="ai-secondary danger" id="cReject">Rejeter le brouillon</button>':''}
+        <span class="lbl">Claude propose, ${esc(currentUser)} décide.</span>
+      </div>
+      ${aiDraftMetaHtml(draft)}
       <div class="foot-top">
-        <span class="lbl">${cs==="faite"?"Réclamation traitée":(draft?"Brouillon proposé par Claude — à valider":"En attente : aucune réponse standard")}</span>
+        <span class="lbl">${sent?'Réclamation traitée':'Brouillon modifiable avant validation'}</span>
         <span style="display:flex;gap:14px"><button class="canned" id="cCanned">+ Réponse type</button><button class="canned" id="cAttachBtn">📎 Pièce jointe</button></span>
       </div>
       <input type="file" id="cFile" multiple style="display:none">
-      <textarea id="cReply" placeholder="${draft?'':'Rédigez la réponse…'}">${cs==="faite"?"":esc(draft)}</textarea>
+      <textarea id="cReply" placeholder="Générez un brouillon ou rédigez une réponse…" ${sent||draft?.status==="rejected"?'disabled':''}>${sent?'':esc(draftText)}</textarea>
       <div class="attach-list" id="cAttachList"></div>
       <div class="foot-row">
-        <button class="btn btn-primary" id="cSend">✓ Valider et envoyer</button>
-        <select class="status-select" id="cStatus">
+        <button class="btn btn-primary" id="cSend" ${!canReview||sent?'disabled':''}>✓ Valider puis envoyer</button>
+        <select class="status-select" id="cStatus" ${sent?'disabled':''}>
           <option value="resolu">Résolu</option><option value="nouveau">Nouveau</option>
         </select>
       </div>
     </div>`;
-  bindTracking(c); bindNiveau(box); bindEuroFields(box);
-  $("#cStatus").value = (typologyOf(c)==="demande_retour")?"nouveau":"resolu";
+  bindTracking(c);bindNiveau(box);bindEuroFields(box);
+  $("#cStatus").value=draft?.suggestedStatus||"nouveau";
   box.querySelectorAll(".td-head .ordref").forEach(el=>el.onclick=e=>copyCode(e,el,el.dataset.lbl||"Valeur"));
   box.querySelectorAll(".mp-link").forEach(a=>a.addEventListener("click",e=>e.stopPropagation()));
+  $("#cGenerate").onclick=()=>generateClaudeDraft(c);
+  if($("#cReject"))$("#cReject").onclick=()=>rejectClaudeDraft(c);
   $("#cCanned").onclick=e=>openReplyPicker(e.currentTarget,"cReply",c);
   $("#cAttachBtn").onclick=()=>$("#cFile").click();
   $("#cFile").onchange=e=>{for(const f of e.target.files){if(claudeFiles.length>=ATTACH_MAX){toast("Maximum "+ATTACH_MAX+" pièces jointes",true);break;}claudeFiles.push(f);}e.target.value="";renderClaudeAttach();};
   $("#cSend").onclick=sendClaudeReply;
   renderClaudeAttach();
 }
+async function generateClaudeDraft(c){
+  const btn=$("#cGenerate");if(btn){btn.disabled=true;btn.textContent="Claude rédige…";}
+  try{
+    const draft=await DataAPI.generateAiDraft(c.id);
+    if(!draft)throw new Error("Aucun brouillon reçu.");
+    AI_DRAFT_CHECKED.add(c.id);
+    AI_DRAFTS.set(c.id,draft);
+    toast("Brouillon généré. Relisez-le avant de l’envoyer.");
+    renderClaude();
+  }catch(error){toast("Claude : "+error.message,true);renderClaude();}
+}
+async function rejectClaudeDraft(c){
+  const draft=claudeDraftRecord(c);if(!draft)return;
+  try{
+    const updated=await DataAPI.reviewAiDraft(draft.id,"reject");
+    AI_DRAFT_CHECKED.add(c.id);
+    AI_DRAFTS.set(c.id,updated);
+    toast("Brouillon rejeté. Une nouvelle génération est nécessaire avant l’envoi.");renderClaude();
+  }catch(error){toast(error.message,true);}
+}
 function renderClaudeAttach(){
-  const el=$("#cAttachList"); if(!el)return;
+  const el=$("#cAttachList");if(!el)return;
   el.innerHTML=claudeFiles.map((f,i)=>`<span class="attach-chip"><span>📎</span><span class="nm">${f.name}</span><span class="sz">${fmtSize(f.size)}</span><button class="rm" data-i="${i}">×</button></span>`).join("");
   el.querySelectorAll(".rm").forEach(b=>b.onclick=()=>{claudeFiles.splice(+b.dataset.i,1);renderClaudeAttach();});
 }
 async function sendClaudeReply(){
-  const c=claims.find(x=>x.id===claudeSelectedId); if(!c)return;
-  const text=$("#cReply").value.trim(), status=$("#cStatus").value;
-  if(!text && !claudeFiles.length){toast("Le brouillon est vide.",true);return;}
-  const files=claudeFiles.slice();
-  $("#cSend").disabled=true; $("#cSend").textContent="Envoi…";
+  const c=claims.find(x=>x.id===claudeSelectedId);if(!c)return;
+  const draft=claudeDraftRecord(c);
+  if(!draft){toast("Générez d’abord un brouillon avec Claude.",true);return;}
+  const text=$("#cReply").value.trim(),status=$("#cStatus").value;
+  if(!text){toast("Le brouillon est vide.",true);return;}
+  const files=claudeFiles.slice(),btn=$("#cSend");btn.disabled=true;btn.textContent="Validation…";
   try{
-    await DataAPI.sendReply(c.id,text,status,files);
-    // Ne pas inventer un statut local : on recharge le fil/statut réel depuis la marketplace.
-    let fresh=null;
-    try{ fresh=await DataAPI.fetchClaimDetail(c.id); }catch(_){ fresh=null; }
-    if(fresh){
-      fresh._detailLoaded=true;
-      const i=claims.findIndex(x=>x.id===c.id);
-      if(i>=0) claims[i]=fresh;
-    }else{
-      c.messages.push({from:"seller",author:"Claude",at:Date.now(),text,attachments:files.map(f=>({name:f.name,size:f.size}))});
-      c.updatedAt=Date.now();
-      c._detailLoaded=true;
+    const approved=await DataAPI.reviewAiDraft(draft.id,"approve",text);
+    AI_DRAFTS.set(c.id,approved);
+    btn.textContent="Envoi…";
+    const result=await DataAPI.sendReply(c.id,text,status,files,{aiDraftId:approved.id});
+    AI_DRAFTS.set(c.id,{...approved,status:"sent",sentBy:AUTH_STATE.user.id});
+    let fresh=null;try{fresh=await DataAPI.fetchClaimDetail(c.id);}catch(_){fresh=null;}
+    if(fresh){fresh._detailLoaded=true;const i=claims.findIndex(x=>x.id===c.id);if(i>=0)claims[i]=fresh;}
+    else{c.messages.push({from:"seller",author:currentUser,at:Date.now(),text,attachments:files.map(f=>({name:f.name,size:f.size}))});c.updatedAt=Date.now();c._detailLoaded=true;}
+    claudeFiles=[];playSendAnimation();
+    const warnings=[result.closeWarning,result.draftTrackingWarning].filter(Boolean);
+    toast(`Brouillon de Claude validé et envoyé par ${currentUser}`+(warnings.length?" — "+warnings.join(" · "):""),warnings.length>0);
+    renderKPIs();renderEvo();renderCharts();renderClaude();
+  }catch(error){toast("Erreur : "+error.message,true);}
+  finally{
+    const b=$("#cSend"),latest=claudeDraftRecord(c);
+    if(b&&latest?.status!=="sent"){
+      b.disabled=!["pending","approved"].includes(latest?.status);
+      b.textContent="✓ Valider puis envoyer";
     }
-    claudeFiles=[];
-    playSendAnimation();
-    toast("Réponse Claude envoyée à "+c.customer);
-    renderKPIs(); renderEvo(); renderCharts(); renderClaude();
-  }catch(e){toast("Erreur : "+e.message,true);}
-  finally{const b=$("#cSend"); if(b){b.disabled=false;b.textContent="✓ Valider et envoyer";}}
+  }
 }
 
 /* ===== Remboursements (saisie manuelle, mémorisée) ===== */
@@ -3037,8 +3275,8 @@ function renderTable(){
   });
   document.querySelectorAll("thead th[data-sort]").forEach(th=>{const a=th.querySelector(".arr");if(a)a.remove();
     if(th.dataset.sort===sort.key)th.insertAdjacentHTML("beforeend",` <span class="arr">${sort.dir<0?"▼":"▲"}</span>`);});
-  renderProducts(list);   // listing des produits à problème (selon les mêmes filtres)
-  renderNotes();          // notes & avis clients (selon le filtre marketplace)
+  if(isVisible("#prodWrap")) renderProducts(list);
+  if(isVisible("#notesWrap")) renderNotes();
   if($("#kanbanView").style.display!=="none") renderKanban(list);  // vue Kanban si active
   if($("#treatView").style.display!=="none") renderTreat();        // vue traitement si active
   // pager réclamations (25/page) — visible uniquement en vue Tableau
@@ -3237,7 +3475,7 @@ async function downloadAttachmentClick(ev,el){
   if(!url){ toast("Pièce jointe non téléchargeable : URL absente",true); return false; }
   try{
     el.classList.add("loading");
-    const r=await fetch(url,{headers:{"Accept":"*/*"}});
+    const r=await apiFetch(url,{headers:{"Accept":"*/*"}});
     if(!r.ok){
       let msg="Erreur téléchargement "+r.status;
       try{
@@ -3535,20 +3773,11 @@ function fallbackCopy(txt,done){
   document.body.removeChild(ta);
 }
 
-/* Sélecteur d'utilisateur (qui traite les réclamations), mémorisé */
+/* Utilisateur courant fourni par la session authentifiée. */
 function initUser(){
-  const sel=$("#userSelect");
-  let saved=""; try{saved=localStorage.getItem("currentUser")||"";}catch(e){}
-  if(USERS.includes(saved)) currentUser=saved;
-  sel.innerHTML=USERS.map(u=>`<option value="${u}"${u===currentUser?" selected":""}>${u}${u==="Claude"?" (assistant)":""}</option>`).join("");
-  sel.onchange=()=>{
-    currentUser=sel.value;
-    try{localStorage.setItem("currentUser",currentUser);}catch(e){}
-    treatFiles=[]; claudeFiles=[];
-    renderActiveRecView();
-    if(selectedId && $("#drawer").classList.contains("show")) openDrawer(selectedId,true);
-    toast("Connecté en tant que "+currentUser);
-  };
+  currentUser=AUTH_STATE.user?.displayName||"Agent";
+  const el=document.getElementById("sessionUserName");
+  if(el) el.textContent=currentUser+(AUTH_STATE.user?.role==="admin"?" · admin":"");
 }
 
 /* Onglet d'affichage (afficher/masquer une section, état mémorisé) */
@@ -3656,12 +3885,36 @@ function prepareClaimsForDisplay(list){
   });
   return list;
 }
+function isVisible(selector){
+  const el=$(selector);
+  return !!el && el.style.display!=="none";
+}
 function renderMainData(){
   syncEuroRefunds();
   renderKPIs();
-  renderEvo();
-  renderCharts();
-  renderTable();
+
+  if(isVisible("#statsWrap")){
+    renderEvo();
+    renderCharts();
+  }
+  if(isVisible("#reclamWrap")){
+    renderTable();
+  }
+  if(isVisible("#prodWrap")){
+    renderProducts(applyFilters());
+  }
+  if(isVisible("#notesWrap")){
+    renderNotes();
+  }
+}
+let mainRenderScheduled=false;
+function scheduleMainRender(){
+  if(mainRenderScheduled) return;
+  mainRenderScheduled=true;
+  requestAnimationFrame(()=>{
+    mainRenderScheduled=false;
+    renderMainData();
+  });
 }
 function providerProgressLabel(payload){
   const done = Number(payload.completed || 0);
@@ -3682,9 +3935,9 @@ async function load(options={}){
       return;
     }
 
-    // Affichage progressif : on vide puis on affiche chaque marketplace dès qu'elle répond.
-    claims=[];
-    renderMainData();
+    // Conserver les données actuellement affichées pendant la synchronisation.
+    // Elles seront remplacées progressivement puis par le snapshot final du serveur.
+    if(!claims.length) scheduleMainRender();
 
     const finalClaims = await DataAPI.fetchClaimsProgressive(
       { providerTimeoutMs: 60000, ...options },
@@ -3694,13 +3947,13 @@ async function load(options={}){
           $("#btnRefresh").textContent=providerProgressLabel(payload);
         }
         claims=prepareClaimsForDisplay(allRows || []);
-        renderMainData();
+        scheduleMainRender();
       }
     );
 
     if(seq!==currentLoadSeq) return;
     claims=prepareClaimsForDisplay(finalClaims || []);
-    renderMainData();
+    scheduleMainRender();
 
     // Les notes restent disponibles, mais elles ne bloquent plus l'affichage des réclamations.
     // Elles se chargent aussi au clic sur l'onglet Notes clients.
@@ -3911,7 +4164,6 @@ function init(){
   $("#incSend").onclick=sendIncidentMsg;
   $("#incCanned").onclick=e=>{ const inc=INCIDENTS.find(x=>x.id===incSelectedId); if(inc) openReplyPicker(e.currentTarget,"incReply",{id:inc.id,subject:(INC_MOTIFS[inc.motif]||inc.motif||""),product:inc.product,marketplace:inc.channel}); };
   renderIncidents(); updateIncCount();
-  if(!CONFIG.USE_DEMO_DATA){ loadIncidents({enrichDetails:false}).catch(()=>{}); }
   const lg=$("#homeLogo"); if(lg) lg.onclick=closeAllTabs;
   showDailyQuote();
   initUser();
@@ -3924,7 +4176,7 @@ function init(){
   if(["kanban","treat","claude"].includes(savedView)) setView(savedView);
   load();
 }
-init();
+bootstrapAuth();
 </script>
 </body>
 </html>

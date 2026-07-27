@@ -23,18 +23,67 @@ require('dotenv').config();
 const express = require('express');
 const path = require('path');
 const cors = require('cors');
+const { configureAuth } = require('./lib/auth');
+const { audit } = require('./lib/audit-store');
+const draftStore = require('./lib/draft-store');
+const { generateSavDraft, checkOllamaHealth } = require('./lib/ai-service');
 const fetch = (...a) => import('node-fetch').then(({ default: f }) => f(...a));
 // Pour l'adaptateur BOMP (Fnac/Darty), l'API est en XML : fast-xml-parser
 const { XMLParser, XMLBuilder } = require('fast-xml-parser');
 
 const app = express();
-// Autorise la page (sur votre domaine) à appeler ce proxy. Restreignez via ALLOWED_ORIGIN.
-app.use(cors({ origin: process.env.ALLOWED_ORIGIN || true }));
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
 
-// Sert aussi le tableau de bord : ouvrez http://localhost:8787
-app.use(express.static(__dirname));
+// En-têtes de sécurité compatibles avec le front monofichier actuel.
+// Une CSP stricte sera possible lorsque le CSS et le JavaScript seront séparés.
+app.use((_req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+  next();
+});
+
+const configuredOrigins = String(process.env.ALLOWED_ORIGIN || '')
+  .split(',')
+  .map(value => value.trim())
+  .filter(Boolean);
+const developmentOrigins = new Set([
+  'http://localhost:8787',
+  'http://127.0.0.1:8787',
+]);
+app.use(cors({
+  credentials: true,
+  origin(origin, callback) {
+    // Les requêtes même origine et les appels serveur sans en-tête Origin restent autorisés.
+    if (!origin) return callback(null, true);
+    if (configuredOrigins.includes(origin)) return callback(null, true);
+    if (process.env.NODE_ENV !== 'production' && developmentOrigins.has(origin)) return callback(null, true);
+    return callback(new Error('Origine non autorisée par CORS.'));
+  },
+}));
+app.use(express.json({ limit: '2mb' }));
+app.use(express.urlencoded({ extended: true, limit: '2mb' }));
+
+// Sessions, routes /api/auth et utilisateurs Guillaume / Sandy / Claude système.
+const auth = configureAuth(app);
+
+// Le tableau de bord reste public afin d'afficher l'écran de connexion,
+// mais aucun fichier source serveur n'est exposé par express.static().
+function serveDashboard(_req, res) {
+  res.setHeader('Cache-Control', 'no-store');
+  res.sendFile(path.join(__dirname, 'index.html'));
+}
+app.get('/', serveDashboard);
+app.get('/index.html', serveDashboard);
+app.get('/reclamations-marketplaces.html', serveDashboard);
+
+// Toutes les données SAV sont privées. Seule la route de santé reste publique.
+app.use('/api/reclamations', (req, res, next) => {
+  if (req.path === '/health') return next();
+  return auth.requireAuth(req, res, next);
+});
+app.use('/api/reclamations', auth.requireCsrf);
 
 const H = 3600 * 1000;
 
@@ -1099,6 +1148,34 @@ function looksLikeMessageSubjectSnippet(v) {
   return false;
 }
 
+function isTechnicalMarketplaceSubjectCode(value) {
+  const raw = cleanText(value);
+  if (!raw) return false;
+
+  const code = raw
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim()
+    .toUpperCase()
+    .replace(/[\s-]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+
+  // Castorama/Mirakl peut exposer le type interne du topic à la place du
+  // libellé utilisateur, par exemple ORDER_MESSAGING_23. Le nombre final
+  // identifie une entrée de taxonomie et ne constitue jamais un sujet client.
+  if (/^(?:MMP_|MPS_)?(?:ORDER|OFFER|PRODUCT|SERVICE|SELLER|OPERATOR|CUSTOMER|CLIENT)_MESSAGING(?:_[A-Z0-9]+)*_\d+$/.test(code)) {
+    return true;
+  }
+
+  // Autres variantes de codes structurants rencontrées dans les topics Mirakl.
+  // On reste volontairement restrictif pour ne pas écarter un vrai sujet libre.
+  if (/^(?:MMP_|MPS_)?(?:ORDER|OFFER|PRODUCT|SERVICE)_(?:TOPIC|SUBJECT|REASON|MESSAGE|MESSAGING)_\d+$/.test(code)) {
+    return true;
+  }
+
+  return false;
+}
+
 function isBadSubject(v) {
   const s = cleanText(v);
   if (!s) return true;
@@ -1106,6 +1183,7 @@ function isBadSubject(v) {
   // Ce code/libellé ne doit jamais être affiché comme sujet client.
   if (/^[#_\-\s]*\d+[#_\-\s]*$/.test(s)) return true;
   if (/^(topic|subject|reason|motif)[_\-\s]*\d+$/i.test(s)) return true;
+  if (isTechnicalMarketplaceSubjectCode(s)) return true;
 
   const compact = s
     .normalize('NFD')
@@ -1277,12 +1355,14 @@ async function readReplyPayload(req) {
     const parsed = await parseMultipartFormData(req);
     const body = cleanText(scalarFirst(parsed.fields.body, parsed.fields.message, parsed.fields.text));
     const status = cleanText(scalarFirst(parsed.fields.status));
+    const aiDraftId = cleanText(scalarFirst(parsed.fields.aiDraftId, parsed.fields.ai_draft_id));
     const files = (parsed.files || []).filter(f => ['attachments', 'files', 'file'].includes(String(f.fieldname || '').toLowerCase()));
-    return { body, status, files };
+    return { body, status, aiDraftId, files };
   }
   return {
     body: cleanText(req.body?.body || req.body?.message || req.body?.text || ''),
     status: cleanText(req.body?.status || ''),
+    aiDraftId: cleanText(req.body?.aiDraftId || req.body?.ai_draft_id || ''),
     files: [],
   };
 }
@@ -2124,7 +2204,9 @@ const mirakl = {
     )) || 'Client';
     const rawCreatedAt = thread.date_created || thread.created_at || thread.creation_date || thread.createdDate || null;
     const rawUpdatedAt = thread.date_updated || thread.updated_at || thread.last_message_date || thread.date_created || thread.created_at || null;
-    const messages = this.extractMessages(thread).map(m => this.mapMessage(m, customer));
+    const rawMessages = this.extractMessages(thread);
+    const messages = rawMessages.map(m => this.mapMessage(m, customer));
+    const lastRawMessage = [...rawMessages].reverse().find(Boolean) || {};
     const lastMsgAt = messages.map(m => Number(m.at || 0)).filter(Boolean).sort((a, b) => b - a)[0] || parseMarketplaceDate(rawUpdatedAt, Date.now());
     const productEntity = Array.isArray(thread.entities) ? thread.entities.find(e => /product|offer/i.test(e.type || e.entity_type || '')) : null;
     const orderEntity = Array.isArray(thread.entities) ? thread.entities.find(e => /order/i.test(e.type || e.entity_type || '')) : null;
@@ -2138,15 +2220,23 @@ const mirakl = {
     const rawStatus = scalarFirst(thread.status, thread.state, thread.thread_status, thread.closed === true ? 'CLOSED' : 'OPEN');
 
     const subject = firstReadableSubject(
+      // Dans l'API Inbox Mirakl, le topic est composé d'un type technique et
+      // d'une valeur lisible. Castorama peut remonter ORDER_MESSAGING_23 dans
+      // un champ générique : on privilégie donc explicitement label/value.
       thread.topic?.label,
+      thread.topic?.value,
       thread.reason?.label,
       thread.reason_label,
+      thread.reason?.value,
       thread.category?.label,
+      thread.category?.value,
+      lastRawMessage?.topic?.label,
+      lastRawMessage?.topic?.value,
+      lastRawMessage?.subject,
+      lastRawMessage?.title,
       thread.subject,
       thread.title,
-      thread.topic?.name,
-      thread.topic?.value,
-      thread.reason?.value
+      thread.topic?.name
     ) || inferSubjectFromText(lastClientText);
 
     return makeClaim(provider.code, {
@@ -2174,6 +2264,7 @@ const mirakl = {
         closedByMarketplace: isClosedMarketplaceStatus(rawStatus),
         miraklRecipients: extractMiraklRecipients(thread),
         customerId: scalarFirst(thread.customer?.id, thread.customer_id, thread.buyer?.id, thread.from?.id),
+        rawSubjectCode: scalarFirst(thread.topic?.type, thread.topic?.code, thread.subject, thread.title),
       },
     });
   },
@@ -2181,8 +2272,10 @@ const mirakl = {
   async fetchAllThreads(provider) {
     const all = [];
 
-    const max = Number(process.env.MIRAKL_PAGE_SIZE || 10);
-    const maxPages = Number(process.env.MIRAKL_MAX_PAGES || 1);
+    // Une valeur 0 dans .env provoquait des appels `max=0`.
+    // On borne toujours la pagination à une plage acceptée par Mirakl.
+    const max = positiveInt(process.env.MIRAKL_PAGE_SIZE, 20, 1, 100);
+    const maxPages = positiveInt(process.env.MIRAKL_MAX_PAGES, 2, 1, 20);
     // Important : pour savoir si une réclamation est vraiment sans réponse,
     // il faut récupérer les messages. Par défaut on les demande à Mirakl.
     const withMessages = String(process.env.MIRAKL_WITH_MESSAGES || 'true') === 'true';
@@ -4079,6 +4172,20 @@ ${inner}
       const orderMessageMaxPages = positiveInt(process.env.BOMP_ORDER_MESSAGES_MAX_PAGES, onlyWaitingReply ? 10 : (broadQuery ? 3 : 1), 1, 50);
       const incidentPageSize = positiveInt(process.env.BOMP_INCIDENTS_PAGE_SIZE, 100, 1, 500);
       const incidentMaxPages = positiveInt(process.env.BOMP_INCIDENTS_MAX_PAGES, onlyWaitingReply ? 10 : 5, 1, 50);
+      // Les enrichissements par commande sont coûteux. On les parallélise, mais
+      // avec une concurrence volontairement faible pour respecter les limites BOMP.
+      const orderEnrichConcurrency = positiveInt(
+        process.env.BOMP_ORDER_ENRICH_CONCURRENCY,
+        onlyWaitingReply ? 3 : 2,
+        1,
+        6
+      );
+      const incidentEnrichConcurrency = positiveInt(
+        process.env.BOMP_INCIDENT_ENRICH_CONCURRENCY,
+        2,
+        1,
+        4
+      );
 
       async function safeQuery(operation, xml, label = operation) {
         try {
@@ -4236,20 +4343,25 @@ ${inner}
         .map(c => c._ctx.incidentId))]
         .slice(0, enrichLimit);
 
-      for (const incidentId of incidentIdsToExpand) {
-        const detailResponse = await safeQuery(
-          'incidents_query',
-          bompQueryXml(provider, token, 'incidents_query', { paging: 1, incident_id: incidentId }, 20),
-          `incidents_query/incident_id:${incidentId}`
-        );
-        const dr = detailResponse?.incidents_query_response || detailResponse?.incidents || detailResponse || {};
-        const detailIncidents = detailResponse ? extractBompNodes(dr, ['incident']) : [];
-        const detailMapped = detailIncidents.map(it => mapIncident(provider, it));
-        for (const detail of detailMapped) {
-          const base = mappedIncidents.find(c => c._ctx?.incidentId === detail._ctx?.incidentId || c.id === detail.id);
-          if (base) mergeClaimDetails(base, detail);
-          else mappedIncidents.push(detail);
+      const expandedIncidentGroups = await mapLimit(
+        incidentIdsToExpand,
+        incidentEnrichConcurrency,
+        async (incidentId) => {
+          const detailResponse = await safeQuery(
+            'incidents_query',
+            bompQueryXml(provider, token, 'incidents_query', { paging: 1, incident_id: incidentId }, 20),
+            `incidents_query/incident_id:${incidentId}`
+          );
+          const dr = detailResponse?.incidents_query_response || detailResponse?.incidents || detailResponse || {};
+          const detailIncidents = detailResponse ? extractBompNodes(dr, ['incident']) : [];
+          return detailIncidents.map(it => mapIncident(provider, it));
         }
+      );
+
+      for (const detail of expandedIncidentGroups.flat()) {
+        const base = mappedIncidents.find(c => c._ctx?.incidentId === detail._ctx?.incidentId || c.id === detail.id);
+        if (base) mergeClaimDetails(base, detail);
+        else mappedIncidents.push(detail);
       }
       mappedIncidents = mergeClaimsByIncidentOrOrder(mappedIncidents);
 
@@ -4278,30 +4390,54 @@ ${inner}
       const perOrderComments = [];
       const orderInfos = [];
 
-      for (const orderId of orderIds) {
-        const msgByOrder = await collectBompMessagesByOrder(orderId);
-        perOrderMessages.push(...msgByOrder.map(m => mapMessage(provider, m, orderId)).filter(c => c._ctx.messageId || c.orderId || c.messages.length));
+      const perOrderResults = await mapLimit(
+        orderIds,
+        orderEnrichConcurrency,
+        async (orderId) => {
+          const msgByOrder = await collectBompMessagesByOrder(orderId);
+          const mappedOrderMessages = msgByOrder
+            .map(m => mapMessage(provider, m, orderId))
+            .filter(c => c._ctx.messageId || c.orderId || c.messages.length);
 
-        if (includeCommentsInThreads || !onlyWaitingReply) {
-          const comByOrderResponse = await safeQuery(
-            'client_order_comments_query',
-            bompQueryXml(provider, token, 'client_order_comments_query', { order_fnac_id: orderId }, 100),
-            `client_order_comments_query/order_fnac_id:${orderId}`
+          let mappedOrderComments = [];
+          if (includeCommentsInThreads || !onlyWaitingReply) {
+            const comByOrderResponse = await safeQuery(
+              'client_order_comments_query',
+              bompQueryXml(provider, token, 'client_order_comments_query', { order_fnac_id: orderId }, 100),
+              `client_order_comments_query/order_fnac_id:${orderId}`
+            );
+            const cor = comByOrderResponse?.client_order_comments_query_response || comByOrderResponse?.client_order_comments || comByOrderResponse || {};
+            const comByOrder = comByOrderResponse ? extractBompNodes(cor, ['client_order_comment', 'comment']) : [];
+            mappedOrderComments = comByOrder
+              .map(c => mapClientOrderComment(provider, c, orderId))
+              .filter(c => c.orderId || c.messages.length);
+          }
+
+          // Enrichit le client et le produit à partir de la commande, sans bloquer
+          // séquentiellement toutes les autres commandes.
+          const orderResponse = await safeQuery(
+            'orders_query',
+            bompQueryXml(provider, token, 'orders_query', { paging: 1, order_fnac_id: orderId }, 20),
+            `orders_query/order_fnac_id:${orderId}`
           );
-          const cor = comByOrderResponse?.client_order_comments_query_response || comByOrderResponse?.client_order_comments || comByOrderResponse || {};
-          const comByOrder = comByOrderResponse ? extractBompNodes(cor, ['client_order_comment', 'comment']) : [];
-          perOrderComments.push(...comByOrder.map(c => mapClientOrderComment(provider, c, orderId)).filter(c => c.orderId || c.messages.length));
-        }
+          const or = orderResponse?.orders_query_response || orderResponse?.orders || orderResponse || {};
+          const mappedOrderInfos = (orderResponse ? extractBompNodes(or, ['order']) : [])
+            .map(mapOrderInfo)
+            .filter(Boolean);
 
-        // Optionnel mais utile : enrichit client / produit depuis la commande.
-        const orderResponse = await safeQuery(
-          'orders_query',
-          bompQueryXml(provider, token, 'orders_query', { paging: 1, order_fnac_id: orderId }, 20),
-          `orders_query/order_fnac_id:${orderId}`
-        );
-        const or = orderResponse?.orders_query_response || orderResponse?.orders || orderResponse || {};
-        const orders = orderResponse ? extractBompNodes(or, ['order']) : [];
-        orderInfos.push(...orders.map(mapOrderInfo).filter(Boolean));
+          return {
+            messages: mappedOrderMessages,
+            comments: mappedOrderComments,
+            orderInfos: mappedOrderInfos,
+          };
+        }
+      );
+
+      for (const result of perOrderResults) {
+        if (!result) continue;
+        perOrderMessages.push(...result.messages);
+        perOrderComments.push(...result.comments);
+        orderInfos.push(...result.orderInfos);
       }
 
       mappedMessages = mergeClaimsByIncidentOrOrder([...mappedMessages, ...perOrderMessages]);
@@ -4874,12 +5010,78 @@ const incidentsCache = new Map();
 const incidentsInFlight = new Map();
 const incidentsLastRefreshStart = new Map();
 
+function invalidateClaimsCaches(reason = 'mutation') {
+  threadsCache.clear();
+  incidentsCache.clear();
+  threadsLastRefreshStart.clear();
+  incidentsLastRefreshStart.clear();
+  console.log(`[cache] Réclamations et incidents invalidés (${reason})`);
+}
+
 function cacheStatePayload(cache, key, extra = {}) {
   return {
     cache,
     key,
     at: Date.now(),
     ...extra,
+  };
+}
+
+function providerIdentity(provider = {}) {
+  return `${String(provider.type || '').toLowerCase()}:${String(provider.code || provider.type || '').toLowerCase()}`;
+}
+function mergeFailedProvidersFromCache(fresh, cached) {
+  if (!cached || !fresh) return fresh;
+
+  const failed = new Set(
+    (fresh.providerChunks || [])
+      .filter(chunk => chunk?.ok === false)
+      .map(chunk => providerIdentity(chunk.provider))
+  );
+  if (!failed.size) return fresh;
+
+  const preservedChunks = (cached.providerChunks || []).filter(chunk =>
+    failed.has(providerIdentity(chunk?.provider))
+  );
+  const preservedRows = preservedChunks.flatMap(chunk => Array.isArray(chunk?.rows) ? chunk.rows : []);
+  const preservedClaimEntries = (cached.claimEntries || []).filter(item =>
+    failed.has(providerIdentity(item?.entry?.provider))
+  );
+  const preservedIncidentEntries = (cached.incidentEntries || []).filter(item =>
+    failed.has(providerIdentity(item?.entry?.provider))
+  );
+
+  const rowMap = new Map();
+  for (const row of [...preservedRows, ...(fresh.data || [])]) {
+    if (row?.id) rowMap.set(row.id, row);
+  }
+  const entryMap = new Map();
+  for (const item of [...preservedClaimEntries, ...(fresh.claimEntries || [])]) {
+    if (item?.id) entryMap.set(item.id, item);
+  }
+  const incidentEntryMap = new Map();
+  for (const item of [...preservedIncidentEntries, ...(fresh.incidentEntries || [])]) {
+    if (item?.id) incidentEntryMap.set(item.id, item);
+  }
+
+  const providerChunks = (fresh.providerChunks || []).map(chunk => {
+    if (!failed.has(providerIdentity(chunk?.provider))) return chunk;
+    const previous = preservedChunks.find(old =>
+      providerIdentity(old?.provider) === providerIdentity(chunk?.provider)
+    );
+    return previous
+      ? { ...previous, ok: false, stale: true, refreshError: chunk.error }
+      : chunk;
+  });
+
+  console.warn(`[cache] ${failed.size} fournisseur(s) en erreur : anciennes données conservées`);
+  return {
+    ...fresh,
+    data: [...rowMap.values()].sort((a, b) => Number(b.updatedAt || 0) - Number(a.updatedAt || 0)),
+    claimEntries: [...entryMap.values()],
+    incidentEntries: [...incidentEntryMap.values()],
+    providerChunks,
+    partialRefresh: true,
   };
 }
 
@@ -5019,29 +5221,51 @@ function incidentsCacheKey(options) {
 function cloneForPublic(claim, provider = null) {
   return decorateClaimAttachmentsForPublic(provider, claim);
 }
-function restoreClaimIndexFromEntries(entries = [], clear = true) {
-  if (clear) claimIndex.clear();
+const INDEX_ENTRY_TTL_MS = positiveInt(
+  process.env.INDEX_ENTRY_TTL_MS,
+  24 * 60 * 60 * 1000,
+  60 * 1000,
+  7 * 24 * 60 * 60 * 1000
+);
+
+function indexedEntry(entry) {
+  return { ...entry, indexedAt: Date.now() };
+}
+function restoreClaimIndexFromEntries(entries = []) {
+  // Ne jamais vider l'index pendant une simple lecture de cache : un utilisateur
+  // filtrant Fnac ne doit pas supprimer les détails Carrefour d'un autre utilisateur.
   for (const item of entries) {
     if (!item || !item.id || !item.entry) continue;
-    claimIndex.set(item.id, item.entry);
+    claimIndex.set(item.id, indexedEntry(item.entry));
   }
 }
-function restoreIncidentIndexFromEntries(entries = [], clear = true) {
-  if (clear) incidentIndex.clear();
+function restoreIncidentIndexFromEntries(entries = []) {
   for (const item of entries) {
     if (!item || !item.id || !item.entry) continue;
-    incidentIndex.set(item.id, item.entry);
-    claimIndex.set(item.id, item.entry);
+    const entry = indexedEntry(item.entry);
+    incidentIndex.set(item.id, entry);
+    claimIndex.set(item.id, entry);
+  }
+}
+function pruneRuntimeIndexes() {
+  const cutoff = Date.now() - INDEX_ENTRY_TTL_MS;
+  for (const [id, entry] of claimIndex) {
+    if (Number(entry?.indexedAt || 0) < cutoff) claimIndex.delete(id);
+  }
+  for (const [id, entry] of incidentIndex) {
+    if (Number(entry?.indexedAt || 0) < cutoff) incidentIndex.delete(id);
   }
 }
 function restoreThreadsResult(result) {
-  restoreClaimIndexFromEntries(result?.claimEntries || [], true);
+  restoreClaimIndexFromEntries(result?.claimEntries || []);
   if (Array.isArray(result?.incidentEntries) && result.incidentEntries.length) {
-    restoreIncidentIndexFromEntries(result.incidentEntries, false);
+    restoreIncidentIndexFromEntries(result.incidentEntries);
   }
+  pruneRuntimeIndexes();
 }
 function restoreIncidentsResult(result) {
-  restoreIncidentIndexFromEntries(result?.incidentEntries || [], true);
+  restoreIncidentIndexFromEntries(result?.incidentEntries || []);
+  pruneRuntimeIndexes();
 }
 async function collectClaimsForCache(options = {}, onProvider = null) {
   const all = [];
@@ -5143,7 +5367,9 @@ async function getThreadsCached(options = {}, forceRefresh = false, onProvider =
   }
 
   if (threadsInFlight.has(key)) {
-    if (cached && options.staleWhileRefresh) {
+    // Une requête JSON classique peut continuer à utiliser l'ancien cache.
+    // Le flux SSE, lui, attend le refresh partagé afin de diffuser le résultat frais.
+    if (cached && options.staleWhileRefresh && typeof onProvider !== 'function') {
       restoreThreadsResult(cached);
       return { ...cached, cache: 'WAIT-STALE', key };
     }
@@ -5154,11 +5380,12 @@ async function getThreadsCached(options = {}, forceRefresh = false, onProvider =
 
   if (!forceRefresh && cached && options.staleWhileRefresh) {
     threadsLastRefreshStart.set(key, now);
-    const refresh = collectClaimsForCache(options)
+    const refresh = collectClaimsForCache(options, onProvider)
       .then(result => {
-        threadsCache.set(key, result);
-        restoreThreadsResult(result);
-        return result;
+        const safeResult = mergeFailedProvidersFromCache(result, cached);
+        threadsCache.set(key, safeResult);
+        restoreThreadsResult(safeResult);
+        return safeResult;
       })
       .catch(e => {
         console.error('[threads/cache refresh]', e.message);
@@ -5166,6 +5393,12 @@ async function getThreadsCached(options = {}, forceRefresh = false, onProvider =
       })
       .finally(() => threadsInFlight.delete(key));
     threadsInFlight.set(key, refresh);
+
+    if (typeof onProvider === 'function') {
+      const result = await refresh;
+      return { ...result, cache: result === cached ? 'STALE-ERROR' : 'REFRESHED', key };
+    }
+
     restoreThreadsResult(cached);
     return { ...cached, cache: 'STALE', key };
   }
@@ -5173,9 +5406,10 @@ async function getThreadsCached(options = {}, forceRefresh = false, onProvider =
   threadsLastRefreshStart.set(key, now);
   const task = collectClaimsForCache(options, onProvider)
     .then(result => {
-      threadsCache.set(key, result);
-      restoreThreadsResult(result);
-      return result;
+      const safeResult = mergeFailedProvidersFromCache(result, cached);
+      threadsCache.set(key, safeResult);
+      restoreThreadsResult(safeResult);
+      return safeResult;
     })
     .finally(() => threadsInFlight.delete(key));
   threadsInFlight.set(key, task);
@@ -5328,7 +5562,121 @@ app.get('/api/reclamations/health', (_req, res) => {
   });
 });
 
-app.get('/api/reclamations/diagnostic', (_req, res) => {
+async function resolveClaimForAi(claimId) {
+  const entry = claimIndex.get(claimId) || incidentIndex.get(claimId);
+  if (!entry?.claim) {
+    throw Object.assign(new Error('Réclamation inconnue. Rechargez la liste avant de demander un brouillon.'), { statusCode: 404 });
+  }
+
+  const { provider, ctx } = entry;
+  const adapter = ADAPTERS[provider.type];
+  let claim = entry.claim;
+
+  // Claude doit disposer du fil complet, mais un échec de détail ne doit pas
+  // empêcher de proposer un brouillon à partir du cache déjà visible.
+  if (adapter?.fetchThread) {
+    try {
+      claim = provider.type === 'bomp'
+        ? await adapter.fetchThread(provider, { ...(ctx || {}), claim })
+        : await adapter.fetchThread(provider, ctx);
+      const fullEntry = indexedEntry({ provider, ctx: claim._ctx || ctx, claim });
+      claimIndex.set(claim.id, fullEntry);
+      claimIndex.set(claimId, fullEntry);
+    } catch (error) {
+      console.warn(`[ai/${provider.code || provider.type}] détail complet indisponible : ${error.message}`);
+    }
+  }
+
+  return { provider, claim };
+}
+
+app.get('/api/reclamations/ai/health', async (_req, res) => {
+  try {
+    const health = await checkOllamaHealth();
+    res.status(health.ok ? 200 : 503).json(health);
+  } catch (error) {
+    const payload = publicErrorPayload(error);
+    res.status(503).json(payload);
+  }
+});
+
+app.get('/api/reclamations/ai/drafts', async (req, res) => {
+  try {
+    const claimId = cleanText(req.query.claimId || '');
+    if (!claimId) throw Object.assign(new Error('claimId manquant.'), { statusCode: 400 });
+    const draft = await draftStore.latestForClaim(claimId);
+    res.json({ draft });
+  } catch (error) {
+    const payload = publicErrorPayload(error);
+    res.status(payload.status >= 400 && payload.status < 500 ? payload.status : 500).json(payload);
+  }
+});
+
+app.post('/api/reclamations/ai/drafts', async (req, res) => {
+  try {
+    const claimId = cleanText(req.body?.claimId || '');
+    const extraInstructions = cleanText(req.body?.instructions || '').slice(0, 1500);
+    if (!claimId) throw Object.assign(new Error('claimId manquant.'), { statusCode: 400 });
+
+    const { provider, claim } = await resolveClaimForAi(claimId);
+    const generated = await generateSavDraft({
+      claim,
+      requestedBy: req.user.displayName,
+      extraInstructions,
+    });
+    const draft = await draftStore.createDraft({
+      claimId,
+      text: generated.reply,
+      suggestedStatus: generated.suggestedStatus,
+      confidence: generated.confidence,
+      needsHumanInput: generated.needsHumanInput,
+      missingInformation: generated.missingInformation,
+      internalNote: generated.internalNote,
+      model: generated.model,
+      responseId: generated.responseId,
+      requestedBy: req.user.id,
+    });
+
+    await audit('ai.draft_generated', req, {
+      claimId,
+      draftId: draft.id,
+      provider: provider.code || provider.type,
+      model: generated.model,
+      requestId: generated.requestId,
+      confidence: draft.confidence,
+      needsHumanInput: draft.needsHumanInput,
+    });
+    res.status(201).json({ draft });
+  } catch (error) {
+    const payload = publicErrorPayload(error);
+    res.status(payload.status >= 400 && payload.status < 500 ? payload.status : 502).json(payload);
+  }
+});
+
+app.patch('/api/reclamations/ai/drafts/:id', async (req, res) => {
+  try {
+    const action = cleanText(req.body?.action || '').toLowerCase();
+    const finalText = cleanText(req.body?.text || '');
+    const draft = await draftStore.reviewDraft(req.params.id, {
+      action,
+      actor: req.user.id,
+      finalText,
+    });
+    if (!draft) throw Object.assign(new Error('Brouillon introuvable.'), { statusCode: 404 });
+
+    await audit(action === 'approve' ? 'ai.draft_approved' : 'ai.draft_rejected', req, {
+      claimId: draft.claimId,
+      draftId: draft.id,
+      edited: action === 'approve' ? draft.originalText !== draft.text : false,
+    });
+    res.json({ draft });
+  } catch (error) {
+    const payload = publicErrorPayload(error);
+    res.status(payload.status >= 400 && payload.status < 500 ? payload.status : 500).json(payload);
+  }
+});
+
+app.get('/api/reclamations/diagnostic', auth.requireRole('admin'), (_req, res) => {
   res.json({
     ok: true,
     providers: PROVIDERS.map(p => ({
@@ -5342,7 +5690,7 @@ app.get('/api/reclamations/diagnostic', (_req, res) => {
   });
 });
 
-app.get('/api/reclamations/bomp-auth-check', async (_req, res) => {
+app.get('/api/reclamations/bomp-auth-check', auth.requireRole('admin'), async (_req, res) => {
   const providers = configured().filter(p => p.type === 'bomp');
   const results = await Promise.all(providers.map(async p => {
     try {
@@ -5385,7 +5733,7 @@ app.get('/api/reclamations/notes', async (req, res) => {
 
 
 
-app.get('/api/reclamations/cache-status', (_req, res) => {
+app.get('/api/reclamations/cache-status', auth.requireRole('admin'), (_req, res) => {
   res.json({
     ok: true,
     threads: {
@@ -5497,6 +5845,9 @@ app.get('/api/reclamations/threads-stream', async (req, res) => {
       completed: providers.length,
       count: Array.isArray(result.data) ? result.data.length : 0,
       cache: result.cache,
+      // Snapshot final : permet au navigateur de retirer les lignes présentes
+      // dans l'ancien cache mais absentes du résultat fraîchement synchronisé.
+      rows: Array.isArray(result.data) ? result.data : [],
     });
     res.end();
   } catch (e) {
@@ -5534,7 +5885,14 @@ app.post('/api/reclamations/incidents/:id/message', async (req, res) => {
     if (!adapter?.sendReply) throw new Error(`Réponse incident non gérée pour ${provider.type}`);
     const sendCtx = provider.type === 'bomp' ? { ...(ctx || {}), claim: entry.claim } : ctx;
     const result = await adapter.sendReply(provider, sendCtx, body, files);
-    res.json({ ok: true, mode: result?.mode || 'reply', files: files.length });
+    invalidateClaimsCaches(`réponse incident ${req.params.id}`);
+    await audit('incident.reply_sent', req, {
+      incidentId: req.params.id,
+      provider: provider.code || provider.type,
+      attachmentCount: files.length,
+      bodyLength: body.length,
+    });
+    res.json({ ok: true, mode: result?.mode || 'reply', files: files.length, sentBy: req.user.displayName });
   } catch (e) {
     const payload = publicErrorPayload(e);
     res.status(payload.status >= 400 && payload.status < 500 ? payload.status : 502).json(payload);
@@ -5552,9 +5910,23 @@ app.patch('/api/reclamations/incidents/:id', async (req, res) => {
     // On ne simule donc pas une clôture marketplace : l'IHM garde le statut localement.
     if (req.body.status === 'resolu' && adapter.close && ctx.incidentId) {
       await adapter.close(provider, ctx.incidentId);
-      return res.json({ ok: true, persisted: true, status: 'resolu' });
+      invalidateClaimsCaches(`clôture incident ${req.params.id}`);
+      await audit('incident.status_changed', req, {
+        incidentId: req.params.id,
+        provider: provider.code || provider.type,
+        status: 'resolu',
+        persisted: true,
+      });
+      return res.json({ ok: true, persisted: true, status: 'resolu', changedBy: req.user.displayName });
     }
-    res.json({ ok: true, persisted: false, status: req.body.status || req.body.state || null });
+    const requestedStatus = req.body.status || req.body.state || null;
+    await audit('incident.status_changed', req, {
+      incidentId: req.params.id,
+      provider: provider.code || provider.type,
+      status: requestedStatus,
+      persisted: false,
+    });
+    res.json({ ok: true, persisted: false, status: requestedStatus, changedBy: req.user.displayName });
   } catch (e) {
     const payload = publicErrorPayload(e);
     res.status(payload.status >= 400 && payload.status < 500 ? payload.status : 502).json(payload);
@@ -5600,8 +5972,8 @@ app.get('/api/reclamations/threads/:id', async (req, res) => {
         ctx: fullClaim._ctx || ctx,
         claim: fullClaim
       };
-      claimIndex.set(fullClaim.id, fullEntry);
-      claimIndex.set(req.params.id, fullEntry);
+      claimIndex.set(fullClaim.id, indexedEntry(fullEntry));
+      claimIndex.set(req.params.id, indexedEntry(fullEntry));
 
       return res.json(cloneForPublic(fullClaim, provider));
     }
@@ -5620,11 +5992,11 @@ app.get('/api/reclamations/threads/:id', async (req, res) => {
         ctx
       );
 
-    claimIndex.set(fullClaim.id, {
+    claimIndex.set(fullClaim.id, indexedEntry({
       provider,
       ctx: fullClaim._ctx || ctx,
       claim: fullClaim
-    });
+    }));
 
     res.json(cloneForPublic(fullClaim, provider));
 
@@ -5720,114 +6092,118 @@ app.get('/api/reclamations/threads/:id/attachments/:messageIndex/:attachmentInde
 
 app.post('/api/reclamations/threads/:id/message', async (req, res) => {
   try {
-    console.log('\n========== ENVOI MESSAGE ==========');
-    console.log('[SEND] ID demandé :', req.params.id);
-
-    const entry = claimIndex.get(req.params.id);
-
+    const claimId = req.params.id;
+    const entry = claimIndex.get(claimId);
     if (!entry) {
-      console.error('[SEND] Réclamation absente du claimIndex');
-      throw new Error('Réclamation inconnue (rechargez la liste)');
+      throw Object.assign(new Error('Réclamation inconnue. Rechargez la liste.'), { statusCode: 404 });
     }
 
     const { provider, ctx } = entry;
-
-    console.log('[SEND] Provider :', {
-      code: provider.code,
-      type: provider.type
-    });
-
-    console.log('[SEND] Context :');
-    console.dir(ctx, { depth: null });
-
     const adapter = ADAPTERS[provider.type];
-
-    const { body, status, files } =
-      await readReplyPayload(req);
-
-    console.log('[SEND] Message :');
-    console.log(body);
-
-    console.log('[SEND] Status :', status);
-
-    console.log(
-      '[SEND] Fichiers :',
-      files.map(f => ({
-        name: f.originalname,
-        size: f.size,
-        type: f.mimetype
-      }))
-    );
-
-    if (!body) {
-      throw Object.assign(
-        new Error('Message vide'),
-        { statusCode: 400 }
-      );
+    if (!adapter?.sendReply) {
+      throw Object.assign(new Error(`Réponse non gérée pour ${provider.type}.`), { statusCode: 400 });
     }
 
-    console.log('[SEND] Appel adapter.sendReply()...');
+    const { body, status, aiDraftId, files } = await readReplyPayload(req);
+    if (!body) throw Object.assign(new Error('Message vide.'), { statusCode: 400 });
 
-    const result =
-      await adapter.sendReply(
+    let approvedDraft = null;
+    if (aiDraftId) {
+      approvedDraft = await draftStore.getDraft(aiDraftId);
+      if (!approvedDraft) {
+        throw Object.assign(new Error('Brouillon IA introuvable.'), { statusCode: 404 });
+      }
+      if (approvedDraft.claimId !== claimId) {
+        throw Object.assign(new Error('Ce brouillon IA appartient à une autre réclamation.'), { statusCode: 409 });
+      }
+      if (approvedDraft.status !== 'approved') {
+        throw Object.assign(new Error('Le brouillon IA doit être validé par un agent humain avant son envoi.'), { statusCode: 409 });
+      }
+      const approvedText = cleanText(approvedDraft.finalText || approvedDraft.text || '');
+      if (approvedText !== body) {
+        throw Object.assign(new Error('Le texte a changé après validation. Validez à nouveau le brouillon avant l’envoi.'), { statusCode: 409 });
+      }
+    }
+
+    if (approvedDraft) {
+      const lockedDraft = await draftStore.beginSend(aiDraftId, {
+        actor: req.user.id,
+        claimId,
+        expectedText: body,
+      });
+      if (!lockedDraft) throw Object.assign(new Error('Brouillon IA introuvable.'), { statusCode: 404 });
+    }
+
+    let result;
+    try {
+      result = await adapter.sendReply(
         provider,
         provider.type === 'bomp' ? { ...(ctx || {}), claim: entry.claim } : ctx,
         body,
         files
       );
-
-    console.log('[SEND] Résultat sendReply :');
-    console.dir(result, { depth: null });
-
-    const closeId =
-      ctx.discussionId ||
-      ctx.incidentId;
-
-    console.log('[SEND] closeId :', closeId);
-
-    if (
-      status === 'resolu' &&
-      adapter.close &&
-      closeId
-    ) {
-      console.log(
-        '[SEND] Fermeture de la réclamation...'
-      );
-
-      await adapter.close(
-        provider,
-        closeId
-      );
-
-      console.log(
-        '[SEND] Réclamation fermée'
-      );
+    } catch (sendError) {
+      if (approvedDraft) {
+        await draftStore.finishSend(aiDraftId, {
+          actor: req.user.id,
+          claimId,
+          success: false,
+          error: sendError.message,
+        }).catch(error => console.error(`[ai-draft/${aiDraftId}] déverrouillage impossible :`, error.message));
+      }
+      throw sendError;
     }
 
-    console.log('[SEND] Réponse OK');
-    console.log('==================================\n');
+    // Le verrou "sending" empêche deux agents d'envoyer simultanément le même brouillon.
+    // Si l'écriture finale échoue, le brouillon reste verrouillé au lieu de permettre un doublon.
+    let draftTrackingWarning = '';
+    if (approvedDraft) {
+      try {
+        await draftStore.finishSend(aiDraftId, { actor: req.user.id, claimId, success: true });
+      } catch (error) {
+        draftTrackingWarning = `Message envoyé, mais suivi du brouillon IA à vérifier : ${error.message}`;
+        console.error(`[ai-draft/${aiDraftId}] ${draftTrackingWarning}`);
+      }
+    }
+
+    let closeWarning = '';
+    const closeId = ctx.discussionId || ctx.incidentId;
+    if (status === 'resolu' && adapter.close && closeId) {
+      try {
+        await adapter.close(provider, closeId);
+      } catch (error) {
+        closeWarning = `Message envoyé, mais clôture distante impossible : ${error.message}`;
+        console.warn(`[send/${provider.code || provider.type}] ${closeWarning}`);
+      }
+    }
+
+    invalidateClaimsCaches(`réponse réclamation ${claimId}`);
+    await audit('claim.reply_sent', req, {
+      claimId,
+      provider: provider.code || provider.type,
+      status,
+      attachmentCount: files.length,
+      bodyLength: body.length,
+      aiAssisted: Boolean(aiDraftId),
+      aiDraftId: aiDraftId || '',
+      closeWarning,
+      draftTrackingWarning,
+    });
 
     res.json({
       ok: true,
       status,
-      files: files.length
+      files: files.length,
+      aiAssisted: Boolean(aiDraftId),
+      sentBy: req.user.displayName,
+      closeWarning,
+      draftTrackingWarning,
+      providerResult: result?.ok === false ? { ok: false } : undefined,
     });
-  } catch (e) {
-    console.error('\n========== ERREUR ENVOI ==========');
-    console.error(e);
-    console.error('Stack :');
-    console.error(e.stack);
-    console.error('=================================\n');
-
-    const payload = publicErrorPayload(e);
-    res
-      .status(
-        payload.status >= 400 &&
-          payload.status < 500
-          ? payload.status
-          : 502
-      )
-      .json(payload);
+  } catch (error) {
+    console.error(`[send/${req.params.id}]`, error.message);
+    const payload = publicErrorPayload(error);
+    res.status(payload.status >= 400 && payload.status < 500 ? payload.status : 502).json(payload);
   }
 });
 // Suivi de livraison : GET /api/reclamations/tracking?carrier=colissimo&number=...

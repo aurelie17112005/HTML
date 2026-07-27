@@ -1,57 +1,139 @@
-# Brancher les vraies données — test en local
-
-Objectif : faire tourner le proxy sur votre ordinateur, le remplir avec vos identifiants,
-et afficher les vraies réclamations/notes dans le tableau de bord. Une fois validé en local,
-on déploiera sur un serveur.
+# Démarrage local — SAV authentifié et Ollama
 
 ## Pré-requis
-- **Node.js 18+** installé (https://nodejs.org → version LTS).
-- Les fichiers suivants dans un même dossier (ex. `proxy-2kings/`) :
-  `proxy-exemple.js`, `package.json`, `.env.example`.
 
-## Étapes
+- Node.js 20 ou plus récent ;
+- Ollama installé et lancé ;
+- les fichiers du projet dans un même dossier ;
+- les identifiants des marketplaces que vous souhaitez tester.
 
-1. **Créer le fichier `.env`** : dupliquez `.env.example` et renommez la copie en `.env`.
-   Renseignez **uniquement** les identifiants que vous avez (laissez le reste vide) :
-   - Cdiscount → `OCTOPIA_CLIENT_ID`, `OCTOPIA_CLIENT_SECRET`, `OCTOPIA_SELLER_ID`
-   - Fnac/Darty → `FNAC_PARTNER_ID`/`FNAC_SHOP_ID`/`FNAC_KEY` (idem Darty)
-   - Mirakl (Carrefour, Leroy Merlin…) → `XXX_URL` + `XXX_KEY`
-   - Ajoutez `ALLOWED_ORIGIN=*` pour le test local.
+## 1. Installer les dépendances
 
-2. **Installer + démarrer** (dans le dossier, en terminal) :
-   ```
-   npm install
-   npm start
-   ```
-   Vous devez voir : `Proxy réclamations sur http://localhost:8787`
+```powershell
+npm ci
+```
 
-3. **Vérifier que ça répond** : ouvrez dans le navigateur
-   `http://localhost:8787/api/reclamations/threads`
-   → vous devez voir un tableau JSON de réclamations (ou un tableau vide `[]` si aucune en cours).
-   Les sources non configurées sont ignorées sans bloquer les autres.
+## 2. Créer la configuration locale
 
-4. **Pointer le tableau de bord sur le proxy** : dans `index.html`, bloc `CONFIG` (vers le début
-   du `<script>`), modifiez 2 lignes :
-   ```js
-   USE_DEMO_DATA: false,
-   API_BASE: "http://localhost:8787/api/reclamations",
-   ```
-   Rechargez la page (Cmd/Ctrl+Shift+R). Le badge passe de « Mode démo » à « ● Connecté ».
+Sous Windows, copiez `.env.example`, renommez la copie en `.env`, puis utilisez au minimum :
 
-## Ce qu'il faut me renvoyer pour finaliser
+```env
+PORT=8787
+NODE_ENV=development
+ALLOWED_ORIGIN=http://localhost:8787
+SESSION_SAME_SITE=lax
+```
 
-Les adaptateurs **Octopia** et **Mirakl** sont prêts ; pour **Fnac/Darty (BOMP)** et certains
-champs Mirakl, je dois caler le « mapping » sur une vraie réponse. Quand le proxy tourne :
+## 3. Créer les mots de passe
 
-- Ouvrez `http://localhost:8787/api/reclamations/threads` et **copiez-moi le JSON** obtenu
-  (anonymisez les noms si besoin), ou tout **message d'erreur** affiché dans le terminal.
-- Pour Fnac/Darty, si possible un **exemple de réponse XML** d'`incidents_query` (via Postman).
+```powershell
+npm run hash-password -- "mot-de-passe-long-pour-guillaume"
+npm run hash-password -- "mot-de-passe-long-pour-sandy"
+```
 
-À partir de ça, j'ajuste les adaptateurs pour que tout s'affiche correctement (réclamations,
-puis notes et suivi).
+Placez les résultats dans `.env` :
 
-## Dépannage rapide
-- **Erreur de port** : changez `PORT` dans `.env`.
-- **CORS** : vérifiez `ALLOWED_ORIGIN=*` pour le test local.
-- **401/403 d'une marketplace** : identifiants invalides → vérifiez la clé/compte concerné.
-- **Rien ne s'affiche** : regardez le terminal du proxy (il logue `[source] erreur` par source).
+```env
+GUILLAUME_PASSWORD_HASH=scrypt$...
+SANDY_PASSWORD_HASH=scrypt$...
+```
+
+Générez le secret de session :
+
+```powershell
+node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"
+```
+
+Puis renseignez :
+
+```env
+AUTH_SESSION_SECRET=valeur_generee
+```
+
+## 4. Installer le modèle Ollama
+
+Pour le modèle recommandé :
+
+```powershell
+ollama pull qwen3:8b
+```
+
+Pour une machine moins puissante :
+
+```powershell
+ollama pull qwen3:4b
+```
+
+Ajoutez dans `.env` :
+
+```env
+OLLAMA_API_BASE=http://127.0.0.1:11434
+OLLAMA_MODEL=qwen3:8b
+OLLAMA_TIMEOUT_MS=120000
+OLLAMA_MAX_RETRIES=1
+OLLAMA_MAX_OUTPUT_TOKENS=900
+OLLAMA_TEMPERATURE=0
+OLLAMA_KEEP_ALIVE=10m
+```
+
+Vérifiez la connexion :
+
+```powershell
+npm run check-ollama
+```
+
+## 5. Configurer les marketplaces
+
+Renseignez seulement les fournisseurs disponibles :
+
+- Cdiscount : `OCTOPIA_CLIENT_ID`, `OCTOPIA_CLIENT_SECRET`, `OCTOPIA_SELLER_ID` ;
+- Fnac : `FNAC_PARTNER_ID`, `FNAC_SHOP_ID`, `FNAC_KEY` ;
+- Darty : `DARTY_PARTNER_ID`, `DARTY_SHOP_ID`, `DARTY_KEY` ;
+- Mirakl : paire `XXX_URL` et `XXX_KEY` pour chaque opérateur.
+
+Les fournisseurs non configurés sont ignorés.
+
+## 6. Démarrer
+
+```powershell
+npm start
+```
+
+Ouvrez ensuite :
+
+```text
+http://localhost:8787
+```
+
+La page affiche d'abord la connexion Guillaume/Sandy. Claude n'est pas un compte connectable :
+il utilise Ollama pour créer uniquement des brouillons à valider.
+
+## Vérifications utiles
+
+Route publique du proxy :
+
+```text
+http://localhost:8787/api/reclamations/health
+```
+
+Après connexion, état d'Ollama :
+
+```text
+http://localhost:8787/api/reclamations/ai/health
+```
+
+Les diagnostics techniques restent réservés à Guillaume :
+
+```text
+http://localhost:8787/api/reclamations/diagnostic
+```
+
+## Données locales créées
+
+```text
+data/sessions/
+data/ai-drafts.json
+data/audit.jsonl
+```
+
+Ne publiez pas ces fichiers et ne publiez jamais `.env`.

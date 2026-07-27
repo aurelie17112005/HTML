@@ -74,3 +74,19 @@ C'est tout : on peut itérer autant de fois que nécessaire.
   partagé en temps réel, il faudra une base de données côté serveur (à prévoir avec le proxy).
 - **HTTPS** : assurez-vous que votre domaine est en https (OVH propose un certificat SSL gratuit
   Let's Encrypt à activer dans l'espace client).
+
+---
+
+## Important — hébergement de l'assistant Ollama
+
+La valeur `OLLAMA_API_BASE=http://127.0.0.1:11434` fonctionne uniquement lorsque Ollama est
+installé sur la même machine que le serveur Node.js.
+
+- Si Node.js fonctionne sur votre PC, lancez Ollama sur ce PC.
+- Si Node.js fonctionne sur un VPS, installez Ollama sur ce VPS ou utilisez une machine privée
+  joignable depuis celui-ci.
+- Si Node.js fonctionne sur Render, `127.0.0.1` ne désigne pas votre PC. L'Ollama installé chez
+  vous ne sera donc pas accessible directement.
+
+N'ouvrez pas publiquement le port `11434`. Utilisez un réseau privé, un VPN ou un pare-feu si
+Ollama et Node.js sont sur deux machines différentes.

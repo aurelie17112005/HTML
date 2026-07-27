@@ -1,19 +1,22 @@
 {
   "name": "2kings-reclamations-proxy",
-  "version": "1.0.0",
-  "description": "Proxy backend qui agrège les réclamations, notes et suivis des marketplaces (Octopia, Mirakl, Fnac/Darty BOMP) pour le tableau de bord 2KINGS.",
+  "version": "1.2.0",
+  "description": "Centre SAV multi-marketplaces avec authentification, cache et brouillons IA locaux via Ollama, validés par un agent humain.",
   "main": "proxy-exemple.js",
   "scripts": {
-    "start": "node proxy-exemple.js"
+    "start": "node proxy-exemple.js",
+    "check": "node --check proxy-exemple.js && node --check lib/auth.js && node --check lib/ai-service.js && node --check lib/draft-store.js && node --check lib/audit-store.js",
+    "hash-password": "node scripts/hash-password.js",
+    "check-ollama": "node scripts/check-ollama.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "dependencies": {
-    "express": "^4.19.2",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
-    "node-fetch": "^3.3.2",
-    "fast-xml-parser": "^4.4.1"
+    "express": "^4.19.2",
+    "fast-xml-parser": "^4.4.1",
+    "node-fetch": "^3.3.2"
   }
 }
