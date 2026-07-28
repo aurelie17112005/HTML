@@ -1,13 +1,13 @@
 {
   "name": "2kings-reclamations-proxy",
-  "version": "1.2.0",
-  "description": "Centre SAV multi-marketplaces avec authentification, cache et brouillons IA locaux via Ollama, validés par un agent humain.",
+  "version": "1.3.0",
+  "description": "Centre SAV multi-marketplaces avec authentification renforcée pour Render et brouillons IA via Groq Cloud.",
   "main": "proxy-exemple.js",
   "scripts": {
     "start": "node proxy-exemple.js",
     "check": "node --check proxy-exemple.js && node --check lib/auth.js && node --check lib/ai-service.js && node --check lib/draft-store.js && node --check lib/audit-store.js",
     "hash-password": "node scripts/hash-password.js",
-    "check-ollama": "node scripts/check-ollama.js"
+    "check-groq": "node scripts/check-groq.js"
   },
   "engines": {
     "node": ">=20"

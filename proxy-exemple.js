@@ -26,7 +26,7 @@ const cors = require('cors');
 const { configureAuth } = require('./lib/auth');
 const { audit } = require('./lib/audit-store');
 const draftStore = require('./lib/draft-store');
-const { generateSavDraft, checkOllamaHealth } = require('./lib/ai-service');
+const { generateSavDraft, checkGroqHealth } = require('./lib/ai-service');
 const fetch = (...a) => import('node-fetch').then(({ default: f }) => f(...a));
 // Pour l'adaptateur BOMP (Fnac/Darty), l'API est en XML : fast-xml-parser
 const { XMLParser, XMLBuilder } = require('fast-xml-parser');
@@ -1148,34 +1148,6 @@ function looksLikeMessageSubjectSnippet(v) {
   return false;
 }
 
-function isTechnicalMarketplaceSubjectCode(value) {
-  const raw = cleanText(value);
-  if (!raw) return false;
-
-  const code = raw
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .trim()
-    .toUpperCase()
-    .replace(/[\s-]+/g, '_')
-    .replace(/^_+|_+$/g, '');
-
-  // Castorama/Mirakl peut exposer le type interne du topic à la place du
-  // libellé utilisateur, par exemple ORDER_MESSAGING_23. Le nombre final
-  // identifie une entrée de taxonomie et ne constitue jamais un sujet client.
-  if (/^(?:MMP_|MPS_)?(?:ORDER|OFFER|PRODUCT|SERVICE|SELLER|OPERATOR|CUSTOMER|CLIENT)_MESSAGING(?:_[A-Z0-9]+)*_\d+$/.test(code)) {
-    return true;
-  }
-
-  // Autres variantes de codes structurants rencontrées dans les topics Mirakl.
-  // On reste volontairement restrictif pour ne pas écarter un vrai sujet libre.
-  if (/^(?:MMP_|MPS_)?(?:ORDER|OFFER|PRODUCT|SERVICE)_(?:TOPIC|SUBJECT|REASON|MESSAGE|MESSAGING)_\d+$/.test(code)) {
-    return true;
-  }
-
-  return false;
-}
-
 function isBadSubject(v) {
   const s = cleanText(v);
   if (!s) return true;
@@ -1183,7 +1155,6 @@ function isBadSubject(v) {
   // Ce code/libellé ne doit jamais être affiché comme sujet client.
   if (/^[#_\-\s]*\d+[#_\-\s]*$/.test(s)) return true;
   if (/^(topic|subject|reason|motif)[_\-\s]*\d+$/i.test(s)) return true;
-  if (isTechnicalMarketplaceSubjectCode(s)) return true;
 
   const compact = s
     .normalize('NFD')
@@ -2204,9 +2175,7 @@ const mirakl = {
     )) || 'Client';
     const rawCreatedAt = thread.date_created || thread.created_at || thread.creation_date || thread.createdDate || null;
     const rawUpdatedAt = thread.date_updated || thread.updated_at || thread.last_message_date || thread.date_created || thread.created_at || null;
-    const rawMessages = this.extractMessages(thread);
-    const messages = rawMessages.map(m => this.mapMessage(m, customer));
-    const lastRawMessage = [...rawMessages].reverse().find(Boolean) || {};
+    const messages = this.extractMessages(thread).map(m => this.mapMessage(m, customer));
     const lastMsgAt = messages.map(m => Number(m.at || 0)).filter(Boolean).sort((a, b) => b - a)[0] || parseMarketplaceDate(rawUpdatedAt, Date.now());
     const productEntity = Array.isArray(thread.entities) ? thread.entities.find(e => /product|offer/i.test(e.type || e.entity_type || '')) : null;
     const orderEntity = Array.isArray(thread.entities) ? thread.entities.find(e => /order/i.test(e.type || e.entity_type || '')) : null;
@@ -2220,23 +2189,15 @@ const mirakl = {
     const rawStatus = scalarFirst(thread.status, thread.state, thread.thread_status, thread.closed === true ? 'CLOSED' : 'OPEN');
 
     const subject = firstReadableSubject(
-      // Dans l'API Inbox Mirakl, le topic est composé d'un type technique et
-      // d'une valeur lisible. Castorama peut remonter ORDER_MESSAGING_23 dans
-      // un champ générique : on privilégie donc explicitement label/value.
       thread.topic?.label,
-      thread.topic?.value,
       thread.reason?.label,
       thread.reason_label,
-      thread.reason?.value,
       thread.category?.label,
-      thread.category?.value,
-      lastRawMessage?.topic?.label,
-      lastRawMessage?.topic?.value,
-      lastRawMessage?.subject,
-      lastRawMessage?.title,
       thread.subject,
       thread.title,
-      thread.topic?.name
+      thread.topic?.name,
+      thread.topic?.value,
+      thread.reason?.value
     ) || inferSubjectFromText(lastClientText);
 
     return makeClaim(provider.code, {
@@ -2264,7 +2225,6 @@ const mirakl = {
         closedByMarketplace: isClosedMarketplaceStatus(rawStatus),
         miraklRecipients: extractMiraklRecipients(thread),
         customerId: scalarFirst(thread.customer?.id, thread.customer_id, thread.buyer?.id, thread.from?.id),
-        rawSubjectCode: scalarFirst(thread.topic?.type, thread.topic?.code, thread.subject, thread.title),
       },
     });
   },
@@ -5592,7 +5552,7 @@ async function resolveClaimForAi(claimId) {
 
 app.get('/api/reclamations/ai/health', async (_req, res) => {
   try {
-    const health = await checkOllamaHealth();
+    const health = await checkGroqHealth();
     res.status(health.ok ? 200 : 503).json(health);
   } catch (error) {
     const payload = publicErrorPayload(error);

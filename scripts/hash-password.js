@@ -23,5 +23,10 @@ crypto.scrypt(password, salt, 64, { N, r, p, maxmem: 64 * 1024 * 1024 }, (error,
     console.error(error.message);
     process.exit(1);
   }
-  console.log(`scrypt$${N}$${r}$${p}$${salt.toString('base64url')}$${key.toString('base64url')}`);
+  const hash = `scrypt$${N}$${r}$${p}$${salt.toString('base64url')}$${key.toString('base64url')}`;
+  const renderSafe = Buffer.from(hash, 'utf8').toString('base64url');
+  console.log('Hash standard (usage locale) :');
+  console.log(hash);
+  console.log('\nValeur Base64URL recommandée pour Render :');
+  console.log(renderSafe);
 });

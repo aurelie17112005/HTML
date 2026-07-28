@@ -1,92 +1,30 @@
-# Mettre le tableau de bord en ligne (FTP / OVH) + modifications futures
+# Mise en ligne sur Render
 
-Le tableau de bord est un **fichier unique** : `index.html`. Il suffit de le déposer sur votre
-hébergement. Voici la marche à suivre, la protection par mot de passe, et le circuit pour
-continuer à le faire évoluer.
+## Commandes Render
 
----
+- Build command : `npm ci`
+- Start command : `npm start`
+- Runtime : Node.js 20 ou plus récent
 
-## 1. Déposer le site par FTP
+## Variables indispensables
 
-**Ce qu'il vous faut** : vos identifiants FTP (fournis par OVH dans l'espace client →
-Hébergements → FTP-SSH), et un logiciel FTP gratuit comme **FileZilla**.
+Configurez les variables d'authentification et les identifiants marketplaces, puis ajoutez :
 
-1. Ouvrez FileZilla et connectez-vous :
-   - Hôte : `ftp.cluster0XX.hosting.ovh.net` (ou l'hôte indiqué par OVH)
-   - Identifiant / Mot de passe : ceux de votre compte FTP
-   - Port : 21
-2. À droite (serveur), entrez dans le dossier **`www`** (c'est la racine publique du site).
-3. (Optionnel mais conseillé) créez un sous-dossier, par ex. `sav`, pour avoir l'URL
-   `https://votre-domaine.fr/sav/`.
-4. Glissez-déposez les fichiers suivants depuis votre dossier vers ce dossier :
-   - `index.html`  (le tableau de bord)
-   - `.htaccess`   (protection par mot de passe — voir étape 2)
-   - `.htpasswd`   (à créer — voir étape 2)
-5. Ouvrez `https://votre-domaine.fr/` (ou `/sav/`) : le tableau de bord s'affiche.
+```env
+GROQ_API_KEY=gsk_...
+GROQ_API_BASE=https://api.groq.com/openai/v1
+GROQ_MODEL=llama-3.3-70b-versatile
+GROQ_TIMEOUT_MS=45000
+GROQ_MAX_RETRIES=2
+GROQ_MAX_OUTPUT_TOKENS=900
+GROQ_TEMPERATURE=0.1
+```
 
-> Astuce : si les fichiers commençant par un point (`.htaccess`) n'apparaissent pas dans
-> FileZilla, activez « Forcer l'affichage des fichiers cachés » (menu Serveur).
+Groq est appelé par le serveur Render. Il n'est plus nécessaire d'installer Ollama ni de maintenir un serveur GPU.
 
----
+Après chaque modification des variables, utilisez **Save, rebuild, and deploy**.
 
-## 2. Protéger l'accès par mot de passe (important : données clients)
+## Vérifications
 
-La page affiche des données clients : protégez-la. Deux façons :
-
-**A. Via l'espace OVH (le plus simple)** — OVH propose un outil « Répertoires protégés » /
-« .htaccess & .htpasswd » dans la gestion de l'hébergement : indiquez le dossier (`www/sav`),
-créez un utilisateur + mot de passe, OVH génère tout. Dans ce cas, pas besoin des fichiers ci-dessous.
-
-**B. Manuellement** avec les fichiers fournis :
-1. Ouvrez `.htaccess` et remplacez `VOTRE_LOGIN` par votre login d'hébergement
-   (le chemin doit pointer vers le `.htpasswd`, ex. `/home/monlogin/www/sav/.htpasswd`).
-2. Créez le fichier **`.htpasswd`** contenant `utilisateur:motdepasse_chiffré`.
-   Générez la ligne avec un outil en ligne « htpasswd generator » (chiffrement bcrypt ou APR1),
-   ou en local : `htpasswd -c .htpasswd sandy` puis `htpasswd .htpasswd guillaume`.
-   Exemple de contenu (mot de passe à régénérer, ne pas réutiliser celui-ci) :
-   ```
-   sandy:$apr1$xxxxxxxx$xxxxxxxxxxxxxxxxxxxxxx
-   ```
-3. Déposez `.htaccess` et `.htpasswd` dans le même dossier que `index.html`.
-
----
-
-## 3. Faire des modifications ensuite (avec moi)
-
-Le circuit ne change pas :
-1. Vous me demandez une modification.
-2. Je modifie le fichier ici et je vous le represente.
-3. Vous **re-déposez `index.html`** par FTP (il écrase l'ancien) → c'est en ligne.
-4. Videz le cache du navigateur (Ctrl/Cmd+Shift+R) pour voir la nouvelle version.
-
-C'est tout : on peut itérer autant de fois que nécessaire.
-
----
-
-## 4. À savoir (limites de la version en ligne actuelle)
-
-- **Données = démonstration.** Les réclamations affichées sont des exemples. Pour les vraies
-  données, il faudra brancher le proxy (`proxy-exemple.js`) sur un hébergement Node — voir
-  `GUIDE-branchement-marketplaces.md`.
-- **États non partagés entre postes.** Les actions cochées (Note OK, retraits EAN, remboursements,
-  niveaux ajustés, validations Claude…) sont enregistrées **dans le navigateur** de chaque poste.
-  Sandy et Guillaume ne verront pas les mêmes coches sur des ordinateurs différents. Pour un suivi
-  partagé en temps réel, il faudra une base de données côté serveur (à prévoir avec le proxy).
-- **HTTPS** : assurez-vous que votre domaine est en https (OVH propose un certificat SSL gratuit
-  Let's Encrypt à activer dans l'espace client).
-
----
-
-## Important — hébergement de l'assistant Ollama
-
-La valeur `OLLAMA_API_BASE=http://127.0.0.1:11434` fonctionne uniquement lorsque Ollama est
-installé sur la même machine que le serveur Node.js.
-
-- Si Node.js fonctionne sur votre PC, lancez Ollama sur ce PC.
-- Si Node.js fonctionne sur un VPS, installez Ollama sur ce VPS ou utilisez une machine privée
-  joignable depuis celui-ci.
-- Si Node.js fonctionne sur Render, `127.0.0.1` ne désigne pas votre PC. L'Ollama installé chez
-  vous ne sera donc pas accessible directement.
-
-N'ouvrez pas publiquement le port `11434`. Utilisez un réseau privé, un VPN ou un pare-feu si
-Ollama et Node.js sont sur deux machines différentes.
+- `/api/auth/status` : état de la configuration des comptes ;
+- `/api/reclamations/ai/health` : état de la clé et du modèle Groq, après connexion.

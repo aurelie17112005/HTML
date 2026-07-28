@@ -15,3 +15,5 @@ Thumbs.db
 # Sessions, brouillons IA et journal d'audit locaux
 data/*
 !data/.gitkeep
+
+.env
