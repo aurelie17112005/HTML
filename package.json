@@ -5,9 +5,10 @@
   "main": "proxy-exemple.js",
   "scripts": {
     "start": "node proxy-exemple.js",
-    "check": "node --check proxy-exemple.js && node --check lib/auth.js && node --check lib/ai-service.js && node --check lib/draft-store.js && node --check lib/audit-store.js",
+    "check": "node --check proxy-exemple.js && node --check lib/auth.js && node --check lib/ai-service.js && node --check lib/draft-store.js && node --check lib/audit-store.js && node --check lib/tracking-status.js && node --check lib/carrier-tracking.js && node --check lib/tracking-pages.js && node --check lib/tracking-browser.js && node --check lib/tracking-xml.js && node --check lib/tracking-laposte.js && node --check lib/tracking-chronopost.js",
     "hash-password": "node scripts/hash-password.js",
-    "check-groq": "node scripts/check-groq.js"
+    "check-groq": "node scripts/check-groq.js",
+    "test": "node --test tests/*.test.js"
   },
   "engines": {
     "node": ">=20"

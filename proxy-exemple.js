@@ -30,6 +30,7 @@ const { generateSavDraft, checkGroqHealth } = require('./lib/ai-service');
 const fetch = (...a) => import('node-fetch').then(({ default: f }) => f(...a));
 // Pour l'adaptateur BOMP (Fnac/Darty), l'API est en XML : fast-xml-parser
 const { XMLParser, XMLBuilder } = require('fast-xml-parser');
+const TrackingStatus = require('./lib/tracking-status');
 
 const app = express();
 
@@ -77,6 +78,10 @@ function serveDashboard(_req, res) {
 app.get('/', serveDashboard);
 app.get('/index.html', serveDashboard);
 app.get('/reclamations-marketplaces.html', serveDashboard);
+app.get('/tracking-status.js', (_req, res) => {
+  res.setHeader('Cache-Control', 'no-cache');
+  res.type('application/javascript').sendFile(path.join(__dirname, 'lib/tracking-status.js'));
+});
 
 // Toutes les données SAV sont privées. Seule la route de santé reste publique.
 app.use('/api/reclamations', (req, res, next) => {
@@ -187,7 +192,7 @@ function makeClaim(marketplace, o = {}) {
     lastClientMessageAt: lastClientMessageAt || null,
     dueAt: o.dueAt || computeDueAt(messages),
     messages,
-    tracking: normalizeTracking(o.tracking, o),
+    tracking: mergeTrackingInfo(normalizeTracking(o.tracking, o), normalizeOrderTracking(o)),
     _ctx: ctx,                                      // données techniques utiles à la réponse
   };
 }
@@ -259,37 +264,21 @@ function normalizeCarrierCode(raw, number = '', url = '') {
   return '';
 }
 
-function normalizeTrackingStatus(raw, events = []) {
-  const all = [raw, ...(events || []).map(e => e?.label)].filter(Boolean).join(' ');
-  const s = foldStatusText(all);
-  // Important : un simple numéro de suivi ne veut PAS dire que le colis est en transit.
-  // On ne classe en transit que si la marketplace/le transporteur donne un vrai statut ou événement exploitable.
-  if (!s) return 'inconnu';
-  if (/livr|delivered|remis/.test(s)) return 'livre';
-  if (/point relais|relais|pickup|a retirer|consigne|disponible/.test(s)) return 'pret_retrait';
-  if (/incident|echec|absent|retour|refus|exception|probleme|anomalie|perdu/.test(s)) return 'incident';
-  if (/preparation|etiquette|label|enregistr|created|annonce|attente|pending/.test(s)) return 'en_attente';
-  if (/expedi|expedie|shipped|pris en charge|accepted|collected|achemin|transit|hub|tri|route|en cours de livraison|out for delivery|en livraison|depart|arrive/.test(s)) return 'en_transit';
-  return 'inconnu';
+function normalizeTrackingStatus(raw, events = [], carrier = '') {
+  return TrackingStatus.pick(raw, TrackingStatus.eventsOf(events,carrier), carrier).status;
 }
-
 function trackingStatusRank(status) {
-  const s = String(status || '').toLowerCase();
-  if (['livre', 'incident', 'pret_retrait'].includes(s)) return 4;
-  if (s === 'en_attente') return 3;
-  if (s === 'en_transit') return 2;
-  if (s === 'inconnu') return 1;
-  return 0;
+  return TrackingStatus.classify(status) !== 'inconnu' ? 1 : 0;
 }
 function chooseTrackingStatus(...statuses) {
-  return statuses.filter(Boolean).sort((a, b) => trackingStatusRank(b) - trackingStatusRank(a))[0] || 'inconnu';
+  return statuses.find(s => trackingStatusRank(s)) || 'inconnu';
 }
 
-function looksLikeTrackingNumber(v) {
+function looksLikeTrackingNumber(v, carrier = '') {
   const s = cleanText(v).replace(/\s+/g, '');
   if (!s || s.length < 6 || s.length > 60) return false;
   if (/^https?:/i.test(s)) return false;
-  if (!/[0-9]/.test(s)) return false;
+  if (!/[0-9]/.test(s) && carrier !== 'chezvous') return false;
   if (/[@]/.test(s)) return false;
   return /^[A-Z0-9._\-]+$/i.test(s);
 }
@@ -341,21 +330,13 @@ function collectDeepArrays(obj, keyRegex, maxDepth = 5) {
   return out;
 }
 
-function normalizeTrackingEvent(e) {
-  if (!e) return null;
-  if (typeof e === 'string') return { at: Date.now(), label: cleanText(e) };
-  const label = cleanText(scalarFirst(e.label, e.description, e.status, e.eventLabel, e.event_label, e.message, e.libelle, e.libellé, e.activity));
-  const atRaw = scalarFirst(e.at, e.date, e.eventDate, e.event_date, e.timestamp, e.time, e.datetime, e.created_at);
-  const at = atRaw ? parseMarketplaceDate(atRaw, Date.now()) : (e.h != null ? Date.now() - Number(e.h) * H : Date.now());
-  if (!label) return null;
-  return { at, label };
-}
+function normalizeTrackingEvent(e) { return TrackingStatus.event(e); }
 
 function normalizeTracking(raw, source = {}) {
   const root = raw || source || {};
   if (!root) return null;
   if (typeof root === 'string') {
-    return looksLikeTrackingNumber(root) ? { carrier: normalizeCarrierCode('', root) || 'transporteur', number: cleanText(root), status: 'inconnu', etaH: null, events: [] } : null;
+    return looksLikeTrackingNumber(root) ? TrackingStatus.normalize({ carrier: normalizeCarrierCode('', root) || 'transporteur', number: cleanText(root), status: 'inconnu' }) : null;
   }
 
   const number = scalarFirst(
@@ -365,12 +346,12 @@ function normalizeTracking(raw, source = {}) {
   );
 
   let trackingNumber = cleanText(number);
-  if (!looksLikeTrackingNumber(trackingNumber)) {
+  if (!looksLikeTrackingNumber(trackingNumber, normalizeCarrierCode(root.carrier || root.shipping_carrier || source.carrier || source.shipping_carrier, trackingNumber, root.url || root.trackingUrl || root.tracking_url || ''))) {
     const url = safeTrackingUrl(scalarFirst(root.url, root.trackingUrl, root.tracking_url, firstDeepValue(root, /(tracking|shipment|parcel).*url|url.*tracking/i)));
     const m = String(url || '').match(/[?&](?:code|tracking-id|trackingNumber|tracking_number|tracknum|listeNumerosLT|match|numColis|numeroExpedition|cons)=([^&]+)/i);
     trackingNumber = m ? decodeURIComponent(m[1]) : '';
   }
-  if (!looksLikeTrackingNumber(trackingNumber)) return null;
+  if (!looksLikeTrackingNumber(trackingNumber, normalizeCarrierCode(root.carrier || root.shipping_carrier || source.carrier || source.shipping_carrier, trackingNumber, root.url || root.trackingUrl || root.tracking_url || ''))) return null;
 
   const url = safeTrackingUrl(scalarFirst(
     root.url, root.trackingUrl, root.tracking_url, root.shippingTrackingUrl, root.shipping_tracking_url,
@@ -386,38 +367,32 @@ function normalizeTracking(raw, source = {}) {
   for (const arr of collectDeepArrays(root, /(event|history|tracking|shipment).*s?$/i, 4)) {
     events.push(...arr.map(normalizeTrackingEvent).filter(Boolean));
   }
-  events = dedupeTrackingEvents(events).slice(0, 20);
-  const statusRaw = scalarFirst(root.status, root.tracking_status, root.delivery_status, root.shipment_status, firstDeepValue(root, /(tracking|delivery|shipment).*status|^status$/i));
-
-  return {
-    carrier: normalizeCarrierCode(carrierRaw, trackingNumber, url) || 'transporteur',
-    number: trackingNumber,
-    status: normalizeTrackingStatus(statusRaw, events),
-    etaH: root.etaH ?? root.eta ?? null,
-    events,
-    ...(url ? { url: cleanText(url) } : {}),
-  };
+  events = TrackingStatus.eventsOf(events);
+  // Les champs de livraison priment. Un statut générique de commande ou de
+  // réclamation (paid, closed, etc.) ne constitue pas un statut transporteur.
+  const scoped = raw != null && raw !== source;
+  const statusRaw = TrackingStatus.statusCandidate([
+    root.tracking_status,root.trackingStatus,root.delivery_status,root.deliveryStatus,
+    root.shipment_status,root.shipmentStatus,root.shipping_status,root.shippingStatus,
+    ...(scoped ? [root.currentStatus,root.statusRaw,root.status] : []),
+    firstDeepValue(root, /^(tracking|delivery|shipment|shipping)_?status$/i)
+  ]);
+  const carrier = normalizeCarrierCode(carrierRaw, trackingNumber, url) || 'transporteur';
+  return TrackingStatus.normalize({
+    ...root, carrier, number:trackingNumber, status:statusRaw,
+    ...(carrier==='chezvous'?{orderReference:scalarFirst(root.orderReference,root.carrierOrderReference,root.ccvOrderNumber,root.cchezvousOrderNumber,root.deliveryOrderReference,source.orderReference,source.carrierOrderReference,source.ccvOrderNumber,source.cchezvousOrderNumber,root.url&&TrackingStatus.chezvousReferenceFromUrl(root.url),url&&TrackingStatus.chezvousReferenceFromUrl(url))}:{}),
+    events, ...(url ? {url:cleanText(url)} : {})
+  });
 }
 
 function mergeTrackingInfo(current, extra) {
-  const a = normalizeTracking(current);
-  const b = normalizeTracking(extra);
-  if (!a) return b;
-  if (!b) return a;
-  const events = dedupeTrackingEvents([...(a.events || []), ...(b.events || [])]).slice(0, 20);
-  return {
-    carrier: (a.carrier && a.carrier !== 'transporteur') ? a.carrier : b.carrier,
-    number: a.number || b.number,
-    status: chooseTrackingStatus(normalizeTrackingStatus('', events), a.status, b.status),
-    etaH: a.etaH ?? b.etaH ?? null,
-    events,
-    ...(a.url || b.url ? { url: a.url || b.url } : {}),
-  };
+  const a=normalizeTracking(current), b=normalizeTracking(extra);
+  return TrackingStatus.merge(a,b);
 }
 
 function normalizeOrderTracking(order = {}) {
   const candidates = [];
-  const addCandidate = (src = {}, fallback = {}) => {
+  const addCandidate = (src = {}, fallback = {}, scope = 'order') => {
     if (!src || typeof src !== 'object') return;
     const t = normalizeTracking({
       number: scalarFirst(
@@ -427,47 +402,77 @@ function normalizeOrderTracking(order = {}) {
         src.awb, src.waybill, typeof src.tracking === 'string' ? src.tracking : '', fallback.number
       ),
       url: scalarFirst(src.shipping_tracking_url, src.shippingTrackingUrl, src.tracking_url, src.trackingUrl, src.url, fallback.url),
+      orderReference: scalarFirst(src.orderReference,src.carrierOrderReference,src.ccvOrderNumber,src.cchezvousOrderNumber,src.deliveryOrderReference,fallback.orderReference,fallback.carrierOrderReference,fallback.ccvOrderNumber,fallback.cchezvousOrderNumber),
       carrier: scalarFirst(
         src.shipping_carrier, src.shippingCarrier, src.shipping_carrier_code, src.shippingCarrierCode,
         src.carrier, src.carrier_code, src.carrierCode, src.carrier_name, src.carrierName,
         src.transporteur, src.transporter, src.shipping_type_label, src.shippingTypeLabel,
         src.shipping_type_code, src.shippingTypeCode, src.delivery_carrier, fallback.carrier
       ),
-      status: scalarFirst(src.shipping_status, src.delivery_status, src.shipment_status, src.tracking_status, src.status, fallback.status),
+      status: TrackingStatus.statusCandidate([
+        src.tracking_status,src.trackingStatus,src.delivery_status,src.deliveryStatus,
+        src.shipment_status,src.shipmentStatus,src.shipping_status,src.shippingStatus,
+        ...(scope==='tracking' ? [src.currentStatus,src.statusRaw,src.status] : []),
+        fallback.tracking_status,fallback.trackingStatus,fallback.delivery_status,fallback.deliveryStatus,
+        fallback.shipment_status,fallback.shipmentStatus,fallback.shipping_status,fallback.shippingStatus
+      ]),
       events: src.events || src.history || src.tracking_events || fallback.events,
     }, src);
-    if (t) candidates.push(t);
+    if (t) {
+      const explicit = TrackingStatus.statusCandidate([
+        src.tracking_status,src.trackingStatus,src.delivery_status,src.deliveryStatus,
+        src.shipment_status,src.shipmentStatus,src.shipping_status,src.shippingStatus,
+        ...(scope==='tracking' ? [src.currentStatus,src.statusRaw] : []),
+        fallback.tracking_status,fallback.trackingStatus,fallback.delivery_status,fallback.deliveryStatus,
+        fallback.shipment_status,fallback.shipmentStatus,fallback.shipping_status,fallback.shippingStatus
+      ],t.carrier);
+      const scoped = scope==='tracking';
+      if (!explicit && !scoped) {
+        const latest=TrackingStatus.pick('',t.events,t.carrier);
+        if(latest.status!=='inconnu'){
+          t.status=latest.status;t.statusRaw=latest.raw;t.statusAt=latest.at;t.statusSource='marketplace';
+        }else{
+          const orderState=TrackingStatus.statusCandidate([order.order_status,order.orderStatus,order.status,order.state],t.carrier);
+          const state=TrackingStatus.classify(orderState,t.carrier);
+          // Un état de commande peut indiquer une expédition, pas une remise au client.
+          t.status=state==='en_attente'||state==='en_transit' ? state : 'inconnu';
+          t.statusRaw=orderState;
+          t.statusSource=state==='en_attente'||state==='en_transit' ? 'commande':'inconnu';
+          if(t.statusSource==='commande')t.statusKind='commande';
+        }
+      }
+      candidates.push(t);
+    }
   };
 
   addCandidate(order);
   for (const key of ['shipping', 'shipment', 'delivery', 'tracking', 'logistic', 'logistics', 'parcel', 'package']) {
-    if (order[key] && typeof order[key] === 'object') addCandidate(order[key], order);
+    if (order[key] && typeof order[key] === 'object') addCandidate(order[key], order, 'tracking');
   }
   for (const key of ['shipments', 'parcels', 'packages', 'order_lines', 'orderLines', 'lines', 'items', 'fulfillments', 'consignments']) {
     const arr = Array.isArray(order[key]) ? order[key] : (order[key] ? [order[key]] : []);
     for (const item of arr) {
       addCandidate(item, order);
       for (const nested of ['shipping', 'shipment', 'delivery', 'tracking', 'parcel', 'package']) {
-        if (item && item[nested] && typeof item[nested] === 'object') addCandidate(item[nested], item);
+        if (item && item[nested] && typeof item[nested] === 'object') addCandidate(item[nested], item, 'tracking');
       }
     }
   }
   for (const arr of collectDeepArrays(order, /(shipment|parcel|package|tracking|delivery|logistic|carrier)s?$/i, 6)) {
-    for (const item of arr) addCandidate(item, order);
+    for (const item of arr) addCandidate(item, order, 'tracking');
   }
 
-  return candidates.find(t => t.carrier && t.carrier !== 'transporteur') || candidates[0] || null;
+  // Préférer un suivi doté d'une preuve de livraison, plutôt que le premier
+  // transporteur reconnu. Les statuts de colis différents ne sont pas fusionnés.
+  return candidates.reduce((best,t) => {
+    if (!best) return t;
+    if (best.number === t.number) return mergeTrackingInfo(best,t);
+    const score=x=> (x.status !== 'inconnu' ? 50 : 0) + (x.statusSource === 'transporteur' ? 30 : x.statusSource === 'marketplace' ? 20 : 0) + (x.carrier !== 'transporteur' ? 10 : 0);
+    return score(t)>score(best) ? t : best;
+  },null);
 }
 
-function dedupeTrackingEvents(events) {
-  const seen = new Set();
-  return (events || []).filter(e => {
-    const key = `${e.at}|${e.label}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  }).sort((a, b) => Number(b.at || 0) - Number(a.at || 0));
-}
+function dedupeTrackingEvents(events) { return TrackingStatus.eventsOf(events); }
 
 function normalizeRatingValue(raw) {
   const s = scalarValue(raw).replace(',', '.');
@@ -676,7 +681,21 @@ function normalizeClaimMessage(m) {
 }
 
 function normalizeClaimMessages(messages) {
-  return asArray(messages).map(normalizeClaimMessage).filter(m => m.text || (m.attachments && m.attachments.length));
+  const normalized = asArray(messages)
+    .map(normalizeClaimMessage)
+    .filter(m => m.text || (m.attachments && m.attachments.length));
+
+  // Toutes les marketplaces ne garantissent pas l'ordre des messages.
+  // On trie lorsque des dates sont disponibles afin que le statut "à répondre"
+  // soit déterminé à partir du vrai dernier message chronologique.
+  return normalized.sort((a, b) => {
+    const ta = Number(a?.at) || parseMarketplaceDate(a?.rawAt || a?.date || a?.created_at || a?.createdAt, 0);
+    const tb = Number(b?.at) || parseMarketplaceDate(b?.rawAt || b?.date || b?.created_at || b?.createdAt, 0);
+    if (!ta && !tb) return 0;
+    if (!ta) return -1;
+    if (!tb) return 1;
+    return ta - tb;
+  });
 }
 
 function asArray(v) {
@@ -1722,7 +1741,7 @@ const octopia = (() => {
       marketplaceStatus: rawStatus,
       updatedAt: parseMarketplaceDate(d.updatedAt || d.lastUpdateDate || d.lastMessageDate || d.createdAt, Date.now()),
       messages,
-      tracking: normalizeTracking(d.tracking || d.shipment || d.shipping || d.delivery, d),
+      tracking: mergeTrackingInfo(normalizeTracking(d.tracking || d.shipment || d.shipping || d.delivery, d), normalizeOrderTracking(d)),
       ctx: { discussionId, salesChannel, customerId, kind: 'discussion', marketplaceStatus: rawStatus, rawStatus, closedByMarketplace: !isOpen },
     });
   }
@@ -1798,15 +1817,27 @@ const octopia = (() => {
 
   async function enrichClaimsWithOrders(provider, claims) {
     if (String(process.env.OCTOPIA_FETCH_ORDER_DETAILS || 'true') === 'false') return claims;
-    const targets = (claims || []).filter(c => c?.orderId && (
+    // L'enrichissement ne doit jamais empêcher l'affichage des discussions.
+    // On traite en priorité les plus récentes et on borne le nombre de commandes par chargement.
+    const candidates = (claims || []).filter(c => c?.orderId && (
       !sanitizeCustomerName(c.customer) || c.customer === 'Client' || !c.ean || !c.product || !c.tracking
     ));
-    if (!targets.length) return claims;
+    if (!candidates.length) return claims;
+    const maxOrders = positiveInt(process.env.OCTOPIA_ORDER_ENRICH_MAX, 40, 0, 500);
+    if (maxOrders === 0) return claims;
+    const targets = [...candidates]
+      .sort((a,b) => Number(b.updatedAt||0)-Number(a.updatedAt||0))
+      .slice(0, maxOrders);
     const concurrency = positiveInt(process.env.OCTOPIA_ORDER_ENRICH_CONCURRENCY, 3, 1, 10);
+    const perOrderTimeoutMs = positiveInt(process.env.OCTOPIA_ORDER_ENRICH_TIMEOUT_MS, 6000, 500, 30000);
     const byOrderId = new Map();
     await mapLimit([...new Set(targets.map(c => c.orderId).filter(Boolean))], concurrency, async (orderId) => {
       try {
-        const order = await fetchOrderByKnownId(provider, orderId);
+        const order = await promiseWithTimeout(
+          fetchOrderByKnownId(provider, orderId),
+          perOrderTimeoutMs,
+          `octopia commande ${orderId}`
+        );
         if (order) byOrderId.set(orderId, octopiaOrderInfo(order));
       } catch (e) {
         console.warn(`[octopia] enrichissement commande ${orderId} ignoré: ${e.message}`);
@@ -1831,8 +1862,10 @@ const octopia = (() => {
     async fetchClaims(provider) {
       // includeMessages=LastMessage est important : sans cela l'API peut renvoyer des discussions
       // sans message, et le filtre "à répondre" les supprimait ensuite.
-      const pageSize = Number(process.env.OCTOPIA_PAGE_SIZE || 50);
-      const maxPages = Number(process.env.OCTOPIA_MAX_PAGES || 3);
+      const pageSize = positiveInt(process.env.OCTOPIA_PAGE_SIZE, 50, 1, 100);
+      // 3 pages pouvaient masquer silencieusement les discussions au-delà de 150 éléments.
+      // On continue désormais jusqu'à la fin, avec une borne de sécurité configurable.
+      const maxPages = positiveInt(process.env.OCTOPIA_MAX_PAGES, 20, 1, 100);
       const all = [];
       for (let pageIndex = 1; pageIndex <= maxPages; pageIndex++) {
         const qs = new URLSearchParams({
@@ -1844,9 +1877,26 @@ const octopia = (() => {
         const data = await api(provider, `/discussions?${qs.toString()}`);
         const items = extractList(data);
         all.push(...items.map(d => mapDiscussion(provider, d)).filter(c => c._ctx.discussionId));
-        if (!items.length || items.length < pageSize) break;
+        const total = Number(
+          data?.totalCount ?? data?.total_count ?? data?.total ?? data?.paging?.total ??
+          data?.pagination?.total ?? data?.meta?.total ?? 0
+        ) || 0;
+        if (!items.length || items.length < pageSize || (total > 0 && all.length >= total)) break;
       }
-      return enrichClaimsWithOrders(provider, all);
+      // Ne jamais perdre Cdiscount parce que l'enrichissement commandes est lent.
+      // La liste des discussions est la donnée prioritaire ; l'enrichissement est best-effort.
+      const enrichBudgetMs = positiveInt(process.env.OCTOPIA_ORDER_ENRICH_BUDGET_MS, 20000, 0, 60000);
+      if (!enrichBudgetMs) return all;
+      try {
+        return await promiseWithTimeout(
+          enrichClaimsWithOrders(provider, all),
+          enrichBudgetMs,
+          'octopia enrichissement commandes'
+        );
+      } catch (e) {
+        console.warn(`[octopia] discussions conservées sans enrichissement complet: ${e.message}`);
+        return all;
+      }
     },
 
     // Récupère et normalise le fil complet d'une discussion.
@@ -2214,7 +2264,7 @@ const mirakl = {
       updatedAt: parseMarketplaceDate(rawUpdatedAt, lastMsgAt),
       lastMessageAt: lastMsgAt,
       messages,
-      tracking: normalizeTracking(thread.tracking || thread.shipment || thread.shipping || thread.delivery, thread),
+      tracking: mergeTrackingInfo(normalizeTracking(thread.tracking || thread.shipment || thread.shipping || thread.delivery, thread), normalizeOrderTracking(thread)),
       ctx: {
         threadId: id,
         rawCreatedAt,
@@ -2235,7 +2285,9 @@ const mirakl = {
     // Une valeur 0 dans .env provoquait des appels `max=0`.
     // On borne toujours la pagination à une plage acceptée par Mirakl.
     const max = positiveInt(process.env.MIRAKL_PAGE_SIZE, 20, 1, 100);
-    const maxPages = positiveInt(process.env.MIRAKL_MAX_PAGES, 2, 1, 20);
+    // 2 pages limitaient silencieusement la récupération à 40 fils par défaut.
+    // La boucle s'arrête dès qu'une page est incomplète ; cette valeur n'est qu'un garde-fou.
+    const maxPages = positiveInt(process.env.MIRAKL_MAX_PAGES, 50, 1, 200);
     // Important : pour savoir si une réclamation est vraiment sans réponse,
     // il faut récupérer les messages. Par défaut on les demande à Mirakl.
     const withMessages = String(process.env.MIRAKL_WITH_MESSAGES || 'true') === 'true';
@@ -2508,6 +2560,29 @@ const mirakl = {
     if (!url) {
       throw Object.assign(new Error('Mirakl : URL/ID de pièce jointe absent'), {
         statusCode: 404, provider: provider.code, operation: 'downloadAttachment'
+      });
+    }
+
+    // Ne jamais transmettre la clé Mirakl à un hôte arbitraire fourni dans un message.
+    // Par défaut seules les URL du même hôte que l'API Mirakl sont autorisées.
+    // Des CDN explicitement approuvés peuvent être ajoutés avec MIRAKL_ATTACHMENT_ALLOWED_HOSTS.
+    let parsedAttachmentUrl;
+    let parsedBaseUrl;
+    try {
+      parsedAttachmentUrl = new URL(url);
+      parsedBaseUrl = new URL(base);
+    } catch (_) {
+      throw Object.assign(new Error('Mirakl : URL de pièce jointe invalide'), {
+        statusCode: 400, provider: provider.code, operation: 'downloadAttachment'
+      });
+    }
+    const extraHosts = new Set(String(process.env.MIRAKL_ATTACHMENT_ALLOWED_HOSTS || '')
+      .split(',').map(v => v.trim().toLowerCase()).filter(Boolean));
+    const sameHost = parsedAttachmentUrl.hostname.toLowerCase() === parsedBaseUrl.hostname.toLowerCase();
+    const explicitlyAllowed = extraHosts.has(parsedAttachmentUrl.hostname.toLowerCase());
+    if (!sameHost && !explicitlyAllowed) {
+      throw Object.assign(new Error(`Mirakl : hôte de pièce jointe non autorisé (${parsedAttachmentUrl.hostname})`), {
+        statusCode: 400, provider: provider.code, operation: 'downloadAttachment'
       });
     }
 
@@ -3073,9 +3148,17 @@ ${inner}
       v => bompTrackingUrlIsSafe(v)
     ));
 
-    const statusRaw = bompText(
-      obj.tracking_status, obj.delivery_status, obj.shipment_status, obj.shipping_status, obj.status, obj.state
-    ) || bompDeepText(obj, ['tracking_status', 'delivery_status', 'shipment_status', 'shipping_status', 'status', 'state']);
+    // Les champs réellement liés à la livraison priment sur l'état générique de la commande.
+    // Cas particulier Fnac/Darty : l'état BOMP `Received` signifie que la réception
+    // de la commande a été confirmée (ou considérée comme telle par la marketplace).
+    // On ne généralise surtout pas cette règle aux autres transporteurs : ailleurs,
+    // « received » peut simplement vouloir dire « reçu par le réseau logistique ».
+    const dedicatedStatusRaw = bompText(
+      obj.tracking_status, obj.delivery_status, obj.shipment_status, obj.shipping_status
+    ) || bompDeepText(obj, ['tracking_status', 'delivery_status', 'shipment_status', 'shipping_status']);
+    const genericOrderStatusRaw = bompText(obj.status, obj.state);
+    const statusRaw = dedicatedStatusRaw || genericOrderStatusRaw;
+    const bompReceiptConfirmed = /^(?:received|recu|reçu|receptionne|réceptionné)$/i.test(cleanText(statusRaw));
 
     const urlNumber = bompTrackingNumberFromUrl(directUrl);
     const carrierFromUrl = inferCarrierFromTrackingUrl(directUrl);
@@ -3085,6 +3168,12 @@ ${inner}
     let structured = null;
     if (number && bompTrackingCandidateIsSafe(number, { ...safeCtx, carrierHint: carrier || directNumber || urlNumber })) {
       structured = normalizeTracking({ number, carrier: carrier || carrierRaw, url: directUrl, status: statusRaw }, {});
+      if (structured && bompReceiptConfirmed) {
+        structured.status = 'livre';
+        structured.statusRaw = statusRaw;
+        structured.statusSource = 'marketplace';
+        structured.statusKind = 'marketplace_receipt';
+      }
     }
 
     // Les infos Fnac/Darty sont parfois uniquement dans le texte envoyé au client.
@@ -4569,166 +4658,58 @@ ${messageTo ? `    <message_to>${xmlEscape(messageTo)}</message_to>
 const ADAPTERS = { octopia, mirakl, bomp };
 
 /* =====================================================================
-   5bis) SUIVI DE LIVRAISON — API directe par transporteur
-   ---------------------------------------------------------------------
-   ⚠ NE PAS scraper les sites transporteurs (fragile, souvent bloqué, CGU).
-   Transporteurs préparés : Colissimo/La Poste, Chronopost, DPD, GLS, UPS,
-   DHL, FedEx/TNT. Chaque adaptateur renvoie le format normalisé :
-     { status:"en_transit|livre|pret_retrait|en_attente|incident",
-       etaH:<heures avant livraison|null>, events:[{at:<ISO|ms>, label:"..."}] }
-   Statut : mapStatus(label) déduit l'état à partir du libellé/code de l'événement.
-   Identifiants via variables d'environnement (voir GUIDE).
-   ⚠ Les chemins de parsing marqués TODO sont à ajuster sur une vraie réponse.
+   5bis) SUIVI DE LIVRAISON — adaptateurs vérifiés, lib/carrier-tracking.js
    =====================================================================*/
-
-// Déduction d'un statut normalisé à partir d'un texte d'événement
-function mapStatus(text) {
-  const t = (text || '').toLowerCase();
-  if (/livr|delivered|remis/.test(t)) return 'livre';
-  if (/point relais|relais|pickup|disposal|à retirer|consigne/.test(t)) return 'pret_retrait';
-  if (/incident|échec|echec|absent|retour|refus|exception|problème|anomalie|perdu/.test(t)) return 'incident';
-  if (/préparation|preparation|étiquette|label|enregistr|created|annonce|attente|pending/.test(t)) return 'en_attente';
-  if (/expédi|expedie|shipped|pris en charge|accepted|collected|achemin|transit|hub|tri|route|en cours de livraison|out for delivery|en livraison|départ|depart|arriv/.test(t)) return 'en_transit';
-  return 'inconnu';
+const { createCarrierTracking } = require('./lib/carrier-tracking');
+const carrierTracking = createCarrierTracking({fetch});
+const trackingCache = new Map();
+const trackingInflight = new Map();
+const TRACKING_CACHE_TTL = 5 * 60 * 1000;
+const TRACKING_ERROR_TTL = 5 * 60 * 1000;
+const TRACKING_FORCE_COOLDOWN = 30 * 1000;
+const TRACKING_CACHE_MAX = 1500;
+function trackingCacheKey(carrier,number,reference='') {return `${carrier}|${number.replace(/\s+/g,'').toUpperCase()}|${String(reference||'').replace(/\s+/g,'').toUpperCase()}`;}
+function trackingCachedValue(entry) {
+  if(!entry?.value)return null;
+  return entry.error?{...entry.value,verificationError:entry.error.message,verificationAt:entry.at}:entry.value;
 }
-
-// Cache de token OAuth (UPS, FedEx)
-const oauthCache = {};
-async function getOAuthToken(key, tokenUrl, body, headers) {
-  const c = oauthCache[key];
-  if (c && Date.now() < c.exp) return c.value;
-  const r = await fetch(tokenUrl, { method: 'POST', headers, body });
-  if (!r.ok) throw new Error(`${key} auth ${r.status}`);
-  const j = await r.json();
-  oauthCache[key] = { value: j.access_token, exp: Date.now() + ((j.expires_in || 3600) - 120) * 1000 };
-  return oauthCache[key].value;
+async function getCarrierTracking(carrier,number,options={}) {
+  // Valider aussi les liens fournis lorsque le résultat est déjà en cache.
+  // Une URL différente peut débloquer une lecture qui avait échoué.
+  const reference=carrier==='chezvous'?(options.reference||TrackingStatus.chezvousReferenceFromUrl(options.url||'')||number):number;
+  if(!TrackingStatus.validNumber(reference,carrier))throw Object.assign(new Error('Référence de suivi invalide.'),{code:'INVALID_TRACKING_NUMBER',statusCode:400});
+  const requestedUrl=options.url&&carrierTracking.pageTracking.configured(carrier)
+    ?carrierTracking.pageTracking.validatePageUrl(options.url,carrier,reference):'';
+  const key=trackingCacheKey(carrier,number,reference), now=Date.now();
+  const cached=trackingCache.get(key);
+  const age=cached?now-cached.at:Infinity;
+  const ttl=cached?.error?TRACKING_ERROR_TTL:TRACKING_CACHE_TTL;
+  const newUrlAfterError=Boolean(cached?.error&&requestedUrl&&requestedUrl!==cached.requestedUrl);
+  if(cached&&!newUrlAfterError&&(age<ttl&&!options.force||options.force&&age<TRACKING_FORCE_COOLDOWN)){
+    if(cached.error&&!cached.value)throw Object.assign(new Error(cached.error.message),{statusCode:cached.error.statusCode,code:cached.error.code});
+    return trackingCachedValue(cached);
+  }
+  if(trackingInflight.has(key))return trackingInflight.get(key);
+  const task=(async()=>{
+    try{
+      const value=await carrierTracking.track(carrier,number,{...options,reference});
+      // Une réponse inexploitable ne doit pas remplacer le dernier état connu.
+      const merged=cached?.value?TrackingStatus.merge(cached.value,value):value;
+      trackingCache.set(key,{at:Date.now(),value:merged,requestedUrl});
+      return merged;
+    }catch(e){
+      const entry={at:Date.now(),value:cached?.value||null,requestedUrl,error:{message:e.message,statusCode:e.statusCode||502,code:e.code||'TRACKING_UNAVAILABLE'}};
+      trackingCache.set(key,entry);
+      if(entry.value)return trackingCachedValue(entry);
+      throw e;
+    }finally{
+      trackingInflight.delete(key);
+      while(trackingCache.size>TRACKING_CACHE_MAX)trackingCache.delete(trackingCache.keys().next().value);
+    }
+  })();
+  trackingInflight.set(key,task);
+  return task;
 }
-
-const CARRIERS = {
-  // ---- Colissimo / La Poste — API "Suivi v2" (clé Okapi) ----
-  colissimo: {
-    async track(number) {
-      if (!process.env.LAPOSTE_OKAPI_KEY) throw new Error('Colissimo: clé Okapi manquante (LAPOSTE_OKAPI_KEY)');
-      const r = await fetch(`https://api.laposte.fr/suivi/v2/idships/${encodeURIComponent(number)}`,
-        { headers: { 'X-Okapi-Key': process.env.LAPOSTE_OKAPI_KEY, Accept: 'application/json' } });
-      if (!r.ok) throw new Error(`Colissimo ${r.status}`);
-      const sh = (await r.json()).shipment || {};
-      const events = (sh.event || []).map(e => ({ at: e.date, label: e.label }));
-      return { status: events[0] ? mapStatus(events[0].label) : 'inconnu', etaH: null, events };
-    },
-  },
-
-  // ---- Chronopost — WS de suivi (compte + mot de passe) ----
-  chronopost: {
-    async track(number) {
-      if (!process.env.CHRONOPOST_ACCOUNT || !process.env.CHRONOPOST_PASSWORD) throw new Error('Chronopost: identifiants manquants (CHRONOPOST_ACCOUNT/PASSWORD)');
-      // REST de suivi Chronopost (sinon WS SOAP TrackingServiceWS). TODO: ajuster selon votre contrat.
-      const u = `https://www.chronopost.fr/tracking-cxf/TrackingServiceWS/track?accountNumber=${process.env.CHRONOPOST_ACCOUNT}&password=${process.env.CHRONOPOST_PASSWORD}&skybillNumber=${encodeURIComponent(number)}&language=fr_FR`;
-      const r = await fetch(u, { headers: { Accept: 'application/json' } });
-      if (!r.ok) throw new Error(`Chronopost ${r.status}`);
-      const j = await r.json();
-      const evs = (j.listEventInfoComp || j.events || []).map(e => ({ at: e.eventDate || e.date, label: e.eventLabel || e.label })); // TODO
-      return { status: evs[0] ? mapStatus(evs[0].label) : 'inconnu', etaH: null, events: evs };
-    },
-  },
-
-  // ---- DPD France — WS de suivi (identifiants) ----
-  dpd: {
-    async track(number) {
-      if (!process.env.DPD_USER || !process.env.DPD_KEY) throw new Error('DPD: identifiants manquants (DPD_USER/DPD_KEY)');
-      // TODO: endpoint DPD France (ex-API e-station). Ajuster URL/auth selon votre contrat.
-      const r = await fetch(`https://api.dpd.fr/tracking/v1/parcels/${encodeURIComponent(number)}`,
-        { headers: { Authorization: `Bearer ${process.env.DPD_KEY}`, Accept: 'application/json' } });
-      if (!r.ok) throw new Error(`DPD ${r.status}`);
-      const j = await r.json();
-      const evs = (j.scanInfo || j.events || []).map(e => ({ at: e.date, label: e.status || e.label })); // TODO
-      return { status: evs[0] ? mapStatus(evs[0].label) : 'inconnu', etaH: null, events: evs };
-    },
-  },
-
-  // ---- GLS — Track & Trace REST (identifiants) ----
-  gls: {
-    async track(number) {
-      if (!process.env.GLS_USER || !process.env.GLS_PASSWORD) throw new Error('GLS: identifiants manquants (GLS_USER/GLS_PASSWORD)');
-      const auth = Buffer.from(`${process.env.GLS_USER}:${process.env.GLS_PASSWORD}`).toString('base64');
-      const r = await fetch(`https://api.gls-group.eu/public/v1/tracking/references/${encodeURIComponent(number)}`,
-        { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } });
-      if (!r.ok) throw new Error(`GLS ${r.status}`);
-      const j = await r.json();
-      const p = (j.parcels && j.parcels[0]) || {};
-      const evs = (p.events || []).map(e => ({ at: e.timestamp, label: e.description })); // TODO
-      return { status: evs[0] ? mapStatus(evs[0].label) : 'inconnu', etaH: null, events: evs };
-    },
-  },
-
-  // ---- UPS — Tracking API (OAuth client_credentials) ----
-  ups: {
-    async track(number) {
-      if (!process.env.UPS_CLIENT_ID || !process.env.UPS_CLIENT_SECRET) throw new Error('UPS: identifiants manquants (UPS_CLIENT_ID/SECRET)');
-      const basic = Buffer.from(`${process.env.UPS_CLIENT_ID}:${process.env.UPS_CLIENT_SECRET}`).toString('base64');
-      const token = await getOAuthToken('ups', 'https://onlinetools.ups.com/security/v1/oauth/token',
-        'grant_type=client_credentials', { Authorization: `Basic ${basic}`, 'Content-Type': 'application/x-www-form-urlencoded' });
-      const r = await fetch(`https://onlinetools.ups.com/api/track/v1/details/${encodeURIComponent(number)}`,
-        { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' } });
-      if (!r.ok) throw new Error(`UPS ${r.status}`);
-      const j = await r.json();
-      const pkg = j.trackResponse?.shipment?.[0]?.package?.[0] || {};
-      const evs = (pkg.activity || []).map(a => ({ at: `${a.date} ${a.time}`, label: a.status?.description })); // TODO
-      return { status: evs[0] ? mapStatus(evs[0].label) : 'inconnu', etaH: null, events: evs };
-    },
-  },
-
-  // ---- DHL — Shipment Tracking Unified API (clé API) ----
-  dhl: {
-    async track(number) {
-      if (!process.env.DHL_API_KEY) throw new Error('DHL: clé manquante (DHL_API_KEY)');
-      const r = await fetch(`https://api-eu.dhl.com/track/shipments?trackingNumber=${encodeURIComponent(number)}`,
-        { headers: { 'DHL-API-Key': process.env.DHL_API_KEY, Accept: 'application/json' } });
-      if (!r.ok) throw new Error(`DHL ${r.status}`);
-      const s = (await r.json()).shipments?.[0] || {};
-      const evs = (s.events || []).map(e => ({ at: e.timestamp, label: e.description || e.status }));
-      return {
-        status: s.status?.statusCode === 'delivered' ? 'livre' : (evs[0] ? mapStatus(evs[0].label) : 'inconnu'),
-        etaH: null, events: evs
-      };
-    },
-  },
-
-  // ---- FedEx (et TNT, réseau FedEx) — Track API (OAuth) ----
-  fedex: {
-    async track(number) {
-      if (!process.env.FEDEX_CLIENT_ID || !process.env.FEDEX_CLIENT_SECRET) throw new Error('FedEx: identifiants manquants (FEDEX_CLIENT_ID/SECRET)');
-      const token = await getOAuthToken('fedex', 'https://apis.fedex.com/oauth/token',
-        `grant_type=client_credentials&client_id=${process.env.FEDEX_CLIENT_ID}&client_secret=${process.env.FEDEX_CLIENT_SECRET}`,
-        { 'Content-Type': 'application/x-www-form-urlencoded' });
-      const r = await fetch('https://apis.fedex.com/track/v1/trackingnumbers', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ trackingInfo: [{ trackingNumberInfo: { trackingNumber: number } }], includeDetailedScans: true })
-      });
-      if (!r.ok) throw new Error(`FedEx ${r.status}`);
-      const j = await r.json();
-      const tr = j.output?.completeTrackResults?.[0]?.trackResults?.[0] || {};
-      const evs = (tr.scanEvents || []).map(e => ({ at: e.date, label: e.eventDescription }));
-      return { status: evs[0] ? mapStatus(evs[0].label) : 'inconnu', etaH: null, events: evs };
-    },
-  },
-  tnt: { async track(n) { return CARRIERS.fedex.track(n); } },  // TNT suivi via le réseau FedEx
-
-  // ---- ChezVous (livraison à domicile) — API à brancher ----
-  chezvous: {
-    async track(number) {
-      if (!process.env.CHEZVOUS_KEY) throw new Error('ChezVous: clé manquante (CHEZVOUS_KEY)');
-      // TODO: endpoint/auth ChezVous à confirmer auprès du transporteur.
-      const r = await fetch(`https://api.chezvous.fr/tracking/${encodeURIComponent(number)}`,
-        { headers: { Authorization: `Bearer ${process.env.CHEZVOUS_KEY}`, Accept: 'application/json' } });
-      if (!r.ok) throw new Error(`ChezVous ${r.status}`);
-      const j = await r.json();
-      const evs = (j.events || []).map(e => ({ at: e.date, label: e.label || e.status })); // TODO
-      return { status: evs[0] ? mapStatus(evs[0].label) : 'inconnu', etaH: null, events: evs };
-    },
-  },
-};
 
 /* =====================================================================
    6) ROUTES EXPOSÉES À LA PAGE
@@ -4787,6 +4768,12 @@ function claimNeedsReply(claim) {
 
   // Flags explicites renvoyés par la marketplace ou déduits au mapping.
   if (ctx.waitingForSeller === true || ctx.needsReply === true) return true;
+
+  // Octopia : une discussion ouverte sans LastMessage exploitable doit rester visible.
+  // La liste Octopia peut omettre/retarder ce message ; la supprimer ici créait de faux négatifs.
+  if (claim.marketplace && !['fnac','darty'].includes(String(claim.marketplace).toLowerCase()) && ctx.kind === 'discussion' && ctx.closedByMarketplace !== true) {
+    return true;
+  }
 
   // Cas BOMP : sans fil de messages et sans waiting_for_seller_answer, on ne garde pas.
   if (isBomp && ctx.kind === 'incident' && ctx.incidentId) return false;
@@ -4855,9 +4842,9 @@ function claimIsRecentEnough(claim, maxAgeDays) {
 function resolveMaxAgeDays(req, onlyUnanswered, provider = null) {
   const explicit = req.query.days || req.query.maxAgeDays;
   const providerDefault = provider?.type === 'bomp' ? process.env.BOMP_MAX_AGE_DAYS : undefined;
-  const raw = explicit || providerDefault || process.env.RECLAMATIONS_MAX_AGE_DAYS || (onlyUnanswered ? 45 : 0);
+  const raw = explicit || providerDefault || process.env.RECLAMATIONS_MAX_AGE_DAYS || (onlyUnanswered ? 90 : 0);
   const days = Number(raw);
-  return Number.isFinite(days) ? days : 45;
+  return Number.isFinite(days) ? days : 90;
 }
 function shouldFetchDetailForReplySignal(provider, claim) {
   if (!provider || !claim) return false;
@@ -6166,18 +6153,27 @@ app.post('/api/reclamations/threads/:id/message', async (req, res) => {
     res.status(payload.status >= 400 && payload.status < 500 ? payload.status : 502).json(payload);
   }
 });
-// Suivi de livraison : GET /api/reclamations/tracking?carrier=colissimo&number=...
+// Suivi de livraison : état réel, provenance et date de vérification.
 app.get('/api/reclamations/tracking', async (req, res) => {
-  try {
-    const { carrier, number } = req.query;
-    const c = CARRIERS[String(carrier || '').toLowerCase()];
-    if (!c) throw new Error('Transporteur non géré : ' + carrier);
-    if (!number) throw new Error('Numéro de suivi manquant');
-    const data = await c.track(number);   // { status, etaH, events:[{at,label}] }
-    res.json(normalizeTracking({ ...(data || {}), carrier, number }, data || { carrier, number }));
-  } catch (e) {
-    res.status(502).json({ error: e.message });
+  const carrier=String(req.query.carrier||'').toLowerCase();
+  const number=String(req.query.number||'').replace(/\s+/g,'').toUpperCase();
+  if (!TrackingStatus.validNumber(number,carrier)) {
+    return res.status(400).json({error:'Numéro de suivi invalide.',code:'INVALID_TRACKING_NUMBER'});
   }
+  if(!carrierTracking.supported.has(carrier) || !carrierTracking.configured(carrier)) {
+    return res.status(503).json({error:`Suivi ${carrier||'transporteur'} non configuré.`,code:'TRACKING_NOT_CONFIGURED'});
+  }
+  try {
+    // Le serveur vérifie lui-même le domaine et le numéro avant toute requête.
+    const data=await getCarrierTracking(carrier,number,{force:req.query.force==='1',url:String(req.query.url||''),reference:String(req.query.reference||'')});
+    res.setHeader('Cache-Control','private, no-store');
+    res.json(data);
+  }catch(e){
+    res.status([400,429,502,503,504].includes(e.statusCode)?e.statusCode:502).json({error:e.message,code:e.code||'TRACKING_UNAVAILABLE'});
+  }
+});
+app.get('/api/reclamations/tracking-config', (_req,res) => {
+  res.json({carriers:Object.fromEntries([...carrierTracking.supported].map(c=>[c,{configured:carrierTracking.configured(c),api:carrierTracking.apiConfigured(c),publicApi:carrierTracking.publicApiConfigured(c),page:carrierTracking.pageTracking.configured(c),browser:carrierTracking.pageTracking.browserConfigured()}]))});
 });
 
 const PORT = process.env.PORT || 8787;

@@ -28,3 +28,24 @@ Après chaque modification des variables, utilisez **Save, rebuild, and deploy**
 
 - `/api/auth/status` : état de la configuration des comptes ;
 - `/api/reclamations/ai/health` : état de la clé et du modèle Groq, après connexion.
+
+## Installation des dépendances
+
+Ne versionnez pas et ne déployez pas le dossier `node_modules` provenant d'une archive locale. Après clonage/extraction, utilisez :
+
+```bash
+npm ci
+```
+
+Le fichier `package-lock.json` fixe les versions attendues.
+
+### Pagination et pièces jointes
+
+Variables optionnelles :
+
+```env
+OCTOPIA_MAX_PAGES=20
+MIRAKL_MAX_PAGES=50
+# Seulement si Mirakl fournit des pièces jointes depuis un CDN distinct :
+MIRAKL_ATTACHMENT_ALLOWED_HOSTS=cdn.exemple.com,files.exemple.com
+```

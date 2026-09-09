@@ -428,7 +428,42 @@
   .td-head .meta .missing-ean{color:var(--muted);font-style:italic}
   .tags{display:flex;gap:7px;flex-wrap:wrap;margin-top:12px}
   .tags .st{background:rgba(255,255,255,.15)!important;color:#fff!important}
-  .drawer-body{padding:20px 22px;overflow-y:auto;flex:1}
+  .drawer-head,.drawer-foot{flex-shrink:0}
+  /* Le suivi est ancré dans le panneau, hors du défilement des messages. */
+  .drawer-tracking{flex:0 1 auto;min-height:0;max-height:min(42dvh,360px);overflow-y:auto;
+    overscroll-behavior:contain;background:var(--surface);border-bottom:1px solid var(--line);
+    box-shadow:0 5px 15px rgba(22,54,94,.08);position:relative;z-index:1}
+  .drawer-tracking .track{margin:0;border:0;border-radius:0;box-shadow:none;padding:12px 22px}
+  .drawer-tracking .track-head{margin-bottom:8px}
+  .drawer-tracking .track-row{margin-bottom:5px}
+  .drawer-tracking .track-eta{margin-bottom:5px;line-height:1.4}
+  .drawer-tracking .track-summary{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
+  .drawer-tracking .track-summary .track-eta{flex:1;min-width:0}
+  .drawer-tracking .track-link{margin:0;white-space:nowrap}
+  .track-extra{border-top:1px solid var(--line);margin-top:8px;padding-top:7px}
+  .track-extra summary{cursor:pointer;color:var(--navy);font-size:12px;font-weight:700;list-style:none;
+    display:flex;align-items:center;gap:6px;user-select:none}
+  .track-extra summary::-webkit-details-marker{display:none}
+  .track-extra summary::before{content:'▸';font-size:14px;transition:transform .15s}
+  .track-extra[open] summary::before{transform:rotate(90deg)}
+  .track-extra summary:hover{text-decoration:underline}
+  .track-extra summary:focus-visible{outline:2px solid var(--navy);outline-offset:3px;border-radius:3px}
+  .track-extra-body{padding-top:11px;display:flex;flex-direction:column;gap:9px}
+  .drawer-body{padding:20px 22px;overflow-y:auto;flex:1;min-height:0;overscroll-behavior:contain;scrollbar-gutter:stable}
+  @media(max-height:650px){
+    .drawer-head{padding:9px 16px;flex:0 1 auto;min-height:0;max-height:24dvh;overflow-y:auto}
+    .drawer-foot{padding:9px 16px;flex:0 1 auto;min-height:0;max-height:27dvh;overflow-y:auto}
+    .drawer-body{min-height:120px}
+    .drawer .drawer-foot textarea{min-height:48px;height:48px;max-height:14dvh}
+    .drawer-tracking{max-height:30dvh}
+    .drawer-tracking .track{padding:9px 16px}
+    .drawer-body{padding:12px 16px}
+  }
+  @media(max-width:600px){
+    .drawer{width:100%;max-width:100vw}
+    .drawer-tracking .track-summary{align-items:flex-start;flex-direction:column;gap:4px}
+    .drawer-tracking .track-link{white-space:normal}
+  }
   .bubble{max-width:80%;padding:11px 14px;border-radius:14px;margin-bottom:13px;font-size:13px;position:relative;box-shadow:var(--shadow)}
   .bubble .who{font-size:11px;font-weight:700;margin-bottom:4px;opacity:.7}
   .bubble .t{font-size:10.5px;opacity:.55;margin-top:5px;text-align:right}
@@ -460,6 +495,7 @@
   .car-logo{width:22px;height:22px;border-radius:5px;object-fit:contain;background:#fff;border:1px solid var(--line);display:inline-block;vertical-align:middle}
   .car-ic{display:inline-block;font-size:9.5px;font-weight:800;padding:2px 7px;border-radius:5px;letter-spacing:.2px;vertical-align:middle}
   .trk-bar{display:inline-flex;gap:4px;vertical-align:middle}
+  .trk-status-label{display:block;font-size:10.5px;color:var(--muted);margin-top:4px;line-height:1.3;font-weight:600;max-width:190px;overflow:hidden;text-overflow:ellipsis;overflow-wrap:anywhere}
   .trk-seg{width:15px;height:5px;border-radius:3px;background:var(--line-2)}
   .drawer-foot{padding:15px 22px;border-top:1px solid var(--line);background:var(--surface)}
   .foot-top{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
@@ -966,7 +1002,8 @@
     <div class="dmeta" id="dMeta"></div>
     <div class="tags" id="dTags"></div>
   </div>
-  <div class="drawer-body" id="dBody"></div>
+  <section class="drawer-tracking" id="dTracking" aria-label="Suivi de livraison"></section>
+  <div class="drawer-body" id="dBody" role="log" aria-label="Messages de la conversation" aria-live="off"></div>
   <div class="drawer-foot">
     <div class="foot-top">
       <span class="lbl">Votre réponse au client</span>
@@ -1011,6 +1048,7 @@
 
 <div class="toast" id="toast"></div>
 
+<script src="/tracking-status.js"></script>
 <script>
 /* =====================================================================
    THEME — identité affichée (logo géré dans le <header> en SVG/IMG)
@@ -1255,11 +1293,11 @@ function cleanTrackingText(v){
 function foldTrackText(v){
   return cleanTrackingText(v).normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase();
 }
-function looksLikeTrackingNumberUi(v){
+function looksLikeTrackingNumberUi(v,carrier=''){
   const s=cleanTrackingText(v).replace(/\s+/g,"");
   if(!s || s.length<6 || s.length>60) return false;
   if(/^https?:/i.test(s)) return false;
-  if(!/[0-9]/.test(s)) return false;
+  if(!/[0-9]/.test(s)&&carrier!=='chezvous') return false;
   if(/[@]/.test(s)) return false;
   return /^[A-Z0-9._\-]+$/i.test(s);
 }
@@ -1318,51 +1356,60 @@ function normalizeCarrierUi(raw,number="",url=""){
   if(/^GEODIS/i.test(n)) return "geodis";
   return "transporteur";
 }
-function normalizeTrackStatusUi(raw,events=[]){
-  const s=foldTrackText([raw,...(events||[]).map(e=>e&&e.label)].filter(Boolean).join(" "));
-  // Un numéro de suivi seul = suivi disponible, pas forcément en transit.
-  if(!s) return "inconnu";
-  if(/livr|delivered|remis/.test(s)) return "livre";
-  if(/point relais|relais|pickup|a retirer|consigne|disponible/.test(s)) return "pret_retrait";
-  if(/incident|echec|absent|retour|refus|exception|probleme|anomalie|perdu/.test(s)) return "incident";
-  if(/preparation|etiquette|label|enregistr|created|annonce|attente|pending/.test(s)) return "en_attente";
-  if(/expedi|expédie|expedie|shipped|pris en charge|accepted|collected|achemin|transit|hub|tri|route|en cours de livraison|out for delivery|en livraison|depart|arrive/.test(s)) return "en_transit";
-  return "inconnu";
+function normalizeTrackStatusUi(raw,events=[],carrier=""){
+  return TrackingStatus.pick(raw,TrackingStatus.eventsOf(events,carrier),carrier).status;
 }
-function parseTrackDate(v){
-  if(v==null || v==="") return null;
-  if(typeof v==="number") return String(Math.abs(v)).length>=13 ? v : v*1000;
-  if(/^\d+$/.test(String(v))) { const n=Number(v); return String(Math.abs(n)).length>=13 ? n : n*1000; }
-  const t=new Date(v).getTime();
-  return Number.isNaN(t)?null:t;
-}
-function normalizeTrackEventUi(e){
-  if(!e) return null;
-  if(typeof e==="string") return {at:Date.now(),label:cleanTrackingText(e)};
-  const label=cleanTrackingText(e.label || e.description || e.status || e.eventLabel || e.event_label || e.message || e.libelle || e.activity || "");
-  const at=parseTrackDate(e.at || e.date || e.eventDate || e.event_date || e.timestamp || e.datetime || e.created_at) || (e.h!=null ? Date.now()-Number(e.h)*H : Date.now());
-  return label ? {at,label} : null;
-}
+function parseTrackDate(v){return TrackingStatus.date(v);}
+function normalizeTrackEventUi(e){return TrackingStatus.event(e);}
 function normalizeDisplayTracking(raw){
   if(!raw) return null;
-  if(typeof raw==="string") return looksLikeTrackingNumberUi(raw) ? {carrier:normalizeCarrierUi("",raw),number:cleanTrackingText(raw),status:"inconnu",etaH:null,events:[]} : null;
+  if(typeof raw==="string") return looksLikeTrackingNumberUi(raw) ? TrackingStatus.normalize({carrier:normalizeCarrierUi("",raw),number:cleanTrackingText(raw),status:"inconnu"}) : null;
   const number=cleanTrackingText(raw.number || raw.trackingNumber || raw.tracking_number || raw.trackingCode || raw.tracking_code || raw.trackingId || raw.tracking_id || raw.parcelNumber || raw.parcel_number || raw.shipmentNumber || raw.shipment_number || raw.shipping_number || raw.awb || raw.waybill || "");
   let n=number;
   const directUrl=safeTrackingUrlUi(raw.url || raw.trackingUrl || raw.tracking_url || "");
-  if(!looksLikeTrackingNumberUi(n) && directUrl){
+  const hint=normalizeCarrierUi(raw.carrier||raw.carrierCode||raw.carrier_name||raw.carrierName||raw.transporteur||raw.shippingCarrier||raw.shipping_carrier||'',n,directUrl);
+  if(!looksLikeTrackingNumberUi(n,hint) && directUrl){
     const m=directUrl.match(/[?&](?:code|tracking-id|trackingNumber|tracking_number|tracknum|listeNumerosLT|match|numColis|numeroExpedition|cons)=([^&]+)/i);
     n=m?decodeURIComponent(m[1]):"";
+    if(!n&&['dpd','chezvous'].includes(inferCarrierFromUrlUi(directUrl))){try{n=decodeURIComponent(new URL(directUrl).pathname.split('/').filter(Boolean).at(-1)||'');}catch{}}
   }
-  if(!looksLikeTrackingNumberUi(n)) return null;
-  const evSrc=Array.isArray(raw.events)?raw.events:(Array.isArray(raw.history)?raw.history:[]);
-  const events=evSrc.map(normalizeTrackEventUi).filter(Boolean).sort((a,b)=>(b.at||0)-(a.at||0)).slice(0,20);
+  if(!looksLikeTrackingNumberUi(n,hint)) return null;
   const carrier=normalizeCarrierUi(
     raw.carrier || raw.carrierCode || raw.carrier_code || raw.carrierName || raw.carrier_name || raw.transporteur || raw.transporter ||
     raw.shippingCarrier || raw.shipping_carrier || raw.shippingCompany || raw.shipping_company || raw.shippingTypeLabel || raw.shipping_type_label || raw.shippingTypeCode || raw.shipping_type_code || "",
-    n,
-    directUrl
+    n,directUrl
   );
-  return {carrier,number:n,status:normalizeTrackStatusUi(raw.status || raw.tracking_status || raw.delivery_status || raw.shipment_status, events),etaH:raw.etaH ?? raw.eta ?? null,events,...(directUrl?{url:directUrl}:{})};
+  return TrackingStatus.normalize({...raw,carrier,number:n,...(directUrl?{url:directUrl}:{})});
+}
+function normalizeDisplayTrackingForMarketplace(raw,marketplace){
+  const t=normalizeDisplayTracking(raw);
+  if(!t)return t;
+  const mp=String(marketplace||'').toLowerCase();
+  const rawStatus=TrackingStatus.statusText(t.statusRaw||t.status);
+  // Sur Fnac/Darty (BOMP), `Received` correspond à une réception confirmée
+  // de la commande. Cette règle est volontairement limitée à ces marketplaces.
+  if((mp==='fnac'||mp==='darty') && /^(?:received|recu|reçu|receptionne|réceptionné)$/i.test(rawStatus)){
+    t.status='livre';
+    t.statusRaw=rawStatus;
+    t.statusSource='marketplace';
+    t.statusKind='marketplace_receipt';
+  }
+  return t;
+}
+function trackingPageUrlUi(t){
+  if(!t||!t.url||!['dpd','gls','chezvous'].includes(t.carrier))return '';
+  try{
+    const u=new URL(t.url);
+    const hosts={dpd:['trace.dpd.fr'],gls:['gls-group.com','www.gls-group.com','gls-group.eu','www.gls-group.eu','gls-france.com','www.gls-france.com'],chezvous:['cchezvous.fr','www.cchezvous.fr']};
+    if(u.protocol!=='https:'||u.username||u.password||u.port||!hosts[t.carrier].includes(u.hostname.toLowerCase()))return '';
+    const path=t.carrier==='dpd'?/^\/(?:trace-particuliers|fr\/trace)\/[a-z0-9._-]{6,60}\/?$/i:t.carrier==='gls'?/^\/(?:FR\/(?:fr|en)\/)?(?:suivi-colis|parcel-tracking)\/?$/i:/^\/suivi-colis\/[a-z0-9._-]{6,60}\/?$/i;
+    if(!path.test(u.pathname))return '';
+    const n=String(t.carrier==='chezvous'?(t.orderReference||t.number):t.number||'').replace(/[^a-z0-9]/gi,'').toUpperCase();
+    const matches=v=>{const x=String(v||'').replace(/[^a-z0-9]/gi,'').toUpperCase();if(x===n)return true;if(t.carrier!=='dpd'||!/^\d+$/.test(x)||!/^\d+$/.test(n))return false;const short=x.length<n.length?x:n,long=x.length<n.length?n:x;return [14,15].includes(short.length)&&long.length===short.length+3&&long.startsWith(short);};
+    if(t.carrier!=='gls'&&!matches(decodeURIComponent(u.pathname.split('/').filter(Boolean).at(-1)||'') )&&!(t.carrier==='chezvous'&&TrackingStatus.chezvousReferenceFromUrl(u.toString())===t.orderReference))return '';
+    if([...u.searchParams.entries()].some(([k,v])=>!['match','parcelnumber','trackingnumber','tracking_number','tracking-id','code','lang','locale'].includes(k.toLowerCase())||!['lang','locale'].includes(k.toLowerCase())&&!matches(v)))return '';
+    return u.toString();
+  }catch{return '';}
 }
 function trackingExternalUrl(t){
   if(!t) return "";
@@ -1371,8 +1418,24 @@ function trackingExternalUrl(t){
   return car.url ? car.url.replace("{n}",encodeURIComponent(t.number||"")) : "";
 }
 function trackingStatusInfo(t){
-  const key=normalizeTrackStatusUi(t&&t.status,t&&t.events);
-  return TSTATUS[key] || TSTATUS.inconnu;
+  const key=normalizeTrackStatusUi(t&&TrackingStatus.statusCandidate([t.status,t.statusRaw,t.tracking_status,t.delivery_status,t.shipping_status],t.carrier),t&&t.events,t&&t.carrier);
+  const base=TSTATUS[key] || TSTATUS.inconnu;
+  const raw=TrackingStatus.statusText(t&&t.statusRaw);
+  if(key==='inconnu'){
+    const meaningful=raw && !/^(?:unknown|inconnu|n\/?a|undefined|null|open|opened|closed|close|new|nouveau|paid|payment pending|pending payment|cancelled|canceled|resolved|resolu)$/i.test(raw);
+    return {...base,label:meaningful?'Statut : '+raw.slice(0,90):base.label};
+  }
+  if(t&&t.statusSource==='commande'){
+    return {...base,label:key==='en_transit'?'Expédié (commande)':key==='en_attente'?'En préparation (commande)':base.label};
+  }
+  return base;
+}
+function trackingSourceLabel(t){
+  if(!t)return 'Aucune information de suivi';
+  if(t.statusSource==='transporteur')return t.status==='inconnu'?'Transporteur interrogé — état non exploitable':t.statusMethod==='page'?'Statut lu sur la page publique du transporteur':'Statut vérifié auprès du transporteur';
+  if(t.statusSource==='commande')return 'État de commande communiqué par la marketplace, pas un suivi transporteur';
+  if(t.statusSource==='marketplace')return 'Statut communiqué par la marketplace, non confirmé auprès du transporteur';
+  return 'Aucun état de livraison exploitable communiqué';
 }
 
 
@@ -1549,13 +1612,14 @@ function normalizeClaim(c){
     lastClientMessageAt: lastClientMessage,
     dueAt: tsSafe(c.dueAt, Date.now() + 24 * 3600 * 1000),
     messages,
-    tracking: normalizeDisplayTracking(c.tracking || {
+    tracking: normalizeDisplayTrackingForMarketplace(c.tracking || {
       number: c.trackingNumber || c.tracking_number || c.trackingCode || c.tracking_code || c.parcelNumber || c.parcel_number || c.shipmentNumber || c.shipment_number || c.awb || c.waybill,
       carrier: c.carrier || c.carrierCode || c.carrier_code || c.carrierName || c.carrier_name || c.transporteur || c.transporter || c.shippingCarrier || c.shipping_carrier,
-      status: c.trackingStatus || c.tracking_status || c.deliveryStatus || c.delivery_status || c.shipmentStatus || c.shipment_status,
+      status: c.trackingStatus || c.tracking_status || c.deliveryStatus || c.delivery_status || c.shipmentStatus || c.shipment_status || c.shippingStatus || c.shipping_status,
+      statusRaw: c.trackingStatusRaw || c.tracking_status_raw || '',
       events: c.trackingEvents || c.tracking_events || c.events,
       url: c.trackingUrl || c.tracking_url
-    }),
+    }, c.marketplace),
     _detailLoaded: Boolean(c._detailLoaded),
   };
 }
@@ -1685,6 +1749,8 @@ const DataAPI = {
   if(options.refresh) params.set('refresh','1');
   if(options.providers) params.set('providers', options.providers);
   if(options.enrichDetails) params.set('enrichDetails','1');
+  if(options.all) params.set('all','1');
+  if(options.days!=null) params.set('days', String(options.days));
 
   const r = await apiFetch(`${CONFIG.API_BASE}/threads?${params.toString()}`, {
     headers:{'Accept':'application/json'}
@@ -1959,14 +2025,27 @@ const DataAPI = {
     }
     return await r.json();
   },
-  /* Récupération automatique du suivi auprès du transporteur (via le proxy).
-     En démo, on renvoie le suivi déjà présent sur la réclamation. */
-  async fetchTracking(carrier,number){
-    if(CONFIG.USE_DEMO_DATA){ await new Promise(r=>setTimeout(r,500)); return null; }
-    const r = await apiFetch(`${CONFIG.API_BASE}/tracking?carrier=${encodeURIComponent(carrier)}&number=${encodeURIComponent(number)}`,
-      {headers:{'Accept':'application/json'}});
-    if(!r.ok) throw new Error("Suivi indisponible ("+r.status+")");
-    return await r.json();   // { status, etaH|eta, events:[{h|at,label}] }
+  /* Statut transporteur réel, jamais un statut de commande déduit. */
+  async fetchTracking(carrier,number,options={}){
+    if(CONFIG.USE_DEMO_DATA) return null;
+    const params=new URLSearchParams({carrier,number});
+    if(options.force) params.set('force','1');
+    if(options.url)params.set('url',options.url);
+    if(options.reference)params.set('reference',options.reference);
+    const r=await apiFetch(`${CONFIG.API_BASE}/tracking?${params}`,{headers:{'Accept':'application/json'}});
+    if(!r.ok){
+      let payload={};try{payload=await r.json();}catch(e){}
+      const error=new Error(payload.error||`Suivi indisponible (${r.status})`);
+      error.code=payload.code||'TRACKING_UNAVAILABLE';error.status=r.status;
+      throw error;
+    }
+    return await r.json();
+  },
+  async fetchTrackingConfig(){
+    if(CONFIG.USE_DEMO_DATA) return {carriers:{}};
+    const r=await apiFetch(`${CONFIG.API_BASE}/tracking-config`,{headers:{'Accept':'application/json'}});
+    if(!r.ok)throw new Error('Configuration des suivis indisponible');
+    return await r.json();
   },
   async fetchIncidents(options={}){
     if(CONFIG.USE_DEMO_DATA){
@@ -2055,7 +2134,7 @@ const CARRIERS={
 };
 const carrierOf=c=>CARRIERS[c]||{label:c||"Transporteur",bg:"#6b7689",fg:"#fff",dom:"",url:""};
 const TSTATUS={
-  inconnu:{label:"Suivi disponible",cls:"ts-unknown",color:"#97a1b3",step:1},
+  inconnu:{label:"Statut indisponible",cls:"ts-unknown",color:"#97a1b3",step:0},
   en_attente:{label:"En préparation",cls:"ts-wait",color:"#97a1b3",step:1},
   en_transit:{label:"En transit",cls:"ts-transit",color:"#d98a07",step:2},
   pret_retrait:{label:"Prêt en point relais",cls:"ts-relay",color:"#6d54c8",step:2},
@@ -2077,7 +2156,11 @@ function trackBar(t){
   const ts=trackingStatusInfo(t);
   const col=STEP_COLOR[ts.step]||"#97a1b3";
   const segs=[1,2,3].map(i=>`<span class="trk-seg" style="${i<=ts.step?`background:${col}`:''}"></span>`).join("");
-  return `<span class="trk-bar" title="${ts.label}">${segs}</span>`;
+  const source=trackingSourceLabel(t);
+  const date=t.checkedAt ? ` · vérifié le ${fmtDate(t.checkedAt)}` : '';
+  const raw=t.statusRaw ? ` · ${TrackingStatus.statusText(t.statusRaw)}` : '';
+  const warning=t.verificationError?' · Dernière vérification échouée : '+t.verificationError:'';
+  return `<span class="trk-bar" title="${esc(ts.label+' · '+source+raw+date+warning)}" aria-label="${esc(ts.label+' · '+source)}">${segs}</span><span class="trk-status-label" title="${esc(ts.label+' · '+source+raw+date+warning)}">${esc(ts.label)}</span>${t.verificationError?`<span class="meta" title="${esc(t.verificationError)}"> ⚠</span>`:''}`;
 }
 
 /* ===== Données de démonstration ===== */
@@ -2238,9 +2321,12 @@ let currentUser="Agent";       // défini par la session authentifiée
 
 let claims=[], sort={key:"updatedAt",dir:-1}, selectedId=null; // défaut : du plus récent au plus ancien
 let notesLoading=false, notesLoaded=CONFIG.USE_DEMO_DATA;
+let claimsScopeUnansweredOnly=true; // le chargement standard cible les dossiers à répondre
 const RECLAM_PER_PAGE=25; let reclamPage=1;                    // pagination des réclamations (25/page)
-function answered(c){ const m=(c&&c.messages)||[]; return !!(m.length && m[m.length-1].from==="seller"); }  // traitée = dernier message vendeur
-function everReplied(c){ return ((c&&c.messages)||[]).some(m=>m.from==="seller"); }  // a-t-on déjà répondu au moins une fois ?
+function msgTime(m){ const t=Number(m&&m.at); return Number.isFinite(t)?t:0; }
+function orderedMessages(c){ return ((c&&c.messages)||[]).filter(Boolean).slice().sort((a,b)=>msgTime(a)-msgTime(b)); }
+function answered(c){ const m=orderedMessages(c); return !!(m.length && m[m.length-1].from==="seller"); }  // traitée = vrai dernier message chronologique vendeur
+function everReplied(c){ return orderedMessages(c).some(m=>m.from==="seller"); }  // a-t-on déjà répondu au moins une fois ?
 function foldUiStatusText(v){ return String(v||"").normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().trim(); }
 function isClosedUiStatus(raw){
   const s=foldUiStatusText(raw);
@@ -2255,7 +2341,7 @@ function isMarketplaceClosed(c){
 }
 function businessStatus(c){
   if(isMarketplaceClosed(c)) return "resolu";
-  const m=((c&&c.messages)||[]).filter(x=>x && (x.from==="client" || x.from==="seller"));
+  const m=orderedMessages(c).filter(x=>x && (x.from==="client" || x.from==="seller"));
   const last=m[m.length-1];
   const hasSeller=m.some(x=>x.from==="seller");
   // Métier 2KINGS : si le client relance après une première réponse, ce n'est plus "Nouveau" mais "Répondu".
@@ -2274,9 +2360,9 @@ function statusBadge(c){
   return `<span class="st ${st.cls}"${title}>${st.label}</span>`;
 }
 /* Dernier agent ayant répondu (auteur du dernier message vendeur) */
-function lastAgent(c){ const m=c.messages||[]; for(let i=m.length-1;i>=0;i--){ if(m[i].from==="seller") return m[i].author||"Agent"; } return null; }
+function lastAgent(c){ const m=orderedMessages(c); for(let i=m.length-1;i>=0;i--){ if(m[i].from==="seller") return m[i].author||"Agent"; } return null; }
 /* Date du dernier message client */
-function lastClientAt(c){ const m=(c.messages||[]).filter(x=>x.from==="client"); return m.length?m[m.length-1].at:null; }
+function lastClientAt(c){ const m=orderedMessages(c).filter(x=>x.from==="client"); return m.length?m[m.length-1].at:null; }
 const AGENT_AV={Claude:{bg:"#16365E",t:"🤖"},Sandy:{bg:"#ec4899",t:"S"},Guillaume:{bg:"#0082c3",t:"G"}};
 function agentAvatar(name){ if(!name) return ""; const a=AGENT_AV[name]||{bg:"#6b7689",t:(name[0]||"?").toUpperCase()};
   return `<span class="agent-av" style="background:${a.bg}" title="Dernière réponse : ${name}">${a.t}</span>`; }
@@ -2493,9 +2579,9 @@ function trackHeader(c){
   const car=carrierOf(t.carrier), ts=trackingStatusInfo(t);
   const url=trackingExternalUrl(t);
   return `<div class="td-track">📦
-    <span class="carrier-badge" style="background:${car.bg};color:${car.fg}">${car.label}</span>
-    <span class="ordref" id="trackNum">${t.number}</span>
-    <span class="tstatus ${ts.cls}">${ts.label}</span>
+    <span class="carrier-badge" style="background:${car.bg};color:${car.fg}">${esc(car.label)}</span>
+    <span class="ordref" id="trackNum">${esc(t.number)}</span>
+    <span class="tstatus ${ts.cls}">${esc(ts.label)}</span>
     ${trackBar(t)}
     ${url?`<a class="td-track-link" href="${url}" target="_blank" rel="noopener">Suivre ↗</a>`:""}
     <button class="track-refresh" id="trackRefresh" title="Rafraîchir le suivi">↻</button></div>`;
@@ -3108,12 +3194,16 @@ function renderKPIs(){
   const aTraiter=claims.filter(needsReply).length;
   const nouveau=claims.filter(c=>businessStatus(c)==="nouveau").length;
   const resolu=claims.filter(c=>businessStatus(c)==="resolu").length;
+  const attente=claims.filter(c=>businessStatus(c)==="attente").length;
   const pct=claims.length?Math.round(resolu/claims.length*100):0;
+  const fourth = claimsScopeUnansweredOnly
+    ? `<div class="kpi good"><div class="label">En attente client</div><div class="val">${attente}</div><div class="sub">après réponse boutique</div></div>`
+    : `<div class="kpi good"><div class="label">Taux de résolution</div><div class="val">${pct}%</div><div class="sub">${resolu} résolues</div></div>`;
   $("#kpis").innerHTML=`
-    <div class="kpi"><div class="label">Ouvertes</div><div class="val">${open.length}</div><div class="sub">${claims.length} au total</div></div>
+    <div class="kpi"><div class="label">Dossiers chargés</div><div class="val">${claims.length}</div><div class="sub">${open.length} non clôturés</div></div>
     <div class="kpi alert"><div class="label">À traiter</div><div class="val">${aTraiter}</div><div class="sub">en attente de réponse</div></div>
     <div class="kpi"><div class="label">Nouvelles</div><div class="val">${nouveau}</div><div class="sub">non traitées</div></div>
-    <div class="kpi good"><div class="label">Taux de résolution</div><div class="val">${pct}%</div><div class="sub">${resolu} résolues</div></div>`;
+    ${fourth}`;
   updateTreatCount(); updateClaudeCount();
   { const el=$("#reclamBadge"); if(el){ const n=claims.filter(needsReply).length; el.textContent=n; el.classList.toggle("zero",n===0);} }
 }
@@ -3246,6 +3336,70 @@ function setChartMode(mode){
   renderCharts();
 }
 
+const TRACKING_LIVE_TTL=5*60*1000;
+const TRACKING_ERROR_TTL=30*1000;
+const trackingLiveCache=new Map();
+const trackingLiveInflight=new Map();
+let trackingCapabilities=null, trackingCapabilitiesPromise=null;
+function trackingLiveKey(t){return `${String(t&&t.carrier||'').toLowerCase()}|${String(t&&t.number||'').replace(/\s+/g,'').toUpperCase()}|${String(t&&t.orderReference||'').replace(/\s+/g,'').toUpperCase()}`;}
+async function getTrackingCapabilities(){
+  if(trackingCapabilities) return trackingCapabilities;
+  if(!trackingCapabilitiesPromise) trackingCapabilitiesPromise=DataAPI.fetchTrackingConfig()
+    .then(x=>{trackingCapabilities=x.carriers||{};return trackingCapabilities;})
+    .catch(()=>{trackingCapabilities={};return trackingCapabilities;})
+    .finally(()=>{trackingCapabilitiesPromise=null;});
+  return trackingCapabilitiesPromise;
+}
+function applyLiveTracking(c,live,expectedKey){
+  if(!c||!c.tracking||trackingLiveKey(c.tracking)!==expectedKey||!live)return false;
+  const before=normalizeDisplayTracking(c.tracking);
+  const merged=TrackingStatus.merge(before,live);
+  if(!merged)return false;
+  // Ne pas redessiner en boucle lorsqu'un résultat est déjà en cache.
+  const after=normalizeDisplayTracking(merged);
+  if(JSON.stringify(before)===JSON.stringify(after))return false;
+  c.tracking=after;
+  return true;
+}
+async function refreshOneTrackingLive(c,options={}){
+  const t=c&&c.tracking;
+  if(!t||!t.number||!t.carrier||t.carrier==='transporteur')return false;
+  const key=trackingLiveKey(t), nowTs=Date.now(), cached=trackingLiveCache.get(key);
+  if(!options.force&&cached&&nowTs-cached.at<(cached.error?TRACKING_ERROR_TTL:TRACKING_LIVE_TTL)){
+    return cached.value?applyLiveTracking(c,cached.value,key):false;
+  }
+  if(trackingLiveInflight.has(key)){
+    const live=await trackingLiveInflight.get(key);
+    return applyLiveTracking(c,live,key);
+  }
+  const task=(async()=>{
+    try{
+      const live=await DataAPI.fetchTracking(t.carrier,t.number,{...options,url:trackingPageUrlUi(t),reference:t.orderReference||''});
+      if(live){
+        trackingLiveCache.set(key,{at:Date.now(),value:live});
+        while(trackingLiveCache.size>1500)trackingLiveCache.delete(trackingLiveCache.keys().next().value);
+      }
+      return live;
+    }catch(e){
+      trackingLiveCache.set(key,{at:Date.now(),value:cached?.value||null,error:e.code||'TRACKING_UNAVAILABLE'});
+      if(options.force)throw e;
+      return cached?.value||null;
+    }finally{trackingLiveInflight.delete(key);}
+  })();
+  trackingLiveInflight.set(key,task);
+  const live=await task;
+  return applyLiveTracking(c,live,key);
+}
+async function refreshVisibleTrackingStatuses(rows){
+  if(CONFIG.USE_DEMO_DATA)return;
+  const capabilities=await getTrackingCapabilities();
+  const queue=(rows||[]).filter(c=>c&&c.tracking&&capabilities[c.tracking.carrier]?.configured);
+  let changed=false,cursor=0;
+  const worker=async()=>{while(cursor<queue.length){const c=queue[cursor++];if(await refreshOneTrackingLive(c))changed=true;}};
+  await Promise.all(Array.from({length:Math.min(4,queue.length)},worker));
+  if(changed)renderTable();
+}
+
 function renderTable(){
   const list=applyFilters();
   $("#count").textContent=`${list.length} réclamation${list.length>1?"s":""} affichée${list.length>1?"s":""}`;
@@ -3273,6 +3427,8 @@ function renderTable(){
     tr.querySelectorAll(".ordref").forEach(el=>el.onclick=e=>copyCode(e,el,el.dataset.lbl||"Valeur"));
     tr.querySelectorAll(".mp-link").forEach(a=>a.addEventListener("click",e=>e.stopPropagation())); // logo -> BO sans ouvrir la fiche
   });
+  // Met à jour en arrière-plan le statut réel des suivis visibles, sans bloquer l'affichage initial.
+  refreshVisibleTrackingStatuses(pageList);
   document.querySelectorAll("thead th[data-sort]").forEach(th=>{const a=th.querySelector(".arr");if(a)a.remove();
     if(th.dataset.sort===sort.key)th.insertAdjacentHTML("beforeend",` <span class="arr">${sort.dir<0?"▼":"▲"}</span>`);});
   if(isVisible("#prodWrap")) renderProducts(list);
@@ -3291,8 +3447,46 @@ function renderTable(){
   }
 }
 
-async function openDrawer(id, skipRemoteDetail=false){
+let drawerTrackingExpanded=false;
+let drawerOpenRequest=0;
+function renderDrawerTracking(c){
+  const dock=document.getElementById("dTracking");
+  if(!dock)return;
+  const scrollTop=dock.scrollTop;
+  // Lire l'état réel avant de remplacer le DOM : le premier événement toggle
+  // peut ne pas encore avoir été émis lorsque le détail distant arrive.
+  const previousDetails=dock.querySelector("#drawerTrackDetails");
+  if(previousDetails&&dock.dataset.claimId===String(c.id))drawerTrackingExpanded=previousDetails.open;
+  dock.dataset.claimId=String(c.id);
+  dock.innerHTML=renderTracking(c,{dock:true,expanded:drawerTrackingExpanded});
+  const details=dock.querySelector("#drawerTrackDetails");
+  if(details)details.addEventListener("toggle",()=>{
+    if(details.isConnected&&dock.contains(details)&&selectedId===c.id)drawerTrackingExpanded=details.open;
+  });
+  dock.scrollTop=scrollTop;
+  bindTracking(c,dock);
+}
+function scrollDrawerToLastMessage(expectedId=selectedId){
+  const body=document.getElementById("dBody");
+  if(!body)return;
+  const request=drawerOpenRequest;
+  requestAnimationFrame(()=>{
+    if(request!==drawerOpenRequest||selectedId!==expectedId)return;
+    body.scrollTop=body.scrollHeight;
+    requestAnimationFrame(()=>{
+      if(request===drawerOpenRequest&&selectedId===expectedId)body.scrollTop=body.scrollHeight;
+    });
+  });
+}
+
+async function openDrawer(id, skipRemoteDetail=false, options={}){
   let c=claims.find(x=>x.id===id); if(!c)return;
+  const request=++drawerOpenRequest;
+  const sameClaim=selectedId===id && $("#drawer").classList.contains("show");
+  if(!sameClaim){drawerTrackingExpanded=false;$("#dTracking").scrollTop=0;}
+  const composer=options.preserveComposer&&sameClaim?{
+    text:$("#replyText").value,status:$("#dStatus").value,files:pendingFiles.slice()
+  }:null;
   selectedId=id; renderTable();
   const mp=mpOf(c.marketplace),st=STATUS[businessStatus(c)],pr=PRIO[c.priority],sla=slaInfo(c);
   $("#dSubject").innerHTML='<span class="subj-mp">'+mpMarkLink(c.marketplace,c.orderId)+'</span> '+esc(c.subject)+' <span class="subj-ord ordref" data-lbl="N° de commande">'+esc(c.orderId)+'</span> '+claimDatesHtml(c);
@@ -3306,28 +3500,38 @@ async function openDrawer(id, skipRemoteDetail=false){
     return `<div class="bubble ${m.from}">
       <div class="who">${m.from==="client"?esc(c.customer || "Client"):("2KINGS — "+esc(m.author||"Agent"))}</div>
       <div class="msg-text">${messageHtml(m.text)}</div>${att}<div class="t">il y a ${fmtAgo(m.at)}</div></div>`;}).join("");
-  $("#dBody").innerHTML=renderTracking(c)+conv;
-  bindTracking(c);
-  $("#dStatus").value=businessStatus(c)==="resolu"?"resolu":"nouveau"; $("#replyText").value="";
-  pendingFiles=[]; renderAttachList();   // réinitialise les pièces jointes
+  renderDrawerTracking(c);
+  $("#dBody").innerHTML=conv;
+  $("#dStatus").value=composer?composer.status:(businessStatus(c)==="resolu"?"resolu":"nouveau");
+  $("#replyText").value=composer?composer.text:"";
+  pendingFiles=composer?composer.files:[]; renderAttachList();
   $("#overlay").classList.add("show"); $("#drawer").classList.add("show");
+  scrollDrawerToLastMessage(id);
 
-  // Chargement du contenu complet uniquement au clic : la liste reste ciblée sur les réclamations
-  // à traiter, puis le détail recharge tout le fil reçu + envoyé pour chaque marketplace.
+  // Le détail distant peut arriver après l'ouverture d'une autre réclamation.
+  // Il ne doit alors ni remplacer le panneau courant ni effacer une réponse en cours.
   if(!skipRemoteDetail && !c._detailLoaded){
     const oldBody=$("#dBody").innerHTML;
-    $("#dBody").innerHTML=renderTracking(c)+`<div class="meta" style="padding:12px">Chargement de la conversation complète…</div>`;
+    $("#dBody").innerHTML='<div class="meta" style="padding:12px">Chargement de la conversation complète…</div>';
     try{
       const detail=await DataAPI.fetchClaimDetail(id);
+      if(request!==drawerOpenRequest||selectedId!==id)return;
       if(detail){
         detail._detailLoaded = true;
+        if(c.tracking&&detail.tracking&&trackingLiveKey(c.tracking)===trackingLiveKey(detail.tracking))
+          detail.tracking=normalizeDisplayTracking(TrackingStatus.merge(detail.tracking,c.tracking));
         const i=claims.findIndex(x=>x.id===id);
         if(i>=0) claims[i]=detail;
-        if(selectedId===id) openDrawer(id,true);
+        openDrawer(id,true,{preserveComposer:true});
+      }else{
+        $("#dBody").innerHTML=oldBody;
+        scrollDrawerToLastMessage(id);
       }
     }catch(e){
+      if(request!==drawerOpenRequest||selectedId!==id)return;
       console.error(e);
       $("#dBody").innerHTML=oldBody+`<div class="meta" style="padding:12px;color:#b91c1c">Impossible de charger le contenu complet : ${esc(e.message)}</div>`;
+      scrollDrawerToLastMessage(id);
       toast("Impossible de charger le contenu du message : "+e.message,true);
     }
   }
@@ -3336,14 +3540,40 @@ async function openDrawer(id, skipRemoteDetail=false){
 /* Bloc de suivi de livraison dans le détail */
 function fmtDate(ts){const d=new Date(ts),p=n=>String(n).padStart(2,"0");
   return `${p(d.getDate())}/${p(d.getMonth()+1)}/${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}`;}
-function renderTracking(c){
+function renderTracking(c,options={}){
   const t=c.tracking;
   if(!t) return `<div class="track track-empty">📦 Aucun suivi de livraison rattaché à cette réclamation.</div>`;
   const car=carrierOf(t.carrier), ts=trackingStatusInfo(t);
   const url=trackingExternalUrl(t);
   const eta = t.status==="livre" ? "Livré" : (t.etaH!=null? "Livraison estimée : "+fmtDate(Date.now()+Number(t.etaH)*H) : "—");
+  const sourceLabel=trackingSourceLabel(t);
+  const checkedLabel=t.checkedAt?' · Vérifié le '+fmtDate(t.checkedAt):'';
+  const warning=t.verificationError?`<div class="meta" style="color:#b45309">⚠ Dernière vérification échouée : ${esc(t.verificationError)}${t.verificationAt?' ('+fmtDate(t.verificationAt)+')':''}. Dernier état connu conservé.</div>`:'';
   const evs=(t.events||[]).map(normalizeTrackEventUi).filter(Boolean).sort((a,b)=>(b.at||0)-(a.at||0)).map(e=>
-    `<div class="tev"><span class="tev-dot"></span><div class="tev-c"><b>${esc(e.label)}</b><span>${fmtDate(e.at)}</span></div></div>`).join("");
+    `<div class="tev"><span class="tev-dot"></span><div class="tev-c"><b>${esc(e.label)}</b><span>${e.at!=null?fmtDate(e.at):"Date non communiquée"}</span></div></div>`).join("");
+  const link=url?`<a class="track-link" href="${url}" target="_blank" rel="noopener">Suivre sur le site ${esc(car.label)} ↗</a>`:"";
+  if(options.dock){
+    return `<div class="track">
+      <div class="track-head"><span>📦 Suivi de livraison</span>
+        <button type="button" class="track-refresh" id="trackRefresh" title="Récupérer le suivi auprès du transporteur">↻ Rafraîchir</button></div>
+      <div class="track-row">
+        <span class="carrier-badge" style="background:${car.bg};color:${car.fg}">${esc(car.label)}</span>
+        <span class="ordref" id="trackNum">${esc(t.number)}</span>
+        <span class="tstatus ${ts.cls}">${esc(ts.label)}</span>
+      </div>
+      <div class="track-summary">
+        <div class="track-eta">${esc(eta)}<div class="meta">${esc(sourceLabel+checkedLabel)}</div></div>
+        ${link}
+      </div>
+      <details class="track-extra" id="drawerTrackDetails" ${options.expanded?'open':''}>
+        <summary>Historique et détails${t.events?.length?' ('+t.events.length+')':''}</summary>
+        <div class="track-extra-body">
+          ${warning}${t.statusRaw?`<div class="meta">Statut communiqué : ${esc(TrackingStatus.statusText(t.statusRaw))}</div>`:""}
+          <div class="track-timeline">${evs||'<div class="meta">Aucun événement.</div>'}</div>
+        </div>
+      </details>
+    </div>`;
+  }
   return `<div class="track">
     <div class="track-head"><span>📦 Suivi de livraison</span>
       <button class="track-refresh" id="trackRefresh" title="Récupérer le suivi auprès du transporteur">↻ Rafraîchir</button></div>
@@ -3352,32 +3582,32 @@ function renderTracking(c){
       <span class="ordref" id="trackNum">${esc(t.number)}</span>
       <span class="tstatus ${ts.cls}">${esc(ts.label)}</span>
     </div>
-    <div class="track-eta">${esc(eta)}</div>
+    <div class="track-eta">${esc(eta)}<div class="meta">${esc(sourceLabel+checkedLabel)}</div>${warning}${t.statusRaw?`<div class="meta">Statut communiqué : ${esc(TrackingStatus.statusText(t.statusRaw))}</div>`:""}</div>
     <div class="track-timeline">${evs||'<div class="meta">Aucun événement.</div>'}</div>
-    ${url?`<a class="track-link" href="${url}" target="_blank" rel="noopener">Suivre sur le site ${esc(car.label)} ↗</a>`:""}
+    ${link}
   </div>`;
 }
-function bindTracking(c){
-  const num=document.getElementById("trackNum");
+function bindTracking(c,root=document){
+  const num=root.querySelector("#trackNum");
   if(num) num.onclick=e=>copyCode(e,num,"N° de suivi");
-  const btn=document.getElementById("trackRefresh");
+  const btn=root.querySelector("#trackRefresh");
   if(btn) btn.onclick=async()=>{
     if(!c.tracking)return;
-    btn.disabled=true; btn.textContent="↻ …";
+    btn.disabled=true;btn.textContent="↻ …";
     try{
-      const upd=await DataAPI.fetchTracking(c.tracking.carrier,c.tracking.number);
-      if(upd){
-        const merged=normalizeDisplayTracking({...(c.tracking||{}),...(upd||{})});
-        if(merged) c.tracking=merged;
-        toast("Suivi mis à jour");
+      const updated=await refreshOneTrackingLive(c,{force:true});
+      if(c.tracking.verificationError)toast('Dernier état conservé : '+c.tracking.verificationError,true);
+      else if(updated)toast(c.tracking.status==='inconnu'?'Le transporteur ne fournit pas de statut exploitable.':'Suivi transporteur mis à jour');
+      else toast("Aucun nouveau statut disponible.");
+      if(selectedId===c.id){
+        if(root.id==="dTracking")renderDrawerTracking(c);
+        else openDrawer(c.id,true);
       }
-      else toast("Mode démo : suivi simulé (branchez le proxy pour le réel)");
-      openDrawer(c.id,true);
     }catch(e){toast("Suivi : "+e.message,true);}
-    finally{btn.disabled=false;btn.textContent="↻ Rafraîchir";}
+    finally{if(btn.isConnected){btn.disabled=false;btn.textContent="↻ Rafraîchir";}}
   };
 }
-function closeDrawer(){selectedId=null;$("#overlay").classList.remove("show");$("#drawer").classList.remove("show");renderTable();}
+function closeDrawer(){drawerOpenRequest++;drawerTrackingExpanded=false;selectedId=null;$("#overlay").classList.remove("show");$("#drawer").classList.remove("show");renderTable();}
 
 async function sendReply(){
   const c=claims.find(x=>x.id===selectedId); if(!c)return;
@@ -3879,7 +4109,16 @@ async function loadNotesAsync(options={}){
 
 let currentLoadSeq = 0;
 function prepareClaimsForDisplay(list){
+  const previous=new Map(claims.map(c=>[c.id,c]));
   list.forEach(c=>{
+    if(c.tracking){
+      const old=previous.get(c.id)?.tracking;
+      if(old && trackingLiveKey(old)===trackingLiveKey(c.tracking)){
+        c.tracking=normalizeDisplayTracking(TrackingStatus.merge(old,c.tracking));
+      }
+      const cached=trackingLiveCache.get(trackingLiveKey(c.tracking));
+      if(cached?.value)applyLiveTracking(c,cached.value,trackingLiveKey(c.tracking));
+    }
     c.uiStatus=businessStatus(c);
     c.slaHours=slaInfo(c).hours;
   });
@@ -3926,6 +4165,7 @@ function providerProgressLabel(payload){
 
 async function load(options={}){
   const seq = ++currentLoadSeq;
+  claimsScopeUnansweredOnly = !options.all;
   try{
     $("#btnRefresh").textContent="↻ Chargement…";
 
